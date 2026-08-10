@@ -1,0 +1,17 @@
+# Never commit signing material, Apple provisioning data, device pairing records,
+# test builds, or local diagnostics.
+*.ipa
+*.p12
+*.p8
+*.key
+*.pem
+*.mobileprovision
+*.plist
+*.log
+diagnostics/
+.env
+.env.*
+
+# Local editor and operating-system files.
+.DS_Store
+Thumbs.db

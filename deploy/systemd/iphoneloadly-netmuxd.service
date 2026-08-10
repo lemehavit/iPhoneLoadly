@@ -1,0 +1,44 @@
+[Unit]
+Description=iPhoneLoadly network-capable usbmux shim
+Documentation=https://github.com/jkcoxson/netmuxd
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+User=root
+Group=iphoneloadly-mux
+UMask=0027
+RuntimeDirectory=iphoneloadly
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Environment=RUST_LOG=warn
+ExecStartPre=/usr/bin/test -d /var/lib/lockdown
+ExecStart=/usr/local/libexec/iphoneloadly/netmuxd --upstream-usbmuxd /run/usbmuxd --socket-path /run/iphoneloadly/mux.sock --plist-storage /var/lib/lockdown --disable-usb
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/lockdown
+ReadWritePaths=/run/iphoneloadly
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
