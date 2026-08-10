@@ -35,6 +35,7 @@ apt-get update
 apt-get install --yes --no-install-recommends \
     avahi-daemon \
     avahi-utils \
+    build-essential \
     ca-certificates \
     curl \
     ideviceinstaller \
