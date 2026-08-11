@@ -13,12 +13,12 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --d
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
 sudo apt update
-sudo apt install caddy
+sudo apt install caddy apache2-utils
 
 read -rp 'Dashboard username: ' CADDY_USER
 read -rsp 'Dashboard password: ' CADDY_PASSWORD
 printf '\n'
-CADDY_HASH="$(printf '%s' "$CADDY_PASSWORD" | sudo caddy hash-password --algorithm argon2id)"
+CADDY_HASH="$(printf '%s\n' "$CADDY_PASSWORD" | htpasswd -niBC 14 "$CADDY_USER" | cut -d: -f2-)"
 unset CADDY_PASSWORD
 
 SERVER_IP='REPLACE-WITH-DEBIAN-LAN-IP'

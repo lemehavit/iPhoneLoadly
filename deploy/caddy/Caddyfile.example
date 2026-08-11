@@ -1,9 +1,3 @@
-{
-	servers {
-		log_credentials false
-	}
-}
-
 # Replace the address, username, and password hash before installation.
 https://REPLACE-WITH-DEBIAN-LAN-IP {
 	tls internal
