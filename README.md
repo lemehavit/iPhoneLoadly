@@ -14,7 +14,7 @@ Use the complete [from-scratch guide](docs/operations/from-scratch.md). Existing
 hosts should use the [systemd operations guide](docs/operations/api-systemd.md).
 
 The dashboard is deliberately bound to `127.0.0.1:8080`; access it through an SSH
-tunnel instead of opening the service to the LAN or Internet.
+tunnel, or use the documented [Caddy LAN proxy](docs/operations/caddy-lan.md).
 
 - [Technical feasibility and architecture assessment](docs/architecture-assessment.md)
 - [Version 0.1 implementation and test plan](docs/mvp-v0.1-plan.md)
@@ -22,5 +22,6 @@ tunnel instead of opening the service to the LAN or Internet.
 - [Test IPA strategy](docs/operations/test-ipa-strategy.md)
 - [From-scratch installation](docs/operations/from-scratch.md)
 - [API and refresh operations](docs/operations/api-systemd.md)
+- [Caddy LAN proxy](docs/operations/caddy-lan.md)
 
 The short conclusion is: build a new headless Rust service around the MIT-licensed `idevice` and `isideload` libraries used by iLoader; use USB only for the initial iPhone trust/pairing ceremony; and make Wi-Fi discovery, local Apple-account provisioning/signing, transfer, installation, and eventual automatic refresh mandatory acceptance criteria. Signing happens locally on the server and does not itself use a device transport.

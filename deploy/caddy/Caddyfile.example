@@ -1,0 +1,19 @@
+{
+	servers {
+		log_credentials false
+	}
+}
+
+# Replace the address, username, and password hash before installation.
+https://REPLACE-WITH-DEBIAN-LAN-IP {
+	tls internal
+	basic_auth {
+		REPLACE-WITH-DASHBOARD-USERNAME REPLACE-WITH-CADDY-PASSWORD-HASH
+	}
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+	}
+	reverse_proxy 127.0.0.1:8080
+}
