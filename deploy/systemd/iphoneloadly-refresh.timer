@@ -1,0 +1,11 @@
+[Unit]
+Description=Run iPhoneLoadly IPA refresh once per day
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=20m
+Unit=iphoneloadly-refresh.service
+
+[Install]
+WantedBy=timers.target

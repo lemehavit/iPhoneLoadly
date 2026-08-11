@@ -1,0 +1,41 @@
+[Unit]
+Description=iPhoneLoadly IPA signing and installation API
+Wants=network-online.target docker.service
+After=network-online.target docker.service iphoneloadly-netmuxd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/iphoneloadly
+EnvironmentFile=/etc/iphoneloadly/api.env
+ExecStartPre=/usr/bin/test -x /opt/iphoneloadly/bin/iphoneloadly-api
+ExecStartPre=/usr/bin/test -r ${IPHONELOADLY_PAIRING_FILE}
+ExecStart=/opt/iphoneloadly/bin/iphoneloadly-api
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/lockdown
+ReadWritePaths=/var/lib/iphoneloadly
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

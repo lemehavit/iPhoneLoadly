@@ -1,0 +1,8 @@
+[Unit]
+Description=Queue iPhoneLoadly IPA refresh jobs
+After=iphoneloadly-api.service
+Wants=iphoneloadly-api.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl --fail --silent --show-error --request POST http://127.0.0.1:8080/api/refresh

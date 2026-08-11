@@ -7,7 +7,7 @@ There is currently no IPA that can satisfy the real installation gate. A device-
 The physical test is intentionally split:
 
 1. **Network gate:** pair once over USB, disconnect it, discover the iPhone and query lockdownd over Wi-Fi. This does not require an IPA.
-2. **Installation gate:** transfer and install a correctly signed IPA over the same Wi-Fi path. This requires a device-valid artifact.
+2. **Signing and installation gate:** provision and sign a safe input IPA for the selected iPhone, then transfer and install the resulting IPA over the same Wi-Fi path.
 
 The first gate can be completed before the test IPA is ready. Neither gate may be replaced by a USB installation.
 

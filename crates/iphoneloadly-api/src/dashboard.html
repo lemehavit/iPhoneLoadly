@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="sv">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>iPhoneLoadly</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:720px;margin:3rem auto;padding:0 1rem;background:#101216;color:#eee}section{background:#1a1e25;padding:1rem 1.25rem;margin:1rem 0;border-radius:.6rem}label,input,select,button{display:block;margin:.45rem 0;width:100%;box-sizing:border-box}input,select,button{padding:.55rem;border-radius:.35rem;border:1px solid #4b5563}button{background:#3b82f6;color:#fff;border:0;font-weight:600;cursor:pointer}.status{white-space:pre-wrap;color:#b8c7db}.ok{color:#86efac}.error{color:#fca5a5}</style>
+<main>
+<h1>iPhoneLoadly</h1><p id="health" class="status">Kontrollerar tjänsten…</p>
+<section><h2>1. Apple-signering</h2><label>Apple-ID e-post<input id="email" type="email" autocomplete="username"></label><label>Lösenord<input id="password" type="password" autocomplete="current-password"></label><button onclick="login()">Logga in</button><div id="login" class="status"></div></section>
+<section><h2>2. Ladda upp IPA</h2><label>IPA-fil<input id="ipa" type="file" accept=".ipa,application/octet-stream"></label><button onclick="upload()">Ladda upp</button><div id="upload" class="status"></div></section>
+<section><h2>3. Installera eller förnya</h2><label>Uppladdad IPA<select id="apps"></select></label><label>iPhone<select id="devices"></select></label><button onclick="install()">Signera och installera</button><button onclick="refresh()">Förnya alla tidigare installationer</button><div id="job" class="status"></div></section>
+</main>
+<script>
+let loginId;
+const show=(id,value,kind='')=>{const e=document.getElementById(id);e.textContent=value;e.className='status '+kind};
+async function json(url,options){const r=await fetch(url,options);const body=await r.json();if(!r.ok)throw new Error(body.message||r.statusText);return body}
+async function load(){try{const h=await json('/healthz');show('health',h.signing.message,h.signing.available?'ok':'');const [apps,devices]=await Promise.all([json('/api/apps'),json('/api/devices')]);document.getElementById('apps').innerHTML=apps.map(a=>`<option value="${a.id}">${a.id} (${(a.sizeBytes/1048576).toFixed(1)} MB)</option>`).join('');document.getElementById('devices').innerHTML=devices.map(d=>`<option value="${d.id}">${d.displayName} — ${d.productType}</option>`).join('')}catch(e){show('health',e.message,'error')}}
+async function login(){try{show('login','Kontaktar Apple…');const email=document.getElementById('email').value,password=document.getElementById('password').value;const s=await json('/api/signing/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});loginId=s.id;document.getElementById('password').value='';pollLogin()}catch(e){show('login',e.message,'error')}}
+async function pollLogin(){try{const s=await json('/api/signing/sessions/'+loginId);show('login',s.message,s.phase==='ready'?'ok':s.phase==='failed'?'error':'');if(s.phase==='awaitingTwoFactor'){const code=prompt('Ange 2FA-koden från Apple');if(code)await json('/api/signing/sessions/'+loginId+'/two-factor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'submitCode',code})})}if(['authenticating','awaitingTwoFactor'].includes(s.phase))setTimeout(pollLogin,3000);else load()}catch(e){show('login',e.message,'error')}}
+async function upload(){try{const file=document.getElementById('ipa').files[0];if(!file)throw new Error('Välj en IPA-fil först.');show('upload','Laddar upp…');const form=new FormData();form.append('file',file);const a=await json('/api/apps',{method:'POST',body:form});show('upload','Uppladdad: '+a.id,'ok');load()}catch(e){show('upload',e.message,'error')}}
+async function install(){try{const appId=document.getElementById('apps').value,deviceId=document.getElementById('devices').value;const j=await json('/api/install-jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({appId,deviceId})});show('job',j.publicMessage);pollJob(j.id)}catch(e){show('job',e.message,'error')}}
+async function refresh(){try{const r=await json('/api/refresh',{method:'POST'});show('job',`Startade ${r.queued} förnyelsejobb.`,'ok')}catch(e){show('job',e.message,'error')}}
+async function pollJob(id){try{const j=await json('/api/install-jobs/'+id);show('job',j.publicMessage,j.phase==='succeeded'?'ok':j.phase==='failed'?'error':'');if(['queued','connecting','installing'].includes(j.phase))setTimeout(()=>pollJob(id),3000)}catch(e){show('job',e.message,'error')}}
+load();
+</script>
+</html>

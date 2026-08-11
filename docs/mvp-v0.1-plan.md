@@ -11,11 +11,12 @@ Version 0.1 proves exactly this path on the real Debian VM and iPhone:
 ```text
 Browser -> authenticated IPA upload -> persistent storage
         -> select a paired iPhone reachable on the home LAN
-        -> install already-signed IPA over Wi-Fi, with USB disconnected
+        -> provision and sign the IPA locally with the selected Apple account
+        -> install the resulting IPA over Wi-Fi, with USB disconnected
         -> live progress -> useful success/failure diagnostics
 ```
 
-USB is used only once for trust/pairing and enabling Wi-Fi connections. Version 0.1 does not authenticate to Apple, create certificates/App IDs/profiles, sign or modify IPAs, refresh apps, operate unattended, or ingest sources. It **does** require working Wi-Fi discovery, staging and installation because these are prerequisites for the later automatic seven-day refresh workflow.
+USB is used only once for trust/pairing and enabling Wi-Fi connections. Version 0.1 authenticates to Apple interactively, handles 2FA, creates or reuses developer resources, provisions the selected device, signs the uploaded IPA locally, and installs it over Wi-Fi. It does not yet operate unattended, persist passwords, refresh automatically, or ingest sources. It **does** require working Wi-Fi discovery, staging and installation because these are prerequisites for the later automatic seven-day refresh workflow.
 
 ## Smallest deployable shape
 
@@ -29,7 +30,7 @@ One Rust service and one container:
 - Bind-mounted dedicated compatible mux socket, for example `/run/iphoneloadly/mux.sock`.
 - No separate frontend container, Redis, message broker, scheduler service or privileged container.
 
-For the first hardware spike, do not build the web UI. Pair and enable Wi-Fi once over USB, then remove the cable. Write a narrow Rust CLI/integration executable using the same `DeviceTransport` adapter. It must enumerate the phone as a network device and install one operator-supplied already-signed IPA entirely over Wi-Fi. If that fails, stop and resolve the device library, mDNS, LAN or host boundary before building HTTP or React layers.
+For the first hardware spike, do not build the web UI. Pair and enable Wi-Fi once over USB, then remove the cable. Write a narrow Rust CLI/integration executable using the same `DeviceTransport` and `SigningProvider` adapters. It must authenticate an operator-supplied Apple account interactively, provision and sign one safe IPA for the selected device, then install it entirely over Wi-Fi. If any step fails, stop and resolve the Apple account, signing library, device library, mDNS, LAN or host boundary before building HTTP or React layers.
 
 ## Minimal data model
 
@@ -110,7 +111,7 @@ The recommended Version 0.1 adapter uses `idevice` and follows the MIT isideload
 
 1. Get the target device from the network-capable mux by exact UDID; reject stale UI selections.
 2. Require connection type `Network`. If only a USB entry exists, report that Wi-Fi is unavailable and do not install through the cable.
-3. Construct an `IdeviceProvider` using the compatible mux socket. The fallback adapter constructs `idevice::TcpProvider` from the mDNS address and encrypted pairing record.
+3. Construct an `IdeviceProvider` using the compatible mux socket. The fallback adapter constructs `idevice::TcpProvider` from the mDNS address and encrypted pairing record. The temporary environment-variable adapter is test-only and must never be enabled in a production container.
 4. Start a lockdownd session using the host-managed pair record.
 5. Open AFC and create a unique path such as `/PublicStaging/iphoneloadly-{job-id}.ipa`.
 6. Stream the IPA over Wi-Fi in bounded chunks while reporting staging progress.
@@ -192,7 +193,7 @@ Default configurable limits for the first build:
 - Exactly one `Payload/<name>.app/Info.plist` main bundle.
 - `CFBundleIdentifier` and at least one of display/bundle name present.
 - `CFBundleShortVersionString` and `CFBundleVersion` parsed when present.
-- `embedded.mobileprovision` required for Version 0.1 and its expiration displayed.
+- An unsigned/re-signable input IPA is accepted only after strict archive and bundle metadata validation. Existing signing material is discarded or replaced only by the signing adapter in a private work directory.
 - Reject encrypted ZIPs, absolute paths, drive prefixes, `..`, symlinks and conflicting duplicate paths.
 
 Do not extract the full IPA merely to display metadata. Read only bounded selected entries from the ZIP. The actual installation adapter streams the original accepted IPA.
@@ -214,18 +215,20 @@ ideviceinfo --network -u <UDID> -k DeviceName
 ideviceinstaller --network -u <UDID> install signed.ipa
 ```
 
-Pass condition: the known correctly signed IPA installs while USB is disconnected. The same network path still works after phone sleep/wake, Wi-Fi reconnect, mux restart and Debian VM reboot without a new Trust prompt or a stale container socket.
+Pass condition: a known safe input IPA is provisioned and signed for the phone, then installs while USB is disconnected. The same network path still works after phone sleep/wake, Wi-Fi reconnect, mux restart and Debian VM reboot without a new Trust prompt or a stale container socket.
 
-### Increment 1: native device spike
+### Increment 1: native signing and device spike
 
 - Create the Rust workspace and the `device-idevice` adapter.
 - Enumerate network devices and print structured JSON including `connectionType: "network"`.
 - Reject installation when the selected device is available only through USB.
-- Install one known already-signed IPA from a local path over Wi-Fi with the cable removed.
+- Perform Apple login and 2FA through a one-time terminal callback; never persist the password.
+- Create or reuse developer resources and a provisioning profile that includes the selected iPhone.
+- Sign one safe IPA in a private job directory, then install it over Wi-Fi with the cable removed.
 - Emit phase/progress events to stdout.
 - Add strict operation timeouts and best-effort staged-file cleanup.
 
-Pass condition: over Wi-Fi, success and intentional invalid-signature failure both produce correct, distinct results on the real iPhone. USB must remain disconnected for both tests.
+Pass condition: an input IPA is signed for the selected iPhone and installs over Wi-Fi; an intentional invalid profile/signature failure produces a distinct, redacted result. USB must remain disconnected for both tests.
 
 ### Increment 2: safe IPA store
 
@@ -334,8 +337,8 @@ Exact command availability depends on the installed Debian package versions. Rec
 | USB connected but Wi-Fi unavailable | Device may appear for onboarding, but install is refused because transport is not `Network`. |
 | Network-visible but untrusted phone | Device/pairing error with USB onboarding instructions, no panic. |
 | Trusted locked phone over Wi-Fi | Install succeeds if iOS permits it; otherwise show a clear unlock/retry state. |
-| Valid signed IPA for target over Wi-Fi | Progress reaches success and staged file is removed. |
-| Valid ZIP but unsigned IPA | Upload may parse; install fails as signature/profile rejection. |
+| Valid unsigned/re-signable IPA | Local signing succeeds, Wi-Fi installation reaches success and staged file is removed. |
+| Apple 2FA required | Job waits for a short-lived authenticated operator response; password is never persisted or logged. |
 | Profile for another UDID | Install fails with device/profile guidance. |
 | Expired profile | UI warns before install; device rejection remains available. |
 | Wi-Fi loss during staging | Job becomes retryable/interrupted, resources close, and later LAN presence can resume with a fresh staging path. |
@@ -352,6 +355,6 @@ Exact command availability depends on the installed Debian package versions. Rec
 
 ## Definition of done
 
-Version 0.1 is done when a user can pair once over USB using documented host steps, remove the cable, and then use only the authenticated web UI to upload a correctly signed IPA, choose the iPhone discovered on the home LAN, install it over Wi-Fi, watch real progress, and receive a useful success or failure result. The network install must survive routine Wi-Fi reconnects, phone sleep and service/VM restarts, meet upload safety checks, avoid privileged Docker access, and fit the target VM.
+Version 0.1 is done when a user can pair once over USB using documented host steps, remove the cable, and then use only the authenticated web UI to upload an unsigned or re-signable IPA, choose the iPhone discovered on the home LAN, complete Apple login/2FA, provision and sign the IPA locally, install it over Wi-Fi, watch real progress, and receive a useful success or failure result. The network install must survive routine Wi-Fi reconnects, phone sleep and service/VM restarts, meet upload safety checks, avoid privileged Docker access, and fit the target VM.
 
-Apple login/signing, auto-refresh, and sources remain explicitly out of scope until this definition is met. However, no later auto-refresh phase may introduce USB installation as a fallback: it must sign locally, wait for the phone to be reachable on the home LAN, and install over Wi-Fi before the profile expires.
+Auto-refresh and sources remain explicitly out of scope until this definition is met. No later phase may introduce USB installation as a fallback: it must sign locally, wait for the phone to be reachable on the home LAN, and install over Wi-Fi before the profile expires.

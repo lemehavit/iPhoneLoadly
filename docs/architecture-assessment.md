@@ -7,7 +7,7 @@ Scope: architecture through Version 0.1 only; no application implementation
 
 ## Executive decision
 
-The project is technically feasible, including installation over the local Wi-Fi network after a one-time USB pairing. Because wireless reachability is now mandatory, Version 0.1 has a hard infrastructure gate: a cable-free install of a known correctly signed IPA must work on the actual Proxmox/Debian/iPhone/LAN combination before the web application is built. The longer-term product remains feasible, but Apple private developer APIs, unattended account sessions, free-account limits, and wireless reachability are continuing operational risks rather than one-time engineering tasks.
+The project is technically feasible, including local Apple-account provisioning/signing and installation over the local Wi-Fi network after a one-time USB pairing. Version 0.1 accepts an unsigned or re-signable IPA, provisions it for the selected iPhone, signs it locally, and installs the resulting IPA over Wi-Fi. Apple private developer APIs, 2FA, free-account seven-day limits, unattended account sessions, and wireless reachability are hard acceptance gates rather than deferred concerns.
 
 Build a new headless Rust backend. Reuse the same two MIT-licensed libraries that current iLoader uses:
 
@@ -28,7 +28,8 @@ USB is permitted only for the initial trust/pairing ceremony and for enabling Wi
 | Pair-record ownership | Host mux daemon, `/var/lib/lockdown` | High | The container receives scoped mux access, not a mount of the pairing directory. The direct-TCP fallback needs an encrypted imported copy. |
 | Wi-Fi discovery/transport | Avahi/mDNS plus current `netmuxd`; fallback `idevice::TcpProvider` | Medium-high, hardware-gated | Required in Version 0.1. The phone and Debian VM must share working multicast/LAN reachability. |
 | IPA validation/metadata | Rust `zip` plus `plist`, strict application-level checks | High | Validation must defend against traversal and archive bombs. |
-| Already-signed IPA install | `idevice` AFC plus installation proxy over a network provider; reuse/adapt isideload's MIT install path | Medium-high, hardware-gated | Upload to a unique `PublicStaging` path over Wi-Fi, invoke install, stream status, then clean up. A USB install does not satisfy Version 0.1. |
+| Apple login, 2FA, developer resources, provisioning and signing | `isideload` behind an internal `SigningProvider` adapter | Medium, hardware/account-gated | Use a dedicated Apple Account; request 2FA interactively; keep passwords in memory only; persist encrypted session state only when supported and validated. |
+| Signed IPA install | `idevice` AFC plus installation proxy over a network provider; reuse/adapt isideload's MIT install path | Medium-high, hardware-gated | Stage the locally signed IPA to a unique `PublicStaging` path over Wi-Fi, invoke install, stream status, then clean up. A USB install does not satisfy Version 0.1. |
 | Installation progress | Installation proxy status callback -> job events/SSE | High | Preserve raw diagnostic data but show a translated error. |
 | Apple authentication and 2FA | `isideload::auth::apple_account` | Medium-high | Implemented and used by iLoader, but private API behavior can change. |
 | Anisette | `isideload` remote v3 provider; self-hosted provider later | Medium | Pin the selected provider and make it replaceable. Do not silently send credentials to an unknown service. |
@@ -354,7 +355,7 @@ This constraint means unattended refresh after a cold restart is blocked until i
 - Stream upload to a newly created temporary file; apply configurable compressed and uncompressed size limits.
 - Require ZIP structure with exactly one top-level `Payload/*.app`, a parseable `Info.plist`, a safe bundle ID/version, and no absolute paths, `..` traversal, symlinks or duplicate/conflicting paths.
 - Cap file count, per-entry size, total expanded size and compression ratio before extraction.
-- Require `embedded.mobileprovision` for an already-signed Version 0.1 upload and parse its expiration for display. Installation remains the final signature/profile validity check because validity is device- and entitlement-dependent.
+- Do not trust or reuse any input `embedded.mobileprovision`. The signing adapter generates the profile for the selected device and the service parses only the resulting signed IPA's expiration for display. Installation remains the final signature/profile validity check because validity is device- and entitlement-dependent.
 - Calculate SHA-256 while streaming. Deduplicate by checksum, not filename.
 - Never pass user-controlled text through a shell. If a diagnostic CLI is used, call it with a fixed executable and argument array.
 
@@ -447,13 +448,13 @@ Do not begin Version 0.2 until all Version 0.1 gates pass on the actual N100/Pro
 2. Pairing survives mux, VM and backend restarts without a new Trust prompt.
 3. With the USB cable removed, mDNS sees the phone and the backend enumerates it as a network device.
 4. Malformed, traversal and oversized IPA fixtures are rejected safely.
-5. With the USB cable still removed, a known correctly signed IPA installs over Wi-Fi with progress and an understandable result.
+5. With the USB cable still removed, a safe unsigned or re-signable IPA is provisioned and signed locally, then installs over Wi-Fi with progress and an understandable result.
 6. A deliberately invalid signature/profile sent over Wi-Fi fails with a useful translated error and retained technical diagnostics.
 7. Network installation recovers after phone sleep, Wi-Fi reconnect, DHCP change, mux restart, backend restart and VM restart.
 8. The service stays within the VM's memory/CPU budget and leaves no staged IPA behind after success/failure.
 9. Authentication and log-redaction tests pass.
 
-There is no optional USB-only completion path. Apple-account work begins only after this Wi-Fi Version 0.1 gate and the passwordless session-persistence proof-of-concept both pass.
+There is no optional USB-only completion path. Apple-account, 2FA, provisioning and signing are Version 0.1 gates. Automatic refresh remains deferred until a passwordless session-persistence proof-of-concept passes.
 
 ## Primary sources
 

@@ -1,0 +1,51 @@
+# Run iPhoneLoadly API with systemd
+
+This deployment keeps the API on `127.0.0.1:8080`. It requires the local anisette
+container to remain bound to `127.0.0.1:6970` and does not store Apple credentials.
+After an API restart, sign in with Apple again before creating an installation job.
+
+Build the release binary, install it below `/opt`, then install the unit and its
+root-only environment file:
+
+```bash
+cd ~/iphoneloadly
+cargo build --release -p iphoneloadly-api
+sudo install -d -o root -g root -m 0755 /opt/iphoneloadly/bin /var/lib/iphoneloadly /etc/iphoneloadly
+sudo install -o root -g root -m 0755 target/release/iphoneloadly-api /opt/iphoneloadly/bin/iphoneloadly-api
+sudo install -o root -g root -m 0644 deploy/systemd/iphoneloadly-api.service /etc/systemd/system/iphoneloadly-api.service
+sudo install -o root -g root -m 0600 deploy/systemd/iphoneloadly-api.env.example /etc/iphoneloadly/api.env
+sudoedit /etc/iphoneloadly/api.env
+```
+
+Set `IPHONELOADLY_PAIRING_FILE` to the actual existing pairing plist. Do not put an
+Apple-ID password or a two-factor code in this file.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now iphoneloadly-api
+sudo systemctl status iphoneloadly-api --no-pager
+curl --fail --silent http://127.0.0.1:8080/healthz
+```
+
+For logs:
+
+```bash
+sudo journalctl -u iphoneloadly-api -f
+```
+
+## Daily refresh timer
+
+The timer checks each day, but only queues an IPA/device pair once its latest
+successful installation is at least six days old—about one day before the free
+Apple signing period expires. It skips a target that already has a queued or
+active job. Apple login state is deliberately memory-only: after an API or host
+restart, sign in with Apple once from the local dashboard before the timer can
+refresh apps.
+
+```bash
+sudo install -o root -g root -m 0644 deploy/systemd/iphoneloadly-refresh.service /etc/systemd/system/iphoneloadly-refresh.service
+sudo install -o root -g root -m 0644 deploy/systemd/iphoneloadly-refresh.timer /etc/systemd/system/iphoneloadly-refresh.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now iphoneloadly-refresh.timer
+systemctl list-timers iphoneloadly-refresh.timer
+```

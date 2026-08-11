@@ -53,7 +53,7 @@ The script:
 2. Installs Debian packages for usbmuxd, libimobiledevice, ideviceinstaller and Avahi.
 3. Downloads exactly `netmuxd` v0.4.3 for x86-64 Linux.
 4. Verifies release-archive SHA-256 `85b6598284fc639f2a282584461d05e2090b79bdf3ec949d2a5e5d3dc655dde4` before extraction.
-5. Installs diagnostic-only `pymobiledevice3` 9.36.3 in `/opt/iphoneloadly-tools`; it is not linked into the future server.
+5. Installs diagnostic-only `pymobiledevice3` 10.7.3 in `/opt/iphoneloadly-tools`; it is not linked into the future server.
 6. Creates the `iphoneloadly-mux` system group.
 7. Starts Avahi and the hardened `iphoneloadly-netmuxd` service.
 
@@ -159,6 +159,15 @@ sudo env USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock \
 
 Expected product version is `26.5`. Debian's libimobiledevice and ideviceinstaller packages predate iOS 26.5; failure here is therefore a compatibility result to diagnose, not permission to fall back to USB installation.
 
+If the Debian `idevice_*` client cannot enumerate the netmuxd socket despite a successful netmuxd discovery log, validate the existing USB-onboarding pairing record directly over TCP instead:
+
+```sh
+sudo /opt/iphoneloadly-tools/pymobiledevice3/bin/python \
+  scripts/verify-wifi-direct.py --host '<IPHONE_IP>' --udid '<UDID>'
+```
+
+This diagnostic does not pair, install an IPA, or print pairing-record material.
+
 ## 6. Run the read-only preflight
 
 ```sh
@@ -201,4 +210,4 @@ USB must remain disconnected. Version 0.1 may proceed to its native Rust device 
 - [Debian 13 ideviceinstaller](https://packages.debian.org/trixie/ideviceinstaller)
 - [Debian 13 Avahi utilities](https://packages.debian.org/trixie/avahi-utils)
 - [netmuxd v0.4.3 releases](https://github.com/jkcoxson/netmuxd/releases/tag/v0.4.3)
-- [pymobiledevice3](https://pypi.org/project/pymobiledevice3/9.36.3/)
+- [pymobiledevice3](https://pypi.org/project/pymobiledevice3/10.7.3/)
