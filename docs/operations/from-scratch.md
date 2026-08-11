@@ -37,21 +37,18 @@ sudo docker run -d --name iphoneloadly-anisette-source --restart unless-stopped 
 curl --fail --silent http://127.0.0.1:6970/ >/dev/null
 ```
 
-## 3. Build and configure the API
+## 3. Build a versioned release and install the API
 
 ```bash
 . "$HOME/.cargo/env"
 cd ~/iphoneloadly
-cargo build --release -p iphoneloadly-api
-sudo install -d -o root -g root -m 0755 /opt/iphoneloadly/bin /var/lib/iphoneloadly /etc/iphoneloadly
-sudo install -o root -g root -m 0755 target/release/iphoneloadly-api /opt/iphoneloadly/bin/iphoneloadly-api
-sudo install -o root -g root -m 0644 deploy/systemd/iphoneloadly-api.service /etc/systemd/system/iphoneloadly-api.service
-sudo install -o root -g root -m 0600 deploy/systemd/iphoneloadly-api.env.example /etc/iphoneloadly/api.env
-sudoedit /etc/iphoneloadly/api.env
+bash deploy/release/build-release.sh
 ```
 
-Set the device ID, iPhone IP, and pairing plist path in `/etc/iphoneloadly/api.env`.
-Do not put an Apple-ID password or a two-factor code in that file.
+Continue with `docs/operations/quick-start.md` and use the generated archive in
+`dist/`. The installer creates `/etc/iphoneloadly/api.env` from the device ID,
+iPhone IP, pairing plist path, and local anisette URL supplied on its command line.
+It does not accept or store an Apple-ID password or a two-factor code.
 
 Continue with `docs/operations/api-systemd.md` to enable the API and refresh timer.
 

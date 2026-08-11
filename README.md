@@ -8,10 +8,18 @@ the seven-day signing period.
 Apple passwords and two-factor codes are never written to disk. An Apple login is
 therefore required after an API or host restart.
 
-## Quick start
+## Installation
 
-Use the complete [from-scratch guide](docs/operations/from-scratch.md). Existing
-hosts should use the [systemd operations guide](docs/operations/api-systemd.md).
+For a ready-to-install server use the [quick-start guide](docs/operations/quick-start.md).
+To build a release archive yourself, run:
+
+```bash
+bash deploy/release/build-release.sh
+```
+
+For host prerequisites and the one-time iPhone pairing ceremony use the complete
+[from-scratch guide](docs/operations/from-scratch.md). Existing hosts should use
+the [systemd operations guide](docs/operations/api-systemd.md).
 
 The dashboard is deliberately bound to `127.0.0.1:8080`; access it through an SSH
 tunnel, or use the documented [Caddy LAN proxy](docs/operations/caddy-lan.md).
@@ -21,6 +29,7 @@ tunnel, or use the documented [Caddy LAN proxy](docs/operations/caddy-lan.md).
 - [Debian 13.6 host preparation runbook](docs/operations/debian13-host-preparation.md)
 - [Test IPA strategy](docs/operations/test-ipa-strategy.md)
 - [From-scratch installation](docs/operations/from-scratch.md)
+- [Quick start from a release archive](docs/operations/quick-start.md)
 - [API and refresh operations](docs/operations/api-systemd.md)
 - [Caddy LAN proxy](docs/operations/caddy-lan.md)
 

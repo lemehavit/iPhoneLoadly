@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
+version="$(tr -d '[:space:]' < "${repo_root}/VERSION")"
+[[ -n "${version}" ]] || { echo "VERSION is empty." >&2; exit 1; }
+command -v cargo >/dev/null || { echo "Cargo is required." >&2; exit 1; }
+
+(cd "${repo_root}" && cargo build --locked --release -p iphoneloadly-api)
+
+dist_root="${repo_root}/dist"
+release_name="iphoneloadly-v${version}-linux-amd64"
+release_dir="${dist_root}/${release_name}"
+case "${release_dir}" in "${dist_root}"/*) ;; *) echo "Unsafe release directory." >&2; exit 1;; esac
+rm -rf -- "${release_dir}"
+mkdir -p "${release_dir}/bin" "${release_dir}/deploy/systemd" "${release_dir}/deploy/caddy" "${release_dir}/scripts" "${release_dir}/docs"
+
+install -m 0755 "${repo_root}/target/release/iphoneloadly-api" "${release_dir}/bin/iphoneloadly-api"
+install -m 0755 "${repo_root}/deploy/host/install-iphoneloadly.sh" "${release_dir}/install-iphoneloadly.sh"
+install -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-api.service" "${release_dir}/deploy/systemd/iphoneloadly-api.service"
+install -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.service" "${release_dir}/deploy/systemd/iphoneloadly-refresh.service"
+install -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.timer" "${release_dir}/deploy/systemd/iphoneloadly-refresh.timer"
+install -m 0644 "${repo_root}/deploy/caddy/Caddyfile.example" "${release_dir}/deploy/caddy/Caddyfile.example"
+install -m 0755 "${repo_root}/scripts/backup-state.sh" "${release_dir}/scripts/backup-state.sh"
+install -m 0755 "${repo_root}/scripts/restore-state.sh" "${release_dir}/scripts/restore-state.sh"
+install -m 0644 "${repo_root}/docs/operations/quick-start.md" "${release_dir}/docs/quick-start.md"
+
+(cd "${dist_root}" && tar -czf "${release_name}.tar.gz" "${release_name}")
+(cd "${dist_root}" && sha256sum "${release_name}.tar.gz" > "${release_name}.tar.gz.sha256")
+printf 'Release created:\n%s\n%s\n' "${dist_root}/${release_name}.tar.gz" "${dist_root}/${release_name}.tar.gz.sha256"

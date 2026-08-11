@@ -12,8 +12,9 @@ pairing_file="$(find /var/lib/lockdown -maxdepth 1 -type f -name '00008110-*.pli
 [[ -n "${pairing_file}" ]] || { echo "No iPhone pairing file found." >&2; exit 1; }
 
 install -d -o root -g root -m 0700 "${backup_dir}"
-tar -C / -czf "${backup_dir}/iphoneloadly-system.tar.gz" \
-  etc/iphoneloadly var/lib/iphoneloadly "${pairing_file#/}"
+archive_paths=(etc/iphoneloadly var/lib/iphoneloadly "${pairing_file#/}")
+[[ -d /etc/caddy ]] && archive_paths+=(etc/caddy)
+tar -C / -czf "${backup_dir}/iphoneloadly-system.tar.gz" "${archive_paths[@]}"
 
 docker run --rm \
   -v "${anisette_volume}:/source:ro" \

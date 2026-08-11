@@ -49,3 +49,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now iphoneloadly-refresh.timer
 systemctl list-timers iphoneloadly-refresh.timer
 ```
+
+## Backup and restore
+
+The installed commands create a checksum-verified backup and verify a backup
+without changing the host:
+
+```bash
+sudo iphoneloadly-backup
+sudo iphoneloadly-restore --verify /var/backups/iphoneloadly/REPLACE-WITH-BACKUP-DIRECTORY
+```
+
+Use `sudo iphoneloadly-restore --apply BACKUP_DIRECTORY` only when recovering a
+host. It stops the API and asks you to type `RESTORE` before overwriting state.
