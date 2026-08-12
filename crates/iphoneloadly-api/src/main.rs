@@ -505,7 +505,7 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
 }
 
 async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
-    let Some(field) = multipart.next_field().await.ok().flatten() else {
+    let Some(mut field) = multipart.next_field().await.ok().flatten() else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"message":"Expected an IPA file field."})),
