@@ -15,17 +15,22 @@ release_name="iphoneloadly-v${version}-linux-amd64"
 release_dir="${dist_root}/${release_name}"
 case "${release_dir}" in "${dist_root}"/*) ;; *) echo "Unsafe release directory." >&2; exit 1;; esac
 rm -rf -- "${release_dir}"
-mkdir -p "${release_dir}/bin" "${release_dir}/deploy/systemd" "${release_dir}/deploy/caddy" "${release_dir}/scripts" "${release_dir}/docs"
+mkdir -p "${release_dir}/bin" "${release_dir}/deploy/host" "${release_dir}/deploy/systemd" "${release_dir}/deploy/caddy" "${release_dir}/scripts" "${release_dir}/docs"
 
 install -m 0755 "${repo_root}/target/release/iphoneloadly-api" "${release_dir}/bin/iphoneloadly-api"
 install -m 0755 "${repo_root}/deploy/host/install-iphoneloadly.sh" "${release_dir}/install-iphoneloadly.sh"
+install -m 0755 "${repo_root}/deploy/host/install.sh" "${release_dir}/install.sh"
+install -m 0755 "${repo_root}/deploy/host/install-debian13.sh" "${release_dir}/deploy/host/install-debian13.sh"
 install -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-api.service" "${release_dir}/deploy/systemd/iphoneloadly-api.service"
 install -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.service" "${release_dir}/deploy/systemd/iphoneloadly-refresh.service"
 install -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.timer" "${release_dir}/deploy/systemd/iphoneloadly-refresh.timer"
 install -m 0644 "${repo_root}/deploy/caddy/Caddyfile.example" "${release_dir}/deploy/caddy/Caddyfile.example"
 install -m 0755 "${repo_root}/scripts/backup-state.sh" "${release_dir}/scripts/backup-state.sh"
 install -m 0755 "${repo_root}/scripts/restore-state.sh" "${release_dir}/scripts/restore-state.sh"
-install -m 0644 "${repo_root}/docs/operations/quick-start.md" "${release_dir}/docs/quick-start.md"
+install -m 0755 "${repo_root}/scripts/preflight-wifi.sh" "${release_dir}/scripts/preflight-wifi.sh"
+install -m 0755 "${repo_root}/scripts/iphoneloadly-doctor.sh" "${release_dir}/scripts/iphoneloadly-doctor.sh"
+install -m 0644 "${repo_root}/docs/INSTALL.md" "${release_dir}/docs/INSTALL.md"
+install -m 0644 "${repo_root}/deploy/host/THIRD_PARTY_NOTICES.md" "${release_dir}/THIRD_PARTY_NOTICES.md"
 
 (cd "${dist_root}" && tar -czf "${release_name}.tar.gz" "${release_name}")
 (cd "${dist_root}" && sha256sum "${release_name}.tar.gz" > "${release_name}.tar.gz.sha256")

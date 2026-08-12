@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use axum::{extract::{DefaultBodyLimit, Multipart, Path, State}, http::StatusCode, response::{Html, IntoResponse}, routing::{get, post}, Json, Router};
 use serde::Serialize;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -405,12 +406,34 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
     let id = Uuid::now_v7();
     let temporary = state.apps_dir.join(format!(".{id}.upload"));
     let final_path = state.apps_dir.join(format!("{id}.ipa"));
-    let Ok(bytes) = field.bytes().await else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"Unable to read IPA upload."}))).into_response();
+    let Ok(mut output) = tokio::fs::File::create(&temporary).await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to store IPA upload."}))).into_response();
     };
-    if tokio::fs::write(&temporary, bytes).await.is_err() {
+    let mut written = 0_u64;
+    loop {
+        let chunk = match field.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"Unable to read IPA upload."}))).into_response();
+            }
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > ipa::MAX_COMPRESSED_BYTES {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"message":"IPA exceeds the 2 GiB upload limit."}))).into_response();
+        }
+        if output.write_all(&chunk).await.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to store IPA upload."}))).into_response();
+        }
+    }
+    if output.flush().await.is_err() || output.sync_all().await.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to store IPA upload."}))).into_response();
     }
+    drop(output);
     let inspected = ipa::inspect_ipa(&temporary);
     match inspected {
         Ok(metadata) => {

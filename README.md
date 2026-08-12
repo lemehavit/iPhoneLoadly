@@ -1,36 +1,75 @@
 # iPhoneLoadly
 
-Self-hosted Debian service for Apple-ID IPA signing and trusted Wi-Fi installation.
-It includes a localhost-only dashboard, locally hosted anisette, systemd deployment,
-and a daily refresh check that re-installs apps only when about one day remains of
-the seven-day signing period.
+Self-hosted IPA signing, Wi-Fi installation, and refresh support for a trusted
+iPhone from a Debian server.
 
-Apple passwords and two-factor codes are never written to disk. An Apple login is
-therefore required after an API or host restart.
+> Self-host IPA signing and installation for your iPhone, then check for refreshes over Wi-Fi before the typical 7-day free-signing period expires.
 
-## Installation
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](VERSION)
+[![Rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![CI](https://github.com/lemehavit/iPhoneLoadly/actions/workflows/ci.yml/badge.svg)](https://github.com/lemehavit/iPhoneLoadly/actions/workflows/ci.yml)
 
-For a ready-to-install server use the [quick-start guide](docs/operations/quick-start.md).
-To build a release archive yourself, run:
+> [!WARNING]
+> iPhoneLoadly is experimental alpha software. Apple’s services and iOS device
+> protocols can change without notice; expect breaking changes and do not rely
+> on it as your only sideloading solution.
 
-```bash
-bash deploy/release/build-release.sh
-```
+## Features
 
-For host prerequisites and the one-time iPhone pairing ceremony use the complete
-[from-scratch guide](docs/operations/from-scratch.md). Existing hosts should use
-the [systemd operations guide](docs/operations/api-systemd.md).
+- Self-hosted Rust service for Debian 13 amd64
+- Local Apple-ID signing session and interactive two-factor authentication
+- One-time USB trust/pairing, followed by trusted Wi-Fi device transport
+- Browser dashboard that remains bound to localhost by default
+- IPA upload validation, SHA-256 inspection, and signing/install job tracking
+- Daily refresh check for apps installed about six days earlier
+- Systemd deployment, host diagnostics, backup, and recovery tools
 
-The dashboard is deliberately bound to `127.0.0.1:8080`; access it through an SSH
-tunnel, or use the documented [Caddy LAN proxy](docs/operations/caddy-lan.md).
+## How it works
 
-- [Technical feasibility and architecture assessment](docs/architecture-assessment.md)
-- [Version 0.1 implementation and test plan](docs/mvp-v0.1-plan.md)
-- [Debian 13.6 host preparation runbook](docs/operations/debian13-host-preparation.md)
-- [Test IPA strategy](docs/operations/test-ipa-strategy.md)
-- [From-scratch installation](docs/operations/from-scratch.md)
-- [Quick start from a release archive](docs/operations/quick-start.md)
-- [API and refresh operations](docs/operations/api-systemd.md)
-- [Caddy LAN proxy](docs/operations/caddy-lan.md)
+1. iPhoneLoadly runs on a Debian 13 amd64 server.
+2. You connect and unlock the iPhone over USB once, then accept its Trust prompt.
+3. The host creates a local pairing record, which is sensitive device-access material.
+4. Wi-Fi connections are enabled; later app work uses the trusted network path.
+5. You sign into Apple through the local dashboard and complete 2FA when asked.
+6. iPhoneLoadly signs and installs uploaded IPA files for the configured phone.
+7. Its systemd timer checks whether a successful installation is about six days old
+   and queues a refresh when the Apple signing session and phone are available.
 
-The short conclusion is: build a new headless Rust service around the MIT-licensed `idevice` and `isideload` libraries used by iLoader; use USB only for the initial iPhone trust/pairing ceremony; and make Wi-Fi discovery, local Apple-account provisioning/signing, transfer, installation, and eventual automatic refresh mandatory acceptance criteria. Signing happens locally on the server and does not itself use a device transport.
+An Apple ID is required because Apple provisioning, certificates, and device
+registration are part of signing. Passwords and two-factor responses are held in
+memory only: restarting the API or server requires a new login. Pairing records,
+uploaded IPAs, and backups should be treated as sensitive local data.
+
+## Install iPhoneLoadly
+
+Follow the single beginner path in [docs/INSTALL.md](docs/INSTALL.md). It starts
+with an empty Debian 13 host, uses a GitHub Release archive when one is available,
+and finishes at the local dashboard. Source builds are documented as an advanced
+option. The API deliberately stays on `127.0.0.1:8080`; use an SSH tunnel or the
+optional [Caddy LAN proxy guide](docs/operations/caddy-lan.md) rather than
+exposing Apple credential endpoints directly.
+
+Detailed material remains available under [docs/](docs/), including host Wi-Fi
+pairing, systemd operations, architecture, and test-IPA guidance.
+
+## Security and licensing
+
+Read [SECURITY.md](SECURITY.md) before deployment. iPhoneLoadly’s own source is
+licensed under the [MIT License](LICENSE). Host tooling and dependencies retain
+their own licenses; see [third-party notices](deploy/host/THIRD_PARTY_NOTICES.md).
+The `isideload` Git dependency is intentionally pinned to its
+`apple-codesign-quick` branch because published releases do not yet include the
+signing backend this project uses; Cargo.lock records the resolved revision.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Suggested GitHub topics: `iphone`,
+`ios`, `ipa`, `sideloading`, `ios-sideloading`, `rust`, `self-hosted`, and
+`debian`.
+
+## Support
+
+If iPhoneLoadly helps you, support is welcome but never expected:
+[Buy Me a Coffee](https://buymeacoffee.com/lemehavit) or
+[PayPal](https://paypal.me/lemehavit).

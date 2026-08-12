@@ -66,6 +66,8 @@ sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-r
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/caddy/Caddyfile.example" /usr/share/iphoneloadly/Caddyfile.example
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/backup-state.sh" /usr/local/sbin/iphoneloadly-backup
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/restore-state.sh" /usr/local/sbin/iphoneloadly-restore
+sudo install -o root -g root -m 0755 "${repo_root}/scripts/iphoneloadly-doctor.sh" /usr/local/sbin/iphoneloadly-doctor
+sudo install -o root -g root -m 0755 "${repo_root}/scripts/preflight-wifi.sh" /usr/share/iphoneloadly/scripts/preflight-wifi.sh
 sudo install -o root -g root -m 0600 "${temporary_env}" /etc/iphoneloadly/api.env
 
 sudo systemctl daemon-reload
