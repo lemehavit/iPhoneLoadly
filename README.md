@@ -1,5 +1,7 @@
 # iPhoneLoadly
 
+buymeacoffee.com/lemehavit
+
 Self-hosted Debian service for Apple-ID IPA signing and trusted Wi-Fi installation.
 It includes a localhost-only dashboard, locally hosted anisette, systemd deployment,
 and a daily refresh check that re-installs apps only when about one day remains of
