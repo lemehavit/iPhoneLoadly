@@ -70,14 +70,6 @@ pub fn insert_app(
     Ok(())
 }
 
-pub fn app_exists(connection: &Connection, id: Uuid) -> rusqlite::Result<bool> {
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM apps WHERE id = ?1)",
-        [id.to_string()],
-        |row| row.get(0),
-    )
-}
-
 pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<String>> {
     let mut statement = connection.prepare("SELECT storage_path FROM apps WHERE id = ?1")?;
     let mut rows = statement.query([id.to_string()])?;

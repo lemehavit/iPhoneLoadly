@@ -1,4 +1,9 @@
-//! Persistable job-state vocabulary. Database storage follows in the next increment.
+//! API-only job-state values.
+//!
+//! Version 0.1 persists installation progress as strings in SQLite so a job can
+//! report its current transport phase after a restart. `Queued` is the only
+//! typed value constructed by the asynchronous job-creation response; the
+//! persisted phase is returned by the job-status endpoint.
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -7,17 +12,6 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
     Queued,
-    AuthenticatingApple,
-    AwaitingTwoFactorCode,
-    Provisioning,
-    Signing,
-    Connecting,
-    Staging,
-    Installing,
-    Verifying,
-    CleaningUp,
-    Succeeded,
-    Failed,
 }
 
 #[derive(Debug, Clone, Serialize)]
