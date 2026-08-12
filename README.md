@@ -44,5 +44,5 @@ If this little tool saved you some time, you can support my work here:
 </a>
 
 <a href="https://paypal.me/lemehavit">
-  <img src="https://img.shields.io/badge/PayPal-Support%20me-0070BA?logo=paypal&logoColor=white" height="50" alt="PayPal">
+  <img src="https://img.shields.io/badge/PayPal-Support%20me-0070BA?logo=paypal&logoColor=white" height="100" alt="PayPal">
 </a>
