@@ -1,6 +1,6 @@
 # iPhoneLoadly
 
-buymeacoffee.com/lemehavit
+[![Buy Me a Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/lemehavit)
 
 Self-hosted Debian service for Apple-ID IPA signing and trusted Wi-Fi installation.
 It includes a localhost-only dashboard, locally hosted anisette, systemd deployment,
