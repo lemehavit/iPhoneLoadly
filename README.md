@@ -71,5 +71,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Suggested GitHub topics: `iphone`,
 ## Support
 
 If iPhoneLoadly helps you, support is welcome but never expected:
-[Buy Me a Coffee](https://buymeacoffee.com/lemehavit) or
-[PayPal](https://paypal.me/lemehavit).
+<a href="https://buymeacoffee.com/lemehavit">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50" alt="Buy Me a Coffee">
+</a>
+
+<a href="https://paypal.me/lemehavit">
+  <img src="https://img.shields.io/badge/PayPal-Support%20me-0070BA?logo=paypal&logoColor=white" height="50" alt="PayPal">
+</a>
