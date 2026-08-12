@@ -5,7 +5,7 @@ The host installer downloads these tools from their upstream distribution channe
 | Component | Pinned version | License | Source |
 |---|---:|---|---|
 | netmuxd | 0.4.3 | LGPL-2.1-only | <https://github.com/jkcoxson/netmuxd/tree/v0.4.3> |
-| pymobiledevice3 | 9.36.3 | GPL-3.0-or-later | <https://pypi.org/project/pymobiledevice3/9.36.3/> |
+| pymobiledevice3 | 10.7.3 | GPL-3.0-or-later | <https://pypi.org/project/pymobiledevice3/10.7.3/> |
 | Debian usbmuxd | Debian 13 package | GPL-3.0 | <https://packages.debian.org/trixie/usbmuxd> |
 | Debian libimobiledevice | Debian 13 package | LGPL-2.1 | <https://packages.debian.org/trixie/libimobiledevice-utils> |
 | Debian ideviceinstaller | Debian 13 package | GPL-2.0 | <https://packages.debian.org/trixie/ideviceinstaller> |

@@ -70,14 +70,6 @@ pub fn insert_app(
     Ok(())
 }
 
-pub fn app_exists(connection: &Connection, id: Uuid) -> rusqlite::Result<bool> {
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM apps WHERE id = ?1)",
-        [id.to_string()],
-        |row| row.get(0),
-    )
-}
-
 pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<String>> {
     let mut statement = connection.prepare("SELECT storage_path FROM apps WHERE id = ?1")?;
     let mut rows = statement.query([id.to_string()])?;
@@ -88,9 +80,8 @@ pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<St
 }
 
 pub fn list_apps(connection: &Connection) -> rusqlite::Result<Vec<StoredApp>> {
-    let mut statement = connection.prepare(
-        "SELECT id, sha256, size_bytes FROM apps ORDER BY uploaded_at DESC",
-    )?;
+    let mut statement =
+        connection.prepare("SELECT id, sha256, size_bytes FROM apps ORDER BY uploaded_at DESC")?;
     statement
         .query_map([], |row| {
             let id: String = row.get(0)?;
@@ -129,7 +120,11 @@ pub fn refresh_due_targets(connection: &Connection) -> rusqlite::Result<Vec<(Uui
         .collect()
 }
 
-pub fn active_job_exists(connection: &Connection, app_id: Uuid, device_id: Uuid) -> rusqlite::Result<bool> {
+pub fn active_job_exists(
+    connection: &Connection,
+    app_id: Uuid,
+    device_id: Uuid,
+) -> rusqlite::Result<bool> {
     connection.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM jobs
@@ -141,7 +136,12 @@ pub fn active_job_exists(connection: &Connection, app_id: Uuid, device_id: Uuid)
     )
 }
 
-pub fn insert_job(connection: &Connection, id: Uuid, app_id: Uuid, device_id: Uuid) -> rusqlite::Result<()> {
+pub fn insert_job(
+    connection: &Connection,
+    id: Uuid,
+    app_id: Uuid,
+    device_id: Uuid,
+) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO jobs (id, app_id, device_id, phase, created_at) VALUES (?1, ?2, ?3, 'queued', datetime('now'))",
         (id.to_string(), app_id.to_string(), device_id.to_string()),
@@ -150,9 +150,8 @@ pub fn insert_job(connection: &Connection, id: Uuid, app_id: Uuid, device_id: Uu
 }
 
 pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<StoredJob>> {
-    let mut statement = connection.prepare(
-        "SELECT id, app_id, device_id, phase FROM jobs WHERE id = ?1",
-    )?;
+    let mut statement =
+        connection.prepare("SELECT id, app_id, device_id, phase FROM jobs WHERE id = ?1")?;
     let mut rows = statement.query([id.to_string()])?;
     let Some(row) = rows.next()? else {
         return Ok(None);

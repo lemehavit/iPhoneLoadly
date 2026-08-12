@@ -1,4 +1,7 @@
-# From-scratch installation
+# From-scratch installation (advanced)
+
+For the supported beginner path, start with [INSTALL.md](../INSTALL.md). This
+document is retained for source-build and host-internals users.
 
 This guide installs iPhoneLoadly on Debian 13 amd64. The API stays on localhost;
 use an SSH tunnel from a browser machine rather than exposing it directly.
@@ -6,7 +9,7 @@ use an SSH tunnel from a browser machine rather than exposing it directly.
 ## 1. Obtain the repository and host prerequisites
 
 ```bash
-git clone https://github.com/lemehavit/lokal-ipa-signerare.git ~/iphoneloadly
+git clone https://github.com/lemehavit/iPhoneLoadly.git ~/iphoneloadly
 cd ~/iphoneloadly
 sudo bash deploy/host/install-debian13.sh
 sudo apt-get install --yes docker.io

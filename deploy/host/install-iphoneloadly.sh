@@ -19,6 +19,7 @@ pairing_file=""
 api_binary=""
 anisette_url="http://127.0.0.1:6970"
 rust_log="info"
+check_package_layout=false
 
 while (($#)); do
   case "$1" in
@@ -28,17 +29,44 @@ while (($#)); do
     --binary) api_binary="${2:?}"; shift 2 ;;
     --anisette-url) anisette_url="${2:?}"; shift 2 ;;
     --rust-log) rust_log="${2:?}"; shift 2 ;;
+    --check-package-layout) check_package_layout=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+find_package_root() {
+  local candidate
+  for candidate in "${script_dir}" "${script_dir}/../.."; do
+    candidate="$(CDPATH= cd -- "${candidate}" 2>/dev/null && pwd)" || continue
+    if [[ -f "${candidate}/deploy/systemd/iphoneloadly-api.service" && ( -f "${candidate}/Cargo.toml" || -f "${candidate}/bin/iphoneloadly-api" ) ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+repo_root="$(find_package_root)" || { echo 'Unable to locate iPhoneLoadly package files.' >&2; exit 1; }
+
+if [[ "${check_package_layout}" == true ]]; then
+  for required in \
+    "${repo_root}/deploy/systemd/iphoneloadly-api.service" \
+    "${repo_root}/deploy/systemd/iphoneloadly-refresh.service" \
+    "${repo_root}/deploy/systemd/iphoneloadly-refresh.timer" \
+    "${repo_root}/deploy/caddy/Caddyfile.example" \
+    "${repo_root}/scripts/iphoneloadly-doctor.sh" \
+    "${repo_root}/scripts/preflight-wifi.sh" \
+    "${repo_root}/scripts/backup-state.sh"; do
+    [[ -f "${required}" ]] || { echo "Release package is missing ${required#"${repo_root}/"}" >&2; exit 1; }
+  done
+  printf 'Application installer package root is valid: %s\n' "${repo_root}"
+  exit 0
+fi
+
 [[ -n "${device_id}" && -n "${device_ip}" && -n "${pairing_file}" ]] || { usage >&2; exit 2; }
 [[ -r "${pairing_file}" ]] || { echo "Pairing file is not readable: ${pairing_file}" >&2; exit 1; }
 command -v sudo >/dev/null || { echo "sudo is required." >&2; exit 1; }
-
-script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
 
 if [[ -z "${api_binary}" ]]; then
   command -v cargo >/dev/null || { echo "Cargo is required when --binary is omitted." >&2; exit 1; }
@@ -66,6 +94,8 @@ sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-r
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/caddy/Caddyfile.example" /usr/share/iphoneloadly/Caddyfile.example
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/backup-state.sh" /usr/local/sbin/iphoneloadly-backup
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/restore-state.sh" /usr/local/sbin/iphoneloadly-restore
+sudo install -o root -g root -m 0755 "${repo_root}/scripts/iphoneloadly-doctor.sh" /usr/local/sbin/iphoneloadly-doctor
+sudo install -o root -g root -m 0755 "${repo_root}/scripts/preflight-wifi.sh" /usr/share/iphoneloadly/scripts/preflight-wifi.sh
 sudo install -o root -g root -m 0600 "${temporary_env}" /etc/iphoneloadly/api.env
 
 sudo systemctl daemon-reload

@@ -1,4 +1,7 @@
-# Quick start
+# Legacy quick start
+
+For the supported beginner path, start with [INSTALL.md](../INSTALL.md). This
+page remains as a compact reference for an already prepared host.
 
 Use a versioned release archive on Debian 13 amd64. It contains the compiled API,
 systemd units, Caddy template, and backup tooling. Before installing, complete the

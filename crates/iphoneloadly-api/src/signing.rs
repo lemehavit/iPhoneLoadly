@@ -1,13 +1,13 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use idevice::provider::TcpProvider;
 use isideload::{
     anisette::remote_v3::RemoteV3AnisetteProvider,
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
     dev::developer_session::DeveloperSession,
-    sideload::{builder::MaxCertsBehavior, SideloaderBuilder, sideloader::Sideloader},
+    sideload::{SideloaderBuilder, builder::MaxCertsBehavior, sideloader::Sideloader},
     util::storage::InMemoryStorage,
 };
-use idevice::provider::TcpProvider;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
@@ -64,7 +64,10 @@ impl LoginAttempt {
         state.message = message.into();
     }
 
-    async fn wait_for_two_factor(&self, params: TwoFactorCallbackParams) -> TwoFactorCallbackResponse {
+    async fn wait_for_two_factor(
+        &self,
+        params: TwoFactorCallbackParams,
+    ) -> TwoFactorCallbackResponse {
         {
             let mut state = self.state.lock().await;
             *state = LoginStatus {
@@ -106,7 +109,8 @@ impl LoginAttempt {
             id: self.id,
             phase: LoginPhase::Failed,
             two_factor: None,
-            message: "Apple authentication failed. Check the server logs for redacted diagnostics.".into(),
+            message: "Apple authentication failed. Check the server logs for redacted diagnostics."
+                .into(),
         };
         tracing::warn!(login_id = %self.id, error = %error, "Apple authentication failed");
     }
@@ -152,8 +156,15 @@ impl AppleSigningProvider {
         self.anisette_url.is_some()
     }
 
-    pub async fn begin_login(self: &Arc<Self>, email: String, password: String) -> Result<LoginStatus, SigningError> {
-        let anisette_url = self.anisette_url.clone().ok_or(SigningError::MissingAnisetteUrl)?;
+    pub async fn begin_login(
+        self: &Arc<Self>,
+        email: String,
+        password: String,
+    ) -> Result<LoginStatus, SigningError> {
+        let anisette_url = self
+            .anisette_url
+            .clone()
+            .ok_or(SigningError::MissingAnisetteUrl)?;
         let id = Uuid::now_v7();
         let attempt = Arc::new(LoginAttempt::new(id));
         self.attempts.lock().await.insert(id, attempt.clone());
@@ -161,7 +172,9 @@ impl AppleSigningProvider {
         let provider = self.clone();
         let background_attempt = attempt.clone();
         tokio::spawn(async move {
-            background_attempt.authenticating("Preparing the local anisette provider.").await;
+            background_attempt
+                .authenticating("Preparing the local anisette provider.")
+                .await;
             let anisette = match RemoteV3AnisetteProvider::new(
                 &anisette_url,
                 Box::new(InMemoryStorage::new()),
@@ -174,7 +187,9 @@ impl AppleSigningProvider {
                 }
             };
             let callback_attempt = background_attempt.clone();
-            background_attempt.authenticating("Contacting Apple through the local anisette provider.").await;
+            background_attempt
+                .authenticating("Contacting Apple through the local anisette provider.")
+                .await;
             let result = tokio::time::timeout(
                 // Apple may require a user-entered two-factor code. Give the
                 // user enough time to retrieve and submit it before timing out.
@@ -185,7 +200,8 @@ impl AppleSigningProvider {
                         let callback_attempt = callback_attempt.clone();
                         async move { Ok(callback_attempt.wait_for_two_factor(params).await) }
                     }),
-            ).await;
+            )
+            .await;
             let mut account = match result {
                 Ok(Ok(account)) => account,
                 Ok(Err(error)) => {
@@ -193,7 +209,9 @@ impl AppleSigningProvider {
                     return;
                 }
                 Err(_) => {
-                    background_attempt.failed("Apple authentication timed out after 90 seconds").await;
+                    background_attempt
+                        .failed("Apple authentication timed out after 90 seconds")
+                        .await;
                     return;
                 }
             };
@@ -222,7 +240,11 @@ impl AppleSigningProvider {
         Ok(attempt.status().await)
     }
 
-    pub async fn install_ipa(&self, provider: &TcpProvider, ipa_path: std::path::PathBuf) -> Result<(), SigningError> {
+    pub async fn install_ipa(
+        &self,
+        provider: &TcpProvider,
+        ipa_path: std::path::PathBuf,
+    ) -> Result<(), SigningError> {
         let mut sideloader = self.sideloader.lock().await;
         let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
         sideloader
@@ -243,14 +265,22 @@ impl AppleSigningProvider {
         number_id: Option<u32>,
     ) -> Result<(), SigningError> {
         let response = match action {
-            "submitCode" => TwoFactorCallbackResponse::SubmitCode(code.filter(|code| !code.trim().is_empty()).ok_or(SigningError::InvalidTwoFactorAction)?),
-            "sendSms" => TwoFactorCallbackResponse::SendSms(number_id.ok_or(SigningError::InvalidTwoFactorAction)?),
+            "submitCode" => TwoFactorCallbackResponse::SubmitCode(
+                code.filter(|code| !code.trim().is_empty())
+                    .ok_or(SigningError::InvalidTwoFactorAction)?,
+            ),
+            "sendSms" => TwoFactorCallbackResponse::SendSms(
+                number_id.ok_or(SigningError::InvalidTwoFactorAction)?,
+            ),
             "sendToDevices" => TwoFactorCallbackResponse::SendToDevices,
             "resendCode" => TwoFactorCallbackResponse::ResendCode,
             "abort" => TwoFactorCallbackResponse::Abort,
             _ => return Err(SigningError::InvalidTwoFactorAction),
         };
         let attempt = self.attempts.lock().await.get(&id).cloned();
-        attempt.ok_or(SigningError::UnknownSession)?.submit(response).await
+        attempt
+            .ok_or(SigningError::UnknownSession)?
+            .submit(response)
+            .await
     }
 }
