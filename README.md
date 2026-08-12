@@ -1,7 +1,5 @@
 # iPhoneLoadly
 
-[![Buy Me a Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/lemehavit)
-
 Self-hosted Debian service for Apple-ID IPA signing and trusted Wi-Fi installation.
 It includes a localhost-only dashboard, locally hosted anisette, systemd deployment,
 and a daily refresh check that re-installs apps only when about one day remains of
@@ -36,3 +34,9 @@ tunnel, or use the documented [Caddy LAN proxy](docs/operations/caddy-lan.md).
 - [Caddy LAN proxy](docs/operations/caddy-lan.md)
 
 The short conclusion is: build a new headless Rust service around the MIT-licensed `idevice` and `isideload` libraries used by iLoader; use USB only for the initial iPhone trust/pairing ceremony; and make Wi-Fi discovery, local Apple-account provisioning/signing, transfer, installation, and eventual automatic refresh mandatory acceptance criteria. Signing happens locally on the server and does not itself use a device transport.
+
+## ☕ Support
+
+If this little tool saved you some time, you can support my work here:
+
+[![Buy Me a Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/lemehavit)
