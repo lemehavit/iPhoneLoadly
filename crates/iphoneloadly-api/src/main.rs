@@ -5,8 +5,9 @@ mod store;
 
 use std::{
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as StdPath, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
@@ -39,12 +41,20 @@ struct DeviceSummary {
     product_type: String,
     ios_version: String,
     connection_type: ConnectionType,
+    status: DeviceStatus,
+    install_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ConnectionType {
     Network,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DeviceStatus {
+    Online,
 }
 
 /// Owns all Apple-account, 2FA, developer-resource, profile, and signing work.
@@ -68,6 +78,7 @@ trait DeviceTransport: Send + Sync {
     async fn install_ipa(
         &self,
         signing: &signing::AppleSigningProvider,
+        device_id: Uuid,
         ipa_path: PathBuf,
     ) -> Result<(), TransportError>;
 }
@@ -102,112 +113,171 @@ impl SigningProvider for signing::AppleSigningProvider {
     }
 }
 
-struct UnconfiguredTransport;
-
-struct ConfiguredNetworkTransport {
-    device: DeviceSummary,
-}
-
-struct DirectTcpTransport {
-    id: Uuid,
-    address: IpAddr,
+/// Resolves trusted Wi-Fi devices through netmuxd every time rather than
+/// retaining a DHCP address in configuration or process memory.
+struct NetmuxTransport {
+    mux_socket: String,
     pairing_path: PathBuf,
 }
 
 #[async_trait]
-impl DeviceTransport for UnconfiguredTransport {
+impl DeviceTransport for NetmuxTransport {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        Err(TransportError::Unavailable)
-    }
-
-    async fn install_ipa(
-        &self,
-        _: &signing::AppleSigningProvider,
-        _: PathBuf,
-    ) -> Result<(), TransportError> {
-        Err(TransportError::Unavailable)
-    }
-}
-
-#[async_trait]
-impl DeviceTransport for ConfiguredNetworkTransport {
-    async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        Ok(vec![self.device.clone()])
-    }
-
-    async fn install_ipa(
-        &self,
-        _: &signing::AppleSigningProvider,
-        _: PathBuf,
-    ) -> Result<(), TransportError> {
-        Err(TransportError::Unavailable)
-    }
-}
-
-#[async_trait]
-impl DeviceTransport for DirectTcpTransport {
-    async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        use idevice::IdeviceService;
-        use idevice::pairing_file::PairingFile;
-        use idevice::provider::TcpProvider;
-        use idevice::services::lockdown::LockdownClient;
-
-        let pairing_file = PairingFile::read_from_file(&self.pairing_path)
-            .map_err(|_| TransportError::Unavailable)?;
-        let provider = TcpProvider {
-            addr: self.address,
-            scope_id: None,
-            pairing_file: pairing_file.clone(),
-            label: "iPhoneLoadly".into(),
-        };
-        let mut client = LockdownClient::connect(&provider)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        client
-            .start_session(&pairing_file)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let device_name = client
-            .get_value(Some("DeviceName"), None)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let product_type = client
-            .get_value(Some("ProductType"), None)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let ios_version = client
-            .get_value(Some("ProductVersion"), None)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        Ok(vec![DeviceSummary {
-            id: self.id,
-            display_name: device_name.as_string().unwrap_or("iPhone").to_owned(),
-            product_type: product_type.as_string().unwrap_or("unknown").to_owned(),
-            ios_version: ios_version.as_string().unwrap_or("unknown").to_owned(),
-            connection_type: ConnectionType::Network,
-        }])
+        let devices = self.network_devices().await?;
+        let mut summaries = Vec::new();
+        for (udid, address) in devices {
+            match self.describe_device(&udid, address).await {
+                Ok(summary) => summaries.push(summary),
+                Err(_) => tracing::debug!(device_id = %device_id_for_udid(&udid), "skipping unreachable or untrusted network device"),
+            }
+        }
+        Ok(summaries)
     }
 
     async fn install_ipa(
         &self,
         signing: &signing::AppleSigningProvider,
+        device_id: Uuid,
         ipa_path: PathBuf,
     ) -> Result<(), TransportError> {
-        use idevice::pairing_file::PairingFile;
-        use idevice::provider::TcpProvider;
-
-        let pairing_file = PairingFile::read_from_file(&self.pairing_path)
-            .map_err(|_| TransportError::Unavailable)?;
-        let provider = TcpProvider {
-            addr: self.address,
-            scope_id: None,
-            pairing_file,
-            label: "iPhoneLoadly".into(),
-        };
+        let (udid, address) = self
+            .network_devices()
+            .await?
+            .into_iter()
+            .find(|(udid, _)| device_id_for_udid(udid) == device_id)
+            .ok_or(TransportError::Unavailable)?;
+        let provider = self.provider_for(&udid, address)?;
         signing
             .install_ipa(&provider, ipa_path)
             .await
             .map_err(|_| TransportError::InstallFailed)
+    }
+}
+
+impl NetmuxTransport {
+    async fn network_devices(&self) -> Result<Vec<(String, IpAddr)>, TransportError> {
+        #[cfg(not(unix))]
+        {
+            let _ = &self.mux_socket;
+            return Err(TransportError::Unavailable);
+        }
+        #[cfg(unix)]
+        {
+            use idevice::usbmuxd::{Connection, UsbmuxdAddr};
+
+            let address = UsbmuxdAddr::UnixSocket(self.mux_socket.clone());
+            let mut connection = tokio::time::timeout(Duration::from_secs(3), address.connect(0))
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
+            let devices = tokio::time::timeout(Duration::from_secs(3), connection.get_devices())
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
+            Ok(devices
+                .into_iter()
+                .filter_map(|device| match device.connection_type {
+                    Connection::Network(address) => Some((device.udid, address)),
+                    Connection::Usb | Connection::Unknown(_) => None,
+                })
+                .collect())
+        }
+    }
+
+    fn provider_for(
+        &self,
+        udid: &str,
+        address: IpAddr,
+    ) -> Result<idevice::provider::TcpProvider, TransportError> {
+        use idevice::pairing_file::PairingFile;
+
+        let pairing_path = pairing_record_path(&self.pairing_path, udid);
+        let pairing_file = PairingFile::read_from_file(pairing_path)
+            .map_err(|_| TransportError::Unavailable)?;
+        Ok(idevice::provider::TcpProvider {
+            addr: address,
+            scope_id: None,
+            pairing_file,
+            label: "iPhoneLoadly".into(),
+        })
+    }
+
+    async fn describe_device(
+        &self,
+        udid: &str,
+        address: IpAddr,
+    ) -> Result<DeviceSummary, TransportError> {
+        use idevice::IdeviceService;
+        use idevice::services::lockdown::LockdownClient;
+
+        let provider = self.provider_for(udid, address)?;
+        let pairing_file = provider.pairing_file.clone();
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(5),
+            LockdownClient::connect(&provider),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        tokio::time::timeout(Duration::from_secs(5), client.start_session(&pairing_file))
+            .await
+            .map_err(|_| TransportError::Unavailable)?
+            .map_err(|_| TransportError::Unavailable)?;
+        let device_name = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_value(Some("DeviceName"), None),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        let product_type = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_value(Some("ProductType"), None),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        let ios_version = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_value(Some("ProductVersion"), None),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        Ok(DeviceSummary {
+            id: device_id_for_udid(udid),
+            display_name: device_name.as_string().unwrap_or("iPhone").to_owned(),
+            product_type: product_type.as_string().unwrap_or("unknown").to_owned(),
+            ios_version: ios_version.as_string().unwrap_or("unknown").to_owned(),
+            connection_type: ConnectionType::Network,
+            status: DeviceStatus::Online,
+            install_eligible: true,
+        })
+    }
+}
+
+fn pairing_record_path(pairing_dir: &StdPath, udid: &str) -> PathBuf {
+    pairing_dir.join(format!("{udid}.plist"))
+}
+
+/// The browser and SQLite use an internal UUID. Apple UDIDs remain private and
+/// are only used in memory to resolve the currently announced network device.
+fn device_id_for_udid(udid: &str) -> Uuid {
+    let digest = Sha256::digest(udid.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_id_for_udid;
+
+    #[test]
+    fn device_id_is_stable_for_non_uuid_apple_udids() {
+        let first = device_id_for_udid("00008110-001A2B3C00000000");
+        assert_eq!(first, device_id_for_udid("00008110-001A2B3C00000000"));
+        assert_ne!(first, device_id_for_udid("00008110-001A2B3C00000001"));
     }
 }
 
@@ -314,11 +384,15 @@ async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "message": "Wi-Fi device transport is not configured yet."
+                "message": "Wi-Fi device discovery is unavailable. Check netmuxd and the dedicated mux socket."
             })),
         )
             .into_response(),
     }
+}
+
+async fn rescan_devices(State(state): State<AppState>) -> impl IntoResponse {
+    list_devices(State(state)).await
 }
 
 #[derive(serde::Deserialize)]
@@ -343,7 +417,7 @@ async fn create_install_job(
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}),
+                serde_json::json!({"message":"Wi-Fi device discovery is unavailable. Check netmuxd and try again."}),
             ),
         )
             .into_response(),
@@ -369,7 +443,7 @@ async fn create_install_job(
         )
             .into_response();
     };
-    tokio::spawn(run_install_job(state.clone(), id, ipa_path));
+    tokio::spawn(run_install_job(state.clone(), id, request.device_id, ipa_path));
     let job = jobs::InstallJob {
         id,
         phase: jobs::JobPhase::Queued,
@@ -397,7 +471,7 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}),
+                serde_json::json!({"message":"Wi-Fi device discovery is unavailable. Check netmuxd and try again."}),
             ),
         )
             .into_response(),
@@ -432,16 +506,24 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
         });
         if matches!(inserted, Ok(true)) {
             queued += 1;
-            tokio::spawn(run_install_job(state.clone(), id, PathBuf::from(ipa_path)));
+            tokio::spawn(run_install_job(
+                state.clone(),
+                id,
+                device_id,
+                PathBuf::from(ipa_path),
+            ));
         }
     }
     (StatusCode::ACCEPTED, Json(RefreshResponse { queued })).into_response()
 }
 
-async fn run_install_job(state: AppState, id: Uuid, ipa_path: PathBuf) {
+async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: PathBuf) {
     set_job_phase(&state.database, id, "connecting");
     set_job_phase(&state.database, id, "installing");
-    let result = state.devices.install_ipa(&state.signing, ipa_path).await;
+    let result = state
+        .devices
+        .install_ipa(&state.signing, device_id, ipa_path)
+        .await;
     if result.is_err() {
         tracing::warn!(job_id = %id, "IPA installation failed");
     }
@@ -618,44 +700,14 @@ async fn main() {
 
     let database_path = PathBuf::from("data/iphoneloadly.db");
     let database = store::initialize(&database_path).expect("initialize SQLite store");
-    let devices: Arc<dyn DeviceTransport> = match (
-        std::env::var("IPHONELOADLY_DEVICE_ID"),
-        std::env::var("IPHONELOADLY_DEVICE_IP"),
-        std::env::var("IPHONELOADLY_PAIRING_FILE"),
-    ) {
-        (Ok(id), Ok(address), Ok(pairing_path)) => {
-            match (Uuid::parse_str(&id), address.parse::<IpAddr>()) {
-                (Ok(id), Ok(address)) => Arc::new(DirectTcpTransport {
-                    id,
-                    address,
-                    pairing_path: pairing_path.into(),
-                }),
-                _ => Arc::new(UnconfiguredTransport),
-            }
-        }
-        _ => match (
-            std::env::var("IPHONELOADLY_DEVICE_ID"),
-            std::env::var("IPHONELOADLY_DEVICE_NAME"),
-            std::env::var("IPHONELOADLY_DEVICE_PRODUCT"),
-            std::env::var("IPHONELOADLY_DEVICE_IOS_VERSION"),
-        ) {
-            (Ok(id), Ok(display_name), Ok(product_type), Ok(ios_version)) => {
-                match Uuid::parse_str(&id) {
-                    Ok(id) => Arc::new(ConfiguredNetworkTransport {
-                        device: DeviceSummary {
-                            id,
-                            display_name,
-                            product_type,
-                            ios_version,
-                            connection_type: ConnectionType::Network,
-                        },
-                    }),
-                    Err(_) => Arc::new(UnconfiguredTransport),
-                }
-            }
-            _ => Arc::new(UnconfiguredTransport),
-        },
-    };
+    let mux_socket = std::env::var("IPHONELOADLY_MUX_SOCKET")
+        .unwrap_or_else(|_| "/run/iphoneloadly/mux.sock".into());
+    let pairing_dir = std::env::var("IPHONELOADLY_PAIRING_DIR")
+        .unwrap_or_else(|_| "/var/lib/lockdown".into());
+    let devices: Arc<dyn DeviceTransport> = Arc::new(NetmuxTransport {
+        mux_socket,
+        pairing_path: pairing_dir.into(),
+    });
     let state = AppState {
         signing: signing::AppleSigningProvider::new(
             std::env::var("IPHONELOADLY_ANISETTE_URL").ok(),
@@ -677,6 +729,7 @@ async fn main() {
             post(submit_apple_two_factor),
         )
         .route("/api/devices", get(list_devices))
+        .route("/api/devices/rescan", post(rescan_devices))
         .route("/api/apps", get(list_apps).post(upload_ipa))
         .route("/api/install-jobs", post(create_install_job))
         .route("/api/install-jobs/{id}", get(get_install_job))

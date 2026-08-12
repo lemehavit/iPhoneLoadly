@@ -76,15 +76,11 @@ read -r
 idevicepair pair
 idevicepair validate
 iphoneloadly-pymobiledevice3 lockdown wifi-connections on
-printf 'Disconnect USB. Enter the iPhone UDID and current Wi-Fi IP without printing pairing data.\n'
-read -r -p 'UDID: ' device_id
-read -r -p 'iPhone IP: ' device_ip
-[[ "$device_id" =~ ^[0-9A-Fa-f-]+$ && -n "$device_ip" ]] || fail 'A UDID and iPhone IP are required.'
-pairing_file="/var/lib/lockdown/${device_id}.plist"
-[[ -r "$pairing_file" ]] || fail 'Pairing record was not found at the expected path.'
+printf 'Disconnect USB. iPhoneLoadly discovers trusted Wi-Fi devices automatically; no UDID or IP address is required.\n'
+read -r -p 'Press Enter after disconnecting USB. '
 
 step 5 'Installing iPhoneLoadly'
-bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}" --device-id "$device_id" --device-ip "$device_ip" --pairing-file "$pairing_file"
+bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}"
 
 step 6 'Checking installation'
 iphoneloadly-doctor || true

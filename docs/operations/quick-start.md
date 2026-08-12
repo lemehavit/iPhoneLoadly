@@ -13,12 +13,8 @@ tar -xzf iphoneloadly-v0.1.0-linux-amd64.tar.gz
 cd iphoneloadly-v0.1.0-linux-amd64
 sudo sha256sum -c ../iphoneloadly-v0.1.0-linux-amd64.tar.gz.sha256
 
-PAIRING_FILE="$(sudo find /var/lib/lockdown -maxdepth 1 -type f -name '00008110-*.plist' -print -quit)"
 bash ./install-iphoneloadly.sh \
-  --binary ./bin/iphoneloadly-api \
-  --device-id 'REPLACE-WITH-LOCAL-DEVICE-ID' \
-  --device-ip 'REPLACE-WITH-IPHONE-IP' \
-  --pairing-file "$PAIRING_FILE"
+  --binary ./bin/iphoneloadly-api
 ```
 
 Open the dashboard through an SSH tunnel or configure Caddy with

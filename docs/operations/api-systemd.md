@@ -17,8 +17,10 @@ sudo install -o root -g root -m 0600 deploy/systemd/iphoneloadly-api.env.example
 sudoedit /etc/iphoneloadly/api.env
 ```
 
-Set `IPHONELOADLY_PAIRING_FILE` to the actual existing pairing plist. Do not put an
-Apple-ID password or a two-factor code in this file.
+Keep `IPHONELOADLY_MUX_SOCKET` pointed at the dedicated `netmuxd` socket and
+`IPHONELOADLY_PAIRING_DIR` at the host pairing-record directory. iPhoneLoadly
+discovers trusted Wi-Fi devices dynamically; do not configure a fixed device IP
+or UDID. Do not put an Apple-ID password or a two-factor code in this file.
 
 ```bash
 sudo systemctl daemon-reload

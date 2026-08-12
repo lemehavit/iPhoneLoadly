@@ -4,7 +4,7 @@ IFS=$'\n\t'
 
 usage() {
   cat <<'EOF'
-Usage: bash install-iphoneloadly.sh --device-id UUID --device-ip ADDRESS --pairing-file PATH [options]
+Usage: bash install-iphoneloadly.sh [options]
 
 Options:
   --binary PATH       Use a prebuilt API binary instead of building with Cargo.
@@ -13,9 +13,6 @@ Options:
 EOF
 }
 
-device_id=""
-device_ip=""
-pairing_file=""
 api_binary=""
 anisette_url="http://127.0.0.1:6970"
 rust_log="info"
@@ -23,9 +20,6 @@ check_package_layout=false
 
 while (($#)); do
   case "$1" in
-    --device-id) device_id="${2:?}"; shift 2 ;;
-    --device-ip) device_ip="${2:?}"; shift 2 ;;
-    --pairing-file) pairing_file="${2:?}"; shift 2 ;;
     --binary) api_binary="${2:?}"; shift 2 ;;
     --anisette-url) anisette_url="${2:?}"; shift 2 ;;
     --rust-log) rust_log="${2:?}"; shift 2 ;;
@@ -64,8 +58,6 @@ if [[ "${check_package_layout}" == true ]]; then
   exit 0
 fi
 
-[[ -n "${device_id}" && -n "${device_ip}" && -n "${pairing_file}" ]] || { usage >&2; exit 2; }
-[[ -r "${pairing_file}" ]] || { echo "Pairing file is not readable: ${pairing_file}" >&2; exit 1; }
 command -v sudo >/dev/null || { echo "sudo is required." >&2; exit 1; }
 
 if [[ -z "${api_binary}" ]]; then
@@ -81,9 +73,8 @@ trap cleanup EXIT
 cat >"${temporary_env}" <<EOF
 RUST_LOG=${rust_log}
 IPHONELOADLY_ANISETTE_URL=${anisette_url}
-IPHONELOADLY_DEVICE_ID=${device_id}
-IPHONELOADLY_DEVICE_IP=${device_ip}
-IPHONELOADLY_PAIRING_FILE=${pairing_file}
+IPHONELOADLY_MUX_SOCKET=/run/iphoneloadly/mux.sock
+IPHONELOADLY_PAIRING_DIR=/var/lib/lockdown
 EOF
 
 sudo install -d -o root -g root -m 0755 /opt/iphoneloadly/bin /var/lib/iphoneloadly /etc/iphoneloadly /usr/share/iphoneloadly
