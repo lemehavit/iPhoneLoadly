@@ -40,3 +40,4 @@ The short conclusion is: build a new headless Rust service around the MIT-licens
 If this little tool saved you some time, you can support my work here:
 
 [![Buy Me a Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/lemehavit)
+[💙 PayPal](https://paypal.me/YOURPAYPALNAME)
