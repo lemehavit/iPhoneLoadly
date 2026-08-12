@@ -20,8 +20,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      - run: find deploy/host deploy/release scripts -type f -name '*.sh' -exec bash -n {} +
       - run: bash deploy/release/build-release.sh
-      - run: bash -n deploy/host/install-debian13.sh deploy/host/install-iphoneloadly.sh scripts/iphoneloadly-doctor.sh
+      - run: bash deploy/release/verify-release-package.sh
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

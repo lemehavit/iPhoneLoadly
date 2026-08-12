@@ -22,3 +22,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --release
+      - run: find deploy/host deploy/release scripts -type f -name '*.sh' -exec bash -n {} +
+      - run: bash deploy/release/build-release.sh
+      - run: bash deploy/release/verify-release-package.sh

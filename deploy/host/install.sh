@@ -3,15 +3,56 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-PACKAGE_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)"
+
+find_package_root() {
+  local candidate
+  for candidate in "${SCRIPT_DIR}" "${SCRIPT_DIR}/../.."; do
+    candidate="$(CDPATH= cd -- "${candidate}" 2>/dev/null && pwd)" || continue
+    if [[ -f "${candidate}/bin/iphoneloadly-api" && -f "${candidate}/install-iphoneloadly.sh" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    if [[ -f "${candidate}/Cargo.toml" && -f "${candidate}/deploy/host/install-iphoneloadly.sh" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PACKAGE_ROOT="$(find_package_root)" || { printf 'ERROR: Unable to locate iPhoneLoadly package files.\n' >&2; exit 1; }
 HOST_PREP="${PACKAGE_ROOT}/deploy/host/install-debian13.sh"
-APP_INSTALLER="${PACKAGE_ROOT}/install-iphoneloadly.sh"
+if [[ -f "${PACKAGE_ROOT}/install-iphoneloadly.sh" ]]; then
+  APP_INSTALLER="${PACKAGE_ROOT}/install-iphoneloadly.sh"
+else
+  APP_INSTALLER="${PACKAGE_ROOT}/deploy/host/install-iphoneloadly.sh"
+fi
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n[%s/6] %s...\n' "$1" "$2"; }
+if [[ "${1:-}" == "--check-package-layout" ]]; then
+  for required in \
+    "${PACKAGE_ROOT}/bin/iphoneloadly-api" \
+    "${HOST_PREP}" \
+    "${APP_INSTALLER}" \
+    "${PACKAGE_ROOT}/deploy/systemd/iphoneloadly-api.service" \
+    "${PACKAGE_ROOT}/deploy/caddy/Caddyfile.example" \
+    "${PACKAGE_ROOT}/scripts/iphoneloadly-doctor.sh" \
+    "${PACKAGE_ROOT}/scripts/preflight-wifi.sh" \
+    "${PACKAGE_ROOT}/scripts/backup-state.sh" \
+    "${PACKAGE_ROOT}/docs/INSTALL.md"; do
+    [[ -f "${required}" ]] || fail "Release package is missing ${required#"${PACKAGE_ROOT}/"}"
+  done
+  printf 'Release package layout is valid: %s\n' "${PACKAGE_ROOT}"
+  exit 0
+fi
 [[ $EUID -eq 0 ]] || fail 'Run with sudo: sudo bash ./install.sh'
-[[ -x "${PACKAGE_ROOT}/bin/iphoneloadly-api" ]] || fail 'This installer must be run from an iPhoneLoadly release archive.'
-[[ -f "$HOST_PREP" && -x "$APP_INSTALLER" ]] || fail 'Release archive is incomplete.'
+if [[ -f "${PACKAGE_ROOT}/bin/iphoneloadly-api" ]]; then
+  API_ARGUMENTS=(--binary "${PACKAGE_ROOT}/bin/iphoneloadly-api")
+else
+  API_ARGUMENTS=()
+fi
+[[ -f "$HOST_PREP" && -f "$APP_INSTALLER" ]] || fail 'Release archive is incomplete.'
 
 step 1 'Checking host prerequisites'
 source /etc/os-release
@@ -20,7 +61,7 @@ source /etc/os-release
 printf 'OK: Debian %s on amd64\n' "$VERSION_ID"
 
 step 2 'Preparing host dependencies'
-"$HOST_PREP"
+bash "$HOST_PREP"
 
 step 3 'Starting local anisette'
 printf 'iPhoneLoadly requires a local anisette service at 127.0.0.1:6970.\n'
@@ -43,7 +84,7 @@ pairing_file="/var/lib/lockdown/${device_id}.plist"
 [[ -r "$pairing_file" ]] || fail 'Pairing record was not found at the expected path.'
 
 step 5 'Installing iPhoneLoadly'
-bash "$APP_INSTALLER" --binary "${PACKAGE_ROOT}/bin/iphoneloadly-api" --device-id "$device_id" --device-ip "$device_ip" --pairing-file "$pairing_file"
+bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}" --device-id "$device_id" --device-ip "$device_ip" --pairing-file "$pairing_file"
 
 step 6 'Checking installation'
 iphoneloadly-doctor || true

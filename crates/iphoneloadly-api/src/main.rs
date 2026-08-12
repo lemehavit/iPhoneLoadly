@@ -3,10 +3,20 @@ mod jobs;
 mod signing;
 mod store;
 
-use std::{net::{IpAddr, SocketAddr}, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
-use axum::{extract::{DefaultBodyLimit, Multipart, Path, State}, http::StatusCode, response::{Html, IntoResponse}, routing::{get, post}, Json, Router};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, Multipart, Path, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::{get, post},
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -55,7 +65,11 @@ struct SigningReadiness {
 #[async_trait]
 trait DeviceTransport: Send + Sync {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError>;
-    async fn install_ipa(&self, signing: &signing::AppleSigningProvider, ipa_path: PathBuf) -> Result<(), TransportError>;
+    async fn install_ipa(
+        &self,
+        signing: &signing::AppleSigningProvider,
+        ipa_path: PathBuf,
+    ) -> Result<(), TransportError>;
 }
 
 #[derive(Debug, Error)]
@@ -70,11 +84,20 @@ enum TransportError {
 impl SigningProvider for signing::AppleSigningProvider {
     async fn readiness(&self) -> SigningReadiness {
         if self.is_ready().await {
-            SigningReadiness { available: true, message: "Apple signing session is active." }
+            SigningReadiness {
+                available: true,
+                message: "Apple signing session is active.",
+            }
         } else if self.has_anisette_url() {
-            SigningReadiness { available: false, message: "Sign in with Apple to enable signing." }
+            SigningReadiness {
+                available: false,
+                message: "Sign in with Apple to enable signing.",
+            }
         } else {
-            SigningReadiness { available: false, message: "Configure a trusted anisette URL before signing in with Apple." }
+            SigningReadiness {
+                available: false,
+                message: "Configure a trusted anisette URL before signing in with Apple.",
+            }
         }
     }
 }
@@ -97,7 +120,11 @@ impl DeviceTransport for UnconfiguredTransport {
         Err(TransportError::Unavailable)
     }
 
-    async fn install_ipa(&self, _: &signing::AppleSigningProvider, _: PathBuf) -> Result<(), TransportError> {
+    async fn install_ipa(
+        &self,
+        _: &signing::AppleSigningProvider,
+        _: PathBuf,
+    ) -> Result<(), TransportError> {
         Err(TransportError::Unavailable)
     }
 }
@@ -108,7 +135,11 @@ impl DeviceTransport for ConfiguredNetworkTransport {
         Ok(vec![self.device.clone()])
     }
 
-    async fn install_ipa(&self, _: &signing::AppleSigningProvider, _: PathBuf) -> Result<(), TransportError> {
+    async fn install_ipa(
+        &self,
+        _: &signing::AppleSigningProvider,
+        _: PathBuf,
+    ) -> Result<(), TransportError> {
         Err(TransportError::Unavailable)
     }
 }
@@ -116,23 +147,38 @@ impl DeviceTransport for ConfiguredNetworkTransport {
 #[async_trait]
 impl DeviceTransport for DirectTcpTransport {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
+        use idevice::IdeviceService;
         use idevice::pairing_file::PairingFile;
         use idevice::provider::TcpProvider;
-        use idevice::IdeviceService;
         use idevice::services::lockdown::LockdownClient;
 
-        let pairing_file = PairingFile::read_from_file(&self.pairing_path).map_err(|_| TransportError::Unavailable)?;
+        let pairing_file = PairingFile::read_from_file(&self.pairing_path)
+            .map_err(|_| TransportError::Unavailable)?;
         let provider = TcpProvider {
             addr: self.address,
             scope_id: None,
             pairing_file: pairing_file.clone(),
             label: "iPhoneLoadly".into(),
         };
-        let mut client = LockdownClient::connect(&provider).await.map_err(|_| TransportError::Unavailable)?;
-        client.start_session(&pairing_file).await.map_err(|_| TransportError::Unavailable)?;
-        let device_name = client.get_value(Some("DeviceName"), None).await.map_err(|_| TransportError::Unavailable)?;
-        let product_type = client.get_value(Some("ProductType"), None).await.map_err(|_| TransportError::Unavailable)?;
-        let ios_version = client.get_value(Some("ProductVersion"), None).await.map_err(|_| TransportError::Unavailable)?;
+        let mut client = LockdownClient::connect(&provider)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        client
+            .start_session(&pairing_file)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        let device_name = client
+            .get_value(Some("DeviceName"), None)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        let product_type = client
+            .get_value(Some("ProductType"), None)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        let ios_version = client
+            .get_value(Some("ProductVersion"), None)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
         Ok(vec![DeviceSummary {
             id: self.id,
             display_name: device_name.as_string().unwrap_or("iPhone").to_owned(),
@@ -142,18 +188,26 @@ impl DeviceTransport for DirectTcpTransport {
         }])
     }
 
-    async fn install_ipa(&self, signing: &signing::AppleSigningProvider, ipa_path: PathBuf) -> Result<(), TransportError> {
+    async fn install_ipa(
+        &self,
+        signing: &signing::AppleSigningProvider,
+        ipa_path: PathBuf,
+    ) -> Result<(), TransportError> {
         use idevice::pairing_file::PairingFile;
         use idevice::provider::TcpProvider;
 
-        let pairing_file = PairingFile::read_from_file(&self.pairing_path).map_err(|_| TransportError::Unavailable)?;
+        let pairing_file = PairingFile::read_from_file(&self.pairing_path)
+            .map_err(|_| TransportError::Unavailable)?;
         let provider = TcpProvider {
             addr: self.address,
             scope_id: None,
             pairing_file,
             label: "iPhoneLoadly".into(),
         };
-        signing.install_ipa(&provider, ipa_path).await.map_err(|_| TransportError::InstallFailed)
+        signing
+            .install_ipa(&provider, ipa_path)
+            .await
+            .map_err(|_| TransportError::InstallFailed)
     }
 }
 
@@ -176,12 +230,21 @@ async fn dashboard() -> Html<&'static str> {
 }
 
 async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
-    match state.database.lock().map_err(|_| ()).and_then(|database| store::list_apps(&database).map_err(|_| ())) {
-        Ok(apps) => Json(serde_json::json!(apps.into_iter().map(|app| serde_json::json!({
-            "id": app.id,
-            "sha256": app.sha256,
-            "sizeBytes": app.size_bytes,
-        })).collect::<Vec<_>>())),
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::list_apps(&database).map_err(|_| ()))
+    {
+        Ok(apps) => Json(serde_json::json!(
+            apps.into_iter()
+                .map(|app| serde_json::json!({
+                    "id": app.id,
+                    "sha256": app.sha256,
+                    "sizeBytes": app.size_bytes,
+                }))
+                .collect::<Vec<_>>()
+        )),
         Err(_) => Json(serde_json::json!({"message":"Unable to list uploaded IPAs."})),
     }
 }
@@ -197,7 +260,11 @@ async fn start_apple_login(
     Json(request): Json<StartAppleLoginRequest>,
 ) -> impl IntoResponse {
     if request.email.trim().is_empty() || request.password.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"Email and password are required."}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message":"Email and password are required."})),
+        )
+            .into_response();
     }
     match state.signing.begin_login(request.email, request.password).await {
         Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
@@ -209,13 +276,14 @@ async fn start_apple_login(
     }
 }
 
-async fn get_apple_login(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
+async fn get_apple_login(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
     match state.signing.login_status(id).await {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"message":"Apple login session was not found."}))).into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Apple login session was not found."})),
+        )
+            .into_response(),
     }
 }
 
@@ -274,8 +342,11 @@ async fn create_install_job(
         Ok(devices) => devices,
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."})),
-        ).into_response(),
+            Json(
+                serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}),
+            ),
+        )
+            .into_response(),
     };
     if !devices.iter().any(|device| device.id == request.device_id) {
         return (
@@ -292,14 +363,21 @@ async fn create_install_job(
         Ok::<_, ()>(PathBuf::from(path))
     });
     let Ok(ipa_path) = ipa_path else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"message":"Uploaded IPA was not found."}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Uploaded IPA was not found."})),
+        )
+            .into_response();
     };
     tokio::spawn(run_install_job(state.clone(), id, ipa_path));
     let job = jobs::InstallJob {
         id,
         phase: jobs::JobPhase::Queued,
         progress_percent: None,
-        public_message: format!("Signing and installation job queued for app {}.", request.app_id),
+        public_message: format!(
+            "Signing and installation job queued for app {}.",
+            request.app_id
+        ),
     };
     (StatusCode::ACCEPTED, Json(job)).into_response()
 }
@@ -316,11 +394,28 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
     }
     let devices = match state.devices.list_network_devices().await {
         Ok(devices) => devices,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}))).into_response(),
+        Err(_) => return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}),
+            ),
+        )
+            .into_response(),
     };
-    let targets = match state.database.lock().map_err(|_| ()).and_then(|database| store::refresh_due_targets(&database).map_err(|_| ())) {
+    let targets = match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::refresh_due_targets(&database).map_err(|_| ()))
+    {
         Ok(targets) => targets,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to read refresh targets."}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message":"Unable to read refresh targets."})),
+            )
+                .into_response();
+        }
     };
     let mut queued = 0;
     for (app_id, device_id, ipa_path) in targets {
@@ -350,7 +445,15 @@ async fn run_install_job(state: AppState, id: Uuid, ipa_path: PathBuf) {
     if result.is_err() {
         tracing::warn!(job_id = %id, "IPA installation failed");
     }
-    set_job_phase(&state.database, id, if result.is_ok() { "succeeded" } else { "failed" });
+    set_job_phase(
+        &state.database,
+        id,
+        if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        },
+    );
 }
 
 fn set_job_phase(database: &Arc<Mutex<rusqlite::Connection>>, id: Uuid, phase: &str) {
@@ -370,13 +473,12 @@ fn job_message(phase: &str) -> &'static str {
     }
 }
 
-async fn get_install_job(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
-    let job = state.database.lock().map_err(|_| ()).and_then(|database| {
-        store::find_job(&database, id).map_err(|_| ())
-    });
+async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let job = state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::find_job(&database, id).map_err(|_| ()));
     match job {
         Ok(Some(job)) => (
             StatusCode::OK,
@@ -387,27 +489,38 @@ async fn get_install_job(
                 "phase": job.phase,
                 "publicMessage": job_message(&job.phase)
             })),
-        ).into_response(),
+        )
+            .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"message":"Installation job was not found."})),
-        ).into_response(),
+        )
+            .into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"message":"Unable to read installation job."})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
 async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     let Some(field) = multipart.next_field().await.ok().flatten() else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"Expected an IPA file field."}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message":"Expected an IPA file field."})),
+        )
+            .into_response();
     };
     let id = Uuid::now_v7();
     let temporary = state.apps_dir.join(format!(".{id}.upload"));
     let final_path = state.apps_dir.join(format!("{id}.ipa"));
     let Ok(mut output) = tokio::fs::File::create(&temporary).await else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to store IPA upload."}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to store IPA upload."})),
+        )
+            .into_response();
     };
     let mut written = 0_u64;
     loop {
@@ -416,22 +529,38 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
             Ok(None) => break,
             Err(_) => {
                 let _ = tokio::fs::remove_file(&temporary).await;
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"Unable to read IPA upload."}))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"message":"Unable to read IPA upload."})),
+                )
+                    .into_response();
             }
         };
         written = written.saturating_add(chunk.len() as u64);
         if written > ipa::MAX_COMPRESSED_BYTES {
             let _ = tokio::fs::remove_file(&temporary).await;
-            return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"message":"IPA exceeds the 2 GiB upload limit."}))).into_response();
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"message":"IPA exceeds the 2 GiB upload limit."})),
+            )
+                .into_response();
         }
         if output.write_all(&chunk).await.is_err() {
             let _ = tokio::fs::remove_file(&temporary).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to store IPA upload."}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message":"Unable to store IPA upload."})),
+            )
+                .into_response();
         }
     }
     if output.flush().await.is_err() || output.sync_all().await.is_err() {
         let _ = tokio::fs::remove_file(&temporary).await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to store IPA upload."}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to store IPA upload."})),
+        )
+            .into_response();
     }
     drop(output);
     let inspected = ipa::inspect_ipa(&temporary);
@@ -439,20 +568,39 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
         Ok(metadata) => {
             if tokio::fs::rename(&temporary, &final_path).await.is_err() {
                 let _ = tokio::fs::remove_file(&temporary).await;
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to finalize IPA upload."}))).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message":"Unable to finalize IPA upload."})),
+                )
+                    .into_response();
             }
             let inserted = state.database.lock().map_err(|_| ()).and_then(|database| {
-                store::insert_app(&database, id, &metadata.sha256, &final_path.to_string_lossy(), metadata.size_bytes).map_err(|_| ())
+                store::insert_app(
+                    &database,
+                    id,
+                    &metadata.sha256,
+                    &final_path.to_string_lossy(),
+                    metadata.size_bytes,
+                )
+                .map_err(|_| ())
             });
             if inserted.is_err() {
                 let _ = tokio::fs::remove_file(&final_path).await;
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to record IPA upload."}))).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message":"Unable to record IPA upload."})),
+                )
+                    .into_response();
             }
             (StatusCode::CREATED, Json(serde_json::json!({"id":id,"sha256":metadata.sha256,"sizeBytes":metadata.size_bytes}))).into_response()
         }
         Err(error) => {
             let _ = tokio::fs::remove_file(&temporary).await;
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"IPA was rejected.","code":error.to_string()}))).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message":"IPA was rejected.","code":error.to_string()})),
+            )
+                .into_response()
         }
     }
 }
@@ -475,38 +623,59 @@ async fn main() {
         std::env::var("IPHONELOADLY_DEVICE_IP"),
         std::env::var("IPHONELOADLY_PAIRING_FILE"),
     ) {
-        (Ok(id), Ok(address), Ok(pairing_path)) => match (Uuid::parse_str(&id), address.parse::<IpAddr>()) {
-            (Ok(id), Ok(address)) => Arc::new(DirectTcpTransport { id, address, pairing_path: pairing_path.into() }),
+        (Ok(id), Ok(address), Ok(pairing_path)) => {
+            match (Uuid::parse_str(&id), address.parse::<IpAddr>()) {
+                (Ok(id), Ok(address)) => Arc::new(DirectTcpTransport {
+                    id,
+                    address,
+                    pairing_path: pairing_path.into(),
+                }),
+                _ => Arc::new(UnconfiguredTransport),
+            }
+        }
+        _ => match (
+            std::env::var("IPHONELOADLY_DEVICE_ID"),
+            std::env::var("IPHONELOADLY_DEVICE_NAME"),
+            std::env::var("IPHONELOADLY_DEVICE_PRODUCT"),
+            std::env::var("IPHONELOADLY_DEVICE_IOS_VERSION"),
+        ) {
+            (Ok(id), Ok(display_name), Ok(product_type), Ok(ios_version)) => {
+                match Uuid::parse_str(&id) {
+                    Ok(id) => Arc::new(ConfiguredNetworkTransport {
+                        device: DeviceSummary {
+                            id,
+                            display_name,
+                            product_type,
+                            ios_version,
+                            connection_type: ConnectionType::Network,
+                        },
+                    }),
+                    Err(_) => Arc::new(UnconfiguredTransport),
+                }
+            }
             _ => Arc::new(UnconfiguredTransport),
         },
-        _ => match (
-        std::env::var("IPHONELOADLY_DEVICE_ID"),
-        std::env::var("IPHONELOADLY_DEVICE_NAME"),
-        std::env::var("IPHONELOADLY_DEVICE_PRODUCT"),
-        std::env::var("IPHONELOADLY_DEVICE_IOS_VERSION"),
-    ) {
-        (Ok(id), Ok(display_name), Ok(product_type), Ok(ios_version)) => match Uuid::parse_str(&id) {
-            Ok(id) => Arc::new(ConfiguredNetworkTransport {
-            device: DeviceSummary { id, display_name, product_type, ios_version, connection_type: ConnectionType::Network },
-        }),
-            Err(_) => Arc::new(UnconfiguredTransport),
-        },
-        _ => Arc::new(UnconfiguredTransport),
-    },
-};
+    };
     let state = AppState {
-        signing: signing::AppleSigningProvider::new(std::env::var("IPHONELOADLY_ANISETTE_URL").ok()),
+        signing: signing::AppleSigningProvider::new(
+            std::env::var("IPHONELOADLY_ANISETTE_URL").ok(),
+        ),
         devices,
         apps_dir: PathBuf::from("data/apps"),
         database: Arc::new(Mutex::new(database)),
     };
-    tokio::fs::create_dir_all(&state.apps_dir).await.expect("create app storage");
+    tokio::fs::create_dir_all(&state.apps_dir)
+        .await
+        .expect("create app storage");
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
         .route("/api/signing/sessions", post(start_apple_login))
         .route("/api/signing/sessions/{id}", get(get_apple_login))
-        .route("/api/signing/sessions/{id}/two-factor", post(submit_apple_two_factor))
+        .route(
+            "/api/signing/sessions/{id}/two-factor",
+            post(submit_apple_two_factor),
+        )
         .route("/api/devices", get(list_devices))
         .route("/api/apps", get(list_apps).post(upload_ipa))
         .route("/api/install-jobs", post(create_install_job))

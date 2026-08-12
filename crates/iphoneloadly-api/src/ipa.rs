@@ -1,6 +1,10 @@
 //! Validation for IPA uploads before they enter a signing job.
 
-use std::{fs::File, io::Read, path::{Component, Path}};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Component, Path},
+};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -47,7 +51,9 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = source.read(&mut buffer).map_err(|_| UploadError::InvalidArchive)?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| UploadError::InvalidArchive)?;
         if read == 0 {
             break;
         }
@@ -64,14 +70,18 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let mut app_bundle: Option<String> = None;
     let mut info_plist_present = false;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(|_| UploadError::InvalidArchive)?;
+        let entry = archive
+            .by_index(index)
+            .map_err(|_| UploadError::InvalidArchive)?;
         let name = entry.name();
         validate_archive_path(name)?;
         expanded_bytes = expanded_bytes.saturating_add(entry.size());
         if expanded_bytes > MAX_EXPANDED_BYTES {
             return Err(UploadError::ExpansionLimit);
         }
-        if entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > MAX_COMPRESSION_RATIO {
+        if entry.compressed_size() > 0
+            && entry.size() / entry.compressed_size() > MAX_COMPRESSION_RATIO
+        {
             return Err(UploadError::ExpansionLimit);
         }
 
@@ -105,7 +115,9 @@ fn validate_archive_path(name: &str) -> Result<(), UploadError> {
     let path = Path::new(name);
     if path.is_absolute()
         || name.contains('\\')
-        || path.components().any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
     {
         return Err(UploadError::UnsafePath);
     }
@@ -118,6 +130,7 @@ fn main_bundle_from_entry(name: &str) -> Option<&str> {
         return None;
     }
     let bundle = components.next()?;
-    bundle.ends_with(".app").then(|| &name[.."Payload/".len() + bundle.len()])
+    bundle
+        .ends_with(".app")
+        .then(|| &name[.."Payload/".len() + bundle.len()])
 }
-
