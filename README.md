@@ -39,5 +39,10 @@ The short conclusion is: build a new headless Rust service around the MIT-licens
 
 If this little tool saved you some time, you can support my work here:
 
-[![Buy Me a Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/lemehavit)
-[💙 PayPal](https://paypal.me/YOURPAYPALNAME)
+<a href="https://buymeacoffee.com/lemehavit">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50" alt="Buy Me a Coffee">
+</a>
+
+<a href="https://paypal.me/lemehavit">
+  <img src="https://img.shields.io/badge/PayPal-Support%20me-0070BA?logo=paypal&logoColor=white" height="50" alt="PayPal">
+</a>
