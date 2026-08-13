@@ -880,7 +880,8 @@ async fn main() {
         .with_target(false)
         .init();
 
-    let database_path = PathBuf::from("data/iphoneloadly.db");
+    let data_dir = PathBuf::from("data");
+    let database_path = data_dir.join("iphoneloadly.db");
     let database = store::initialize(&database_path).expect("initialize SQLite store");
     let mux_socket = std::env::var("IPHONELOADLY_MUX_SOCKET")
         .unwrap_or_else(|_| "/run/iphoneloadly/mux.sock".into());
@@ -893,9 +894,10 @@ async fn main() {
     let state = AppState {
         signing: signing::AppleSigningProvider::new(
             std::env::var("IPHONELOADLY_ANISETTE_URL").ok(),
+            data_dir.join("signing"),
         ),
         devices,
-        apps_dir: PathBuf::from("data/apps"),
+        apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
     };
     tokio::fs::create_dir_all(&state.apps_dir)

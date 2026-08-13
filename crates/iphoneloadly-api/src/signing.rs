@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,9 +12,12 @@ use idevice::provider::TcpProvider;
 use isideload::{
     anisette::remote_v3::RemoteV3AnisetteProvider,
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
-    dev::developer_session::DeveloperSession,
-    sideload::{SideloaderBuilder, builder::MaxCertsBehavior, sideloader::Sideloader},
-    util::storage::InMemoryStorage,
+    dev::{developer_session::DeveloperSession, devices::DevicesApi},
+    sideload::{
+        SideloaderBuilder, builder::MaxCertsBehavior, install::install_app as install_signed_app,
+        sideloader::Sideloader,
+    },
+    util::{device::IdeviceInfo, fs_storage::FsStorage, storage::InMemoryStorage},
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -123,9 +127,9 @@ impl LoginAttempt {
     }
 }
 
-#[derive(Default)]
 pub struct AppleSigningProvider {
     anisette_url: Option<String>,
+    signing_storage_path: PathBuf,
     sideloader: Mutex<Option<Sideloader>>,
     attempts: Mutex<HashMap<Uuid, Arc<LoginAttempt>>>,
     certificate_recovery_requested: AtomicBool,
@@ -148,9 +152,10 @@ pub enum SigningError {
 }
 
 impl AppleSigningProvider {
-    pub fn new(anisette_url: Option<String>) -> Arc<Self> {
+    pub fn new(anisette_url: Option<String>, signing_storage_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             anisette_url: anisette_url.filter(|url| !url.trim().is_empty()),
+            signing_storage_path,
             sideloader: Mutex::new(None),
             attempts: Mutex::new(HashMap::new()),
             certificate_recovery_requested: AtomicBool::new(false),
@@ -244,7 +249,11 @@ impl AppleSigningProvider {
             };
             let sideloader = SideloaderBuilder::new(developer_session, email)
                 .machine_name("iPhoneLoadly".into())
-                .storage(Box::new(InMemoryStorage::new()))
+                // Reusing this root-only service state lets isideload find the
+                // matching Apple development certificate after a new login.
+                .storage(Box::new(FsStorage::new(
+                    provider.signing_storage_path.clone(),
+                )))
                 .max_certs_behavior(if revoke_old_certificate {
                     MaxCertsBehavior::Revoke
                 } else {
@@ -272,22 +281,44 @@ impl AppleSigningProvider {
     ) -> Result<(), SigningError> {
         let mut sideloader = self.sideloader.lock().await;
         let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
+        let progress = Arc::new(progress);
+        let device = IdeviceInfo::from_device(provider)
+            .await
+            .map_err(|_| SigningError::InstallFailed)?;
+        let team = sideloader
+            .get_team()
+            .await
+            .map_err(|_| SigningError::InstallFailed)?;
         sideloader
-            .install_app(
-                provider,
+            .get_dev_session()
+            .ensure_device_registered(&team, &device.name, &device.udid, None)
+            .await
+            .map_err(|_| SigningError::InstallFailed)?;
+
+        let signing_progress = progress.clone();
+        let (signed_app_path, _) = sideloader
+            .sign_app(
                 ipa_path,
+                Some(team),
                 false,
-                Some(move |signing_progress: f32| {
-                    // `isideload` reports signing progress, then performs the
-                    // device transfer internally without exposing per-byte
-                    // callbacks. Reserve the latter half for that visible
-                    // transfer/installation phase rather than inventing it.
-                    progress((signing_progress.clamp(0.0, 1.0) * 50.0) as u8);
+                Some(move |value: f32| {
+                    signing_progress((value.clamp(0.0, 1.0) * 40.0) as u8);
                     async {}
                 }),
             )
             .await
             .map_err(|_| SigningError::InstallFailed)?;
+
+        // The upstream installer reports actual AFC-upload and installation
+        // percentages. Reserve the final 60% of the job for those values.
+        progress(40);
+        let install_progress = progress.clone();
+        install_signed_app(provider, &signed_app_path, move |value| {
+            let percent = 40 + ((value.min(100) * 60) / 100) as u8;
+            install_progress(percent);
+        })
+        .await
+        .map_err(|_| SigningError::InstallFailed)?;
         Ok(())
     }
 

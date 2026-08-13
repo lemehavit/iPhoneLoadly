@@ -10,7 +10,7 @@ axum = { version = "0.8.8", features = ["multipart"] }
 idevice = { version = "=0.1.65", features = ["tcp", "usbmuxd"] }
 # Pin the same signing stack as iLoader. The Git branch is required because
 # published isideload releases do not contain its current signing backend.
-isideload = { version = "0.3.17", git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick" }
+isideload = { version = "0.3.17", git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick", features = ["fs-storage"] }
 mdns-sd = "0.20.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

@@ -149,12 +149,14 @@ the memory-only signing session.
 
 ### Apple reports that the development-certificate limit is reached
 
-For a free Apple developer account, select **Frigör gammalt
-utvecklingscertifikat** in the dashboard, confirm the warning, and then sign in
-again. The next signing session revokes one older development certificate only
-if Apple rejects new-certificate creation for reaching the limit. Revoking a
-certificate can invalidate apps signed with it; do not use this action if an
-existing certificate supports an app you need to keep running.
+For a free Apple developer account, iPhoneLoadly saves its signing key in its
+root-only service data directory and reuses the matching Apple certificate
+after a new login. You should therefore only select **Frigör gammalt
+utvecklingscertifikat** if Apple explicitly reports that the certificate limit
+has been reached. The next signing session then revokes one older development
+certificate only if Apple rejects new-certificate creation for reaching the
+limit. Revoking a certificate can invalidate apps signed with it; do not use
+this action if an existing certificate supports an app you need to keep running.
 
 ### An app does not install
 
