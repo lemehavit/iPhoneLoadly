@@ -9,6 +9,10 @@ pub struct StoredJob {
     pub device_id: Uuid,
     pub phase: String,
     pub progress_percent: Option<u8>,
+    pub device_label: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub failure_code: Option<String>,
 }
 
 pub struct StoredApp {
@@ -37,7 +41,9 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
             phase TEXT NOT NULL,
             created_at TEXT NOT NULL,
             completed_at TEXT,
-            progress_percent INTEGER
+            progress_percent INTEGER,
+            device_label TEXT NOT NULL DEFAULT 'Trusted iPhone',
+            failure_code TEXT
         );
         ",
     )?;
@@ -52,6 +58,14 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
     }
     if !job_columns.iter().any(|name| name == "progress_percent") {
         connection.execute_batch("ALTER TABLE jobs ADD COLUMN progress_percent INTEGER;")?;
+    }
+    if !job_columns.iter().any(|name| name == "device_label") {
+        connection.execute_batch(
+            "ALTER TABLE jobs ADD COLUMN device_label TEXT NOT NULL DEFAULT 'Trusted iPhone';",
+        )?;
+    }
+    if !job_columns.iter().any(|name| name == "failure_code") {
+        connection.execute_batch("ALTER TABLE jobs ADD COLUMN failure_code TEXT;")?;
     }
     let app_columns = {
         let mut columns = connection.prepare("PRAGMA table_info(apps)")?;
@@ -155,17 +169,18 @@ pub fn insert_job(
     id: Uuid,
     app_id: Uuid,
     device_id: Uuid,
+    device_label: &str,
 ) -> rusqlite::Result<()> {
     connection.execute(
-        "INSERT INTO jobs (id, app_id, device_id, phase, created_at) VALUES (?1, ?2, ?3, 'queued', datetime('now'))",
-        (id.to_string(), app_id.to_string(), device_id.to_string()),
+        "INSERT INTO jobs (id, app_id, device_id, device_label, phase, created_at) VALUES (?1, ?2, ?3, ?4, 'queued', datetime('now'))",
+        (id.to_string(), app_id.to_string(), device_id.to_string(), device_label),
     )?;
     Ok(())
 }
 
 pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<StoredJob>> {
     let mut statement = connection
-        .prepare("SELECT id, app_id, device_id, phase, progress_percent FROM jobs WHERE id = ?1")?;
+        .prepare("SELECT id, app_id, device_id, phase, progress_percent, device_label, created_at, completed_at, failure_code FROM jobs WHERE id = ?1")?;
     let mut rows = statement.query([id.to_string()])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
@@ -180,7 +195,37 @@ pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<St
         device_id: Uuid::parse_str(&device_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
         phase: row.get(3)?,
         progress_percent: row.get::<_, Option<i64>>(4)?.map(|value| value as u8),
+        device_label: row.get(5)?,
+        created_at: row.get(6)?,
+        completed_at: row.get(7)?,
+        failure_code: row.get(8)?,
     }))
+}
+
+pub fn list_recent_jobs(connection: &Connection, limit: usize) -> rusqlite::Result<Vec<StoredJob>> {
+    let mut statement = connection.prepare(
+        "SELECT id, app_id, device_id, phase, progress_percent, device_label, created_at, completed_at, failure_code
+         FROM jobs ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    statement
+        .query_map([limit as i64], |row| {
+            let id: String = row.get(0)?;
+            let app_id: String = row.get(1)?;
+            let device_id: String = row.get(2)?;
+            Ok(StoredJob {
+                id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                app_id: Uuid::parse_str(&app_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                device_id: Uuid::parse_str(&device_id)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                phase: row.get(3)?,
+                progress_percent: row.get::<_, Option<i64>>(4)?.map(|value| value as u8),
+                device_label: row.get(5)?,
+                created_at: row.get(6)?,
+                completed_at: row.get(7)?,
+                failure_code: row.get(8)?,
+            })
+        })?
+        .collect()
 }
 
 pub fn update_job_status(
@@ -189,7 +234,7 @@ pub fn update_job_status(
     phase: &str,
     progress_percent: Option<u8>,
 ) -> rusqlite::Result<()> {
-    if phase == "succeeded" {
+    if matches!(phase, "succeeded" | "failed") {
         connection.execute(
             "UPDATE jobs SET phase = ?1, progress_percent = ?2, completed_at = datetime('now') WHERE id = ?3",
             (phase, progress_percent.map(i64::from), id.to_string()),
@@ -200,6 +245,18 @@ pub fn update_job_status(
             (phase, progress_percent.map(i64::from), id.to_string()),
         )?;
     }
+    Ok(())
+}
+
+pub fn set_job_failure(
+    connection: &Connection,
+    id: Uuid,
+    failure_code: &str,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE jobs SET failure_code = ?1 WHERE id = ?2",
+        (failure_code, id.to_string()),
+    )?;
     Ok(())
 }
 

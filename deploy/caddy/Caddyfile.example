@@ -1,5 +1,6 @@
-# Replace the address, username, and password hash before installation.
-https://REPLACE-WITH-DEBIAN-LAN-IP {
+# Copy this file to /etc/caddy/Caddyfile. Replace the username and password
+# hash before reloading Caddy. The API itself listens only on 127.0.0.1.
+https://iphoneloadly.local {
 	tls internal
 	basic_auth {
 		REPLACE-WITH-DASHBOARD-USERNAME REPLACE-WITH-CADDY-PASSWORD-HASH
@@ -8,6 +9,8 @@ https://REPLACE-WITH-DEBIAN-LAN-IP {
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		-Server
 	}
 	reverse_proxy 127.0.0.1:8080
 }

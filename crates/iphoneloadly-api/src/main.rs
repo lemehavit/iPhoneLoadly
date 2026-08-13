@@ -538,18 +538,25 @@ async fn create_install_job(
         )
             .into_response(),
     };
-    if !devices.iter().any(|device| device.id == request.device_id) {
+    let Some(device) = devices.iter().find(|device| device.id == request.device_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"message":"The requested iPhone was not found on the trusted Wi-Fi transport."})),
         ).into_response();
-    }
+    };
 
     let id = Uuid::now_v7();
     let ipa_path = state.database.lock().map_err(|_| ()).and_then(|database| {
         let path = store::app_path(&database, request.app_id).map_err(|_| ())?;
         let path = path.ok_or(())?;
-        store::insert_job(&database, id, request.app_id, request.device_id).map_err(|_| ())?;
+        store::insert_job(
+            &database,
+            id,
+            request.app_id,
+            request.device_id,
+            &device.display_name,
+        )
+        .map_err(|_| ())?;
         Ok::<_, ()>(PathBuf::from(path))
     });
     let Ok(ipa_path) = ipa_path else {
@@ -622,7 +629,12 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
             if store::active_job_exists(&database, app_id, device_id).map_err(|_| ())? {
                 return Ok(false);
             }
-            store::insert_job(&database, id, app_id, device_id).map_err(|_| ())?;
+            let device_label = devices
+                .iter()
+                .find(|device| device.id == device_id)
+                .map(|device| device.display_name.as_str())
+                .unwrap_or("Trusted iPhone");
+            store::insert_job(&database, id, app_id, device_id, device_label).map_err(|_| ())?;
             Ok(true)
         });
         if matches!(inserted, Ok(true)) {
@@ -649,7 +661,7 @@ async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: P
             device_id,
             ipa_path,
             Box::new(move |progress| {
-                let phase = if progress >= 50 {
+                let phase = if progress >= 40 {
                     "transferring"
                 } else {
                     "signing"
@@ -658,8 +670,16 @@ async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: P
             }),
         )
         .await;
-    if result.is_err() {
-        tracing::warn!(job_id = %id, "IPA installation failed");
+    if let Err(error) = &result {
+        tracing::warn!(job_id = %id, error = %error, "IPA installation failed");
+        set_job_failure(
+            &state.database,
+            id,
+            match error {
+                TransportError::Unavailable => "iphone_unavailable",
+                TransportError::InstallFailed => "installation_failed",
+            },
+        );
     }
     set_job_status(
         &state.database,
@@ -681,6 +701,12 @@ fn set_job_status(
 ) {
     if let Ok(connection) = database.lock() {
         let _ = store::update_job_status(&connection, id, phase, progress_percent);
+    }
+}
+
+fn set_job_failure(database: &Arc<Mutex<rusqlite::Connection>>, id: Uuid, failure_code: &str) {
+    if let Ok(connection) = database.lock() {
+        let _ = store::set_job_failure(&connection, id, failure_code);
     }
 }
 
@@ -712,6 +738,7 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
                 "deviceId": job.device_id,
                 "phase": job.phase,
                 "progressPercent": job.progress_percent,
+                "failureCode": job.failure_code,
                 "publicMessage": job_message(&job.phase)
             })),
         )
@@ -726,6 +753,32 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
             Json(serde_json::json!({"message":"Unable to read installation job."})),
         )
             .into_response(),
+    }
+}
+
+async fn list_install_jobs(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::list_recent_jobs(&database, 20).map_err(|_| ()))
+    {
+        Ok(jobs) => Json(serde_json::json!(
+            jobs.into_iter()
+                .map(|job| serde_json::json!({
+                    "id": job.id,
+                    "appId": job.app_id,
+                    "deviceLabel": job.device_label,
+                    "phase": job.phase,
+                    "progressPercent": job.progress_percent,
+                    "createdAt": job.created_at,
+                    "completedAt": job.completed_at,
+                    "failureCode": job.failure_code,
+                    "publicMessage": job_message(&job.phase)
+                }))
+                .collect::<Vec<_>>()
+        )),
+        Err(_) => Json(serde_json::json!({"message":"Unable to read installation history."})),
     }
 }
 
@@ -921,6 +974,7 @@ async fn main() {
         .route("/api/apps", get(list_apps).post(upload_ipa))
         .route("/api/apps/{id}", delete(delete_ipa))
         .route("/api/install-jobs", post(create_install_job))
+        .route("/api/install-jobs", get(list_install_jobs))
         .route("/api/install-jobs/{id}", get(get_install_job))
         .route("/api/refresh", post(trigger_refresh))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
