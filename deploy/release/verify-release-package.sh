@@ -27,10 +27,13 @@ for required in \
   install-iphoneloadly.sh \
   deploy/host/install-debian13.sh \
   deploy/systemd/iphoneloadly-api.service \
+  deploy/systemd/iphoneloadly-dashboard-mdns.service \
   deploy/systemd/iphoneloadly-refresh.service \
   deploy/systemd/iphoneloadly-refresh.timer \
   deploy/caddy/Caddyfile.example \
   scripts/iphoneloadly-doctor.sh \
+  scripts/create-caddy-ios-profile.sh \
+  scripts/publish-dashboard-mdns.sh \
   scripts/preflight-wifi.sh \
   scripts/backup-state.sh \
   scripts/restore-state.sh \

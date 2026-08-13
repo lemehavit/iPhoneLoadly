@@ -118,6 +118,12 @@ lists only apps that iPhoneLoadly installed on the selected trusted iPhone.
 
 Use Caddy only on a trusted LAN with authentication; never expose it to the Internet.
 
+On an iPhone or iPad, open `https://iphoneloadly.local` only after completing
+the Bonjour name-resolution and Caddy certificate-trust steps in
+[caddy-lan.md](operations/caddy-lan.md). A raw IP address is not a supported
+dashboard URL because Caddy's HTTPS certificate is issued to
+`iphoneloadly.local`.
+
 ## Troubleshooting
 
 ### Dashboard does not open
@@ -129,9 +135,17 @@ sudo systemctl status iphoneloadly-api --no-pager
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-If the service is inactive, inspect `sudo journalctl -u iphoneloadly-api -n 100
---no-pager`, correct the reported configuration error, then run `sudo systemctl
-restart iphoneloadly-api`. Confirm your SSH tunnel uses the same server.
+If the API is healthy but an iPhone cannot open `https://iphoneloadly.local`,
+verify the dashboard mDNS record and that the iPhone has trusted Caddy's root
+certificate:
+
+```bash
+sudo systemctl status iphoneloadly-dashboard-mdns.service --no-pager
+avahi-resolve --name iphoneloadly.local
+```
+
+The address must be the Debian LAN address. Do not use a Docker address or a raw
+IP URL. See [caddy-lan.md](operations/caddy-lan.md) for the iPhone trust steps.
 
 ### iPhone is not detected or reachable
 

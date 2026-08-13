@@ -103,7 +103,10 @@ if [[ "${1:-}" == "--check-package-layout" ]]; then
     "${HOST_PREP}" \
     "${APP_INSTALLER}" \
     "${PACKAGE_ROOT}/deploy/systemd/iphoneloadly-api.service" \
+    "${PACKAGE_ROOT}/deploy/systemd/iphoneloadly-dashboard-mdns.service" \
     "${PACKAGE_ROOT}/deploy/caddy/Caddyfile.example" \
+    "${PACKAGE_ROOT}/scripts/create-caddy-ios-profile.sh" \
+    "${PACKAGE_ROOT}/scripts/publish-dashboard-mdns.sh" \
     "${PACKAGE_ROOT}/scripts/iphoneloadly-doctor.sh" \
     "${PACKAGE_ROOT}/scripts/preflight-wifi.sh" \
     "${PACKAGE_ROOT}/scripts/backup-state.sh" \
