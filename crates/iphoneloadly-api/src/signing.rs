@@ -1,14 +1,27 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use idevice::provider::TcpProvider;
 use isideload::{
     anisette::remote_v3::RemoteV3AnisetteProvider,
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
-    dev::developer_session::DeveloperSession,
-    sideload::{SideloaderBuilder, builder::MaxCertsBehavior, sideloader::Sideloader},
-    util::storage::InMemoryStorage,
+    dev::{developer_session::DeveloperSession, devices::DevicesApi},
+    sideload::{
+        SideloaderBuilder, builder::MaxCertsBehavior, install::install_app as install_signed_app,
+        sideloader::Sideloader,
+    },
+    util::{device::IdeviceInfo, fs_storage::FsStorage, storage::InMemoryStorage},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
@@ -116,11 +129,25 @@ impl LoginAttempt {
     }
 }
 
-#[derive(Default)]
 pub struct AppleSigningProvider {
     anisette_url: Option<String>,
+    signing_storage_path: PathBuf,
     sideloader: Mutex<Option<Sideloader>>,
     attempts: Mutex<HashMap<Uuid, Arc<LoginAttempt>>>,
+    certificate_recovery_requested: AtomicBool,
+    saved_login_id: Mutex<Option<Uuid>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedCredentials {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedCredentials {
+    nonce: String,
+    ciphertext: String,
 }
 
 #[derive(Debug, Error)]
@@ -137,14 +164,19 @@ pub enum SigningError {
     NotReady,
     #[error("IPA installation failed")]
     InstallFailed,
+    #[error("encrypted credential storage failed")]
+    CredentialStorage,
 }
 
 impl AppleSigningProvider {
-    pub fn new(anisette_url: Option<String>) -> Arc<Self> {
+    pub fn new(anisette_url: Option<String>, signing_storage_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             anisette_url: anisette_url.filter(|url| !url.trim().is_empty()),
+            signing_storage_path,
             sideloader: Mutex::new(None),
             attempts: Mutex::new(HashMap::new()),
+            certificate_recovery_requested: AtomicBool::new(false),
+            saved_login_id: Mutex::new(None),
         })
     }
 
@@ -156,6 +188,127 @@ impl AppleSigningProvider {
         self.anisette_url.is_some()
     }
 
+    fn credentials_path(&self) -> PathBuf {
+        self.signing_storage_path.join("saved-credentials.json")
+    }
+
+    fn credentials_key_path(&self) -> PathBuf {
+        self.signing_storage_path.join("credentials.key")
+    }
+
+    fn credential_key(&self) -> Result<[u8; 32], SigningError> {
+        std::fs::create_dir_all(&self.signing_storage_path)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let path = self.credentials_key_path();
+        if let Ok(bytes) = std::fs::read(&path) {
+            return bytes
+                .try_into()
+                .map_err(|_| SigningError::CredentialStorage);
+        }
+        let key: [u8; 32] = rand::random();
+        std::fs::write(&path, key).map_err(|_| SigningError::CredentialStorage)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(key)
+    }
+
+    pub fn save_credentials(&self, email: &str, password: &str) -> Result<(), SigningError> {
+        let key = self.credential_key()?;
+        let nonce: [u8; 12] = rand::random();
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|_| SigningError::CredentialStorage)?;
+        let plaintext = serde_json::to_vec(&SavedCredentials {
+            email: email.into(),
+            password: password.into(),
+        })
+        .map_err(|_| SigningError::CredentialStorage)?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let record = serde_json::to_vec(&EncryptedCredentials {
+            nonce: BASE64.encode(nonce),
+            ciphertext: BASE64.encode(ciphertext),
+        })
+        .map_err(|_| SigningError::CredentialStorage)?;
+        let path = self.credentials_path();
+        std::fs::write(&path, record).map_err(|_| SigningError::CredentialStorage)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn delete_saved_credentials(&self) -> Result<(), SigningError> {
+        match std::fs::remove_file(self.credentials_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(SigningError::CredentialStorage),
+        }
+    }
+
+    pub async fn clear_saved_login_id(&self) {
+        *self.saved_login_id.lock().await = None;
+    }
+
+    pub fn has_saved_credentials(&self) -> bool {
+        self.credentials_path().is_file()
+    }
+
+    pub async fn set_saved_login_id(&self, id: Uuid) {
+        *self.saved_login_id.lock().await = Some(id);
+    }
+
+    pub async fn restore_saved_login(
+        self: &Arc<Self>,
+    ) -> Result<Option<LoginStatus>, SigningError> {
+        let record = match std::fs::read(self.credentials_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(SigningError::CredentialStorage),
+        };
+        let encrypted: EncryptedCredentials =
+            serde_json::from_slice(&record).map_err(|_| SigningError::CredentialStorage)?;
+        let nonce = BASE64
+            .decode(encrypted.nonce)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        if nonce.len() != 12 {
+            return Err(SigningError::CredentialStorage);
+        }
+        let ciphertext = BASE64
+            .decode(encrypted.ciphertext)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let cipher = Aes256Gcm::new_from_slice(&self.credential_key()?)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let saved: SavedCredentials =
+            serde_json::from_slice(&plaintext).map_err(|_| SigningError::CredentialStorage)?;
+        let status = self.begin_login(saved.email, saved.password).await?;
+        *self.saved_login_id.lock().await = Some(status.id);
+        Ok(Some(status))
+    }
+
+    pub async fn saved_login_status(&self) -> Result<Option<LoginStatus>, SigningError> {
+        let Some(id) = *self.saved_login_id.lock().await else {
+            return Ok(None);
+        };
+        self.login_status(id).await.map(Some)
+    }
+
+    /// Arms one subsequent interactive login to revoke an older development
+    /// certificate only if Apple rejects a new certificate for hitting its
+    /// certificate limit. This never makes an Apple request by itself.
+    pub fn request_certificate_recovery(&self) {
+        self.certificate_recovery_requested
+            .store(true, Ordering::Release);
+    }
+
     pub async fn begin_login(
         self: &Arc<Self>,
         email: String,
@@ -165,6 +318,9 @@ impl AppleSigningProvider {
             .anisette_url
             .clone()
             .ok_or(SigningError::MissingAnisetteUrl)?;
+        let revoke_old_certificate = self
+            .certificate_recovery_requested
+            .swap(false, Ordering::AcqRel);
         let id = Uuid::now_v7();
         let attempt = Arc::new(LoginAttempt::new(id));
         self.attempts.lock().await.insert(id, attempt.clone());
@@ -224,8 +380,16 @@ impl AppleSigningProvider {
             };
             let sideloader = SideloaderBuilder::new(developer_session, email)
                 .machine_name("iPhoneLoadly".into())
-                .storage(Box::new(InMemoryStorage::new()))
-                .max_certs_behavior(MaxCertsBehavior::Error)
+                // Reusing this root-only service state lets isideload find the
+                // matching Apple development certificate after a new login.
+                .storage(Box::new(FsStorage::new(
+                    provider.signing_storage_path.clone(),
+                )))
+                .max_certs_behavior(if revoke_old_certificate {
+                    MaxCertsBehavior::Revoke
+                } else {
+                    MaxCertsBehavior::Error
+                })
                 .build();
             *provider.sideloader.lock().await = Some(sideloader);
             background_attempt.ready().await;
@@ -244,17 +408,58 @@ impl AppleSigningProvider {
         &self,
         provider: &TcpProvider,
         ipa_path: std::path::PathBuf,
-    ) -> Result<(), SigningError> {
+        progress: impl Fn(u8) + Send + Sync + 'static,
+    ) -> Result<String, SigningError> {
         let mut sideloader = self.sideloader.lock().await;
         let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
-        sideloader
-            // The API accepts an optional asynchronous progress callback. The
-            // job API currently reports phases only, so consume progress here
-            // until per-byte progress is persisted in a later increment.
-            .install_app(provider, ipa_path, false, Some(|_progress: f32| async {}))
+        let progress = Arc::new(progress);
+        let device = IdeviceInfo::from_device(provider)
             .await
             .map_err(|_| SigningError::InstallFailed)?;
-        Ok(())
+        let team = sideloader
+            .get_team()
+            .await
+            .map_err(|_| SigningError::InstallFailed)?;
+        sideloader
+            .get_dev_session()
+            .ensure_device_registered(&team, &device.name, &device.udid, None)
+            .await
+            .map_err(|_| SigningError::InstallFailed)?;
+
+        let signing_progress = progress.clone();
+        let (signed_app_path, _) = sideloader
+            .sign_app(
+                ipa_path,
+                Some(team),
+                false,
+                Some(move |value: f32| {
+                    signing_progress((value.clamp(0.0, 1.0) * 40.0) as u8);
+                    async {}
+                }),
+            )
+            .await
+            .map_err(|_| SigningError::InstallFailed)?;
+        let signed_info = plist::Value::from_file(signed_app_path.join("Info.plist"))
+            .map_err(|_| SigningError::InstallFailed)?;
+        let installed_bundle_id = signed_info
+            .as_dictionary()
+            .and_then(|info| info.get("CFBundleIdentifier"))
+            .and_then(plist::Value::as_string)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or(SigningError::InstallFailed)?;
+
+        // The upstream installer reports actual AFC-upload and installation
+        // percentages. Reserve the final 60% of the job for those values.
+        progress(40);
+        let install_progress = progress.clone();
+        install_signed_app(provider, &signed_app_path, move |value| {
+            let percent = 40 + ((value.min(100) * 60) / 100) as u8;
+            install_progress(percent);
+        })
+        .await
+        .map_err(|_| SigningError::InstallFailed)?;
+        Ok(installed_bundle_id)
     }
 
     pub async fn submit_two_factor(

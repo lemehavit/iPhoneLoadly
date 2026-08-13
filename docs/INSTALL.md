@@ -29,9 +29,9 @@ Expected checksum result:
 iphoneloadly-v<VERSION>-linux-amd64.tar.gz: OK
 ```
 
-There is no published release asset yet if the Releases page is empty. Until the
-first release, use the advanced source-build instructions in
-[from-scratch.md](operations/from-scratch.md); do not substitute an unverified
+The current alpha release is `v0.2.0-alpha.1`. If that release is unavailable,
+use the advanced source-build instructions in
+[from-scratch.md](operations/from-scratch.md); never substitute an unverified
 archive from another site.
 
 ## 2. Start the local anisette service
@@ -62,18 +62,36 @@ Connect and unlock the iPhone before starting. The assistant installs Debian
 packages, verifies the pinned `netmuxd` archive and binary checksums, installs
 the systemd units, performs the pairing ceremony, enables Wi-Fi connections,
 creates safe configuration, starts the API and refresh timer, and runs a health
-check. It does not save Apple credentials or expose port 8080.
+check. The source-install path installs iPhoneLoadly's isolated Rust 1.89.0
+toolchain and Cargo needed to build the API; Debian's older Rust package is not
+used. The installer explicitly selects that toolchain during the build. It does
+not save Apple credentials or expose port 8080.
+
+When the installer asks for the Trust This Computer confirmation, it waits up to
+120 seconds for the iPhone response. Keep the phone connected and unlocked, then
+tap **Trust** and enter the device passcode if iOS requests it.
 
 ```bash
 sudo bash ./install.sh
 ```
 
-During setup, accept **Trust This Computer** on the phone, then disconnect USB
-when prompted. Enter the phone’s UDID and current Wi-Fi IP only at the local
-terminal. If the pairing record is not found, stop and use the explicit pairing
-steps in [debian13-host-preparation.md](operations/debian13-host-preparation.md).
+During setup, connect and unlock exactly one iPhone, then accept **Trust This
+Computer** on the phone. Disconnect USB when prompted. The installer identifies
+that phone, enables Wi-Fi connections, and verifies the same trusted device over
+the network before it continues; it never asks you to enter a UDID or IP address.
+If that verification times out, keep USB disconnected and use the diagnostics
+below before repeating the pairing ceremony.
 
 ## 4. Open the dashboard and install an IPA
+
+For normal use on a trusted LAN, configure the authenticated Caddy endpoint by
+following [caddy-lan.md](operations/caddy-lan.md), then open:
+
+```text
+https://iphoneloadly.local
+```
+
+An SSH tunnel remains available as an administrator fallback:
 
 From your own computer, make an SSH tunnel to the Debian host:
 
@@ -81,16 +99,24 @@ From your own computer, make an SSH tunnel to the Debian host:
 ssh -N -L 8080:127.0.0.1:8080 YOUR_USER@YOUR_SERVER
 ```
 
-Open `http://127.0.0.1:8080/`, sign in with your Apple ID, complete 2FA, upload
-an IPA, select the discovered phone, and create an installation job. The password
-and 2FA response live only in memory; sign in again after an API or server restart.
+Open the dashboard, sign in with your Apple ID, complete 2FA, upload an IPA,
+select the discovered phone, and create an installation job. The password stays
+in memory unless you explicitly select encrypted credential storage; 2FA is never
+saved. Apple may still require 2FA after an API or server restart.
+The job view shows signing progress and then the device-transfer phase. Use
+**Ta bort vald IPA från servern** to permanently remove an uploaded IPA when it
+is no longer needed; it is unavailable while that IPA has an active installation
+or refresh job, and a removed IPA cannot be refreshed later.
 
-The refresh timer runs daily at about 03:00 with up to a 20-minute delay. It only
-queues a refresh for an app whose last successful install is at least six days
-old, and only succeeds while both the signing session and phone are available.
+The refresh timer runs hourly with up to a 10-minute delay. It only queues a
+refresh for an app whose last successful install is at least six days old. If the
+phone is unavailable, a later hourly run retries automatically; use the History
+and diagnostics view to see each result.
 
-For LAN dashboard access, optionally configure [Caddy](operations/caddy-lan.md).
-Do this only on a trusted LAN with authentication; never expose it to the Internet.
+The Overview shows remaining free-signing days for successful installations and
+lists only apps that iPhoneLoadly installed on the selected trusted iPhone.
+
+Use Caddy only on a trusted LAN with authentication; never expose it to the Internet.
 
 ## Troubleshooting
 
@@ -114,11 +140,11 @@ then disconnect USB. Confirm both devices use the same Wi-Fi/LAN and run:
 
 ```bash
 sudo iphoneloadly-doctor
-sudo bash /usr/share/iphoneloadly/scripts/preflight-wifi.sh --udid '<UDID>'
+sudo bash /usr/share/iphoneloadly/scripts/preflight-wifi.sh
 ```
 
 If Bonjour or direct Wi-Fi fails, check Wi-Fi client isolation, VLAN multicast
-filtering, the configured IP, and `iphoneloadly-netmuxd` status. Do not delete
+filtering and `iphoneloadly-netmuxd` status. Do not delete
 pairing records unless you intentionally want to pair again.
 
 ### Apple sign-in fails
@@ -132,7 +158,23 @@ sudo systemctl status iphoneloadly-api --no-pager
 
 Enter the password and 2FA response only in the local dashboard. A delayed or
 failed 2FA interaction can time out; start a new sign-in. Any API restart ends
-the memory-only signing session.
+the memory-only signing session unless you explicitly selected **Save
+credentials encrypted on this server**. That optional setting stores the Apple
+email and password encrypted with a root-only local key; on restart the service
+attempts to sign in again. Apple may still require a new 2FA response. Use
+**Remove saved credentials** to delete the encrypted record. A server root user
+can access the encryption key, so enable this only on a server you administer.
+
+### Apple reports that the development-certificate limit is reached
+
+For a free Apple developer account, iPhoneLoadly saves its signing key in its
+root-only service data directory and reuses the matching Apple certificate
+after a new login. You should therefore only select **Frigör gammalt
+utvecklingscertifikat** if Apple explicitly reports that the certificate limit
+has been reached. The next signing session then revokes one older development
+certificate only if Apple rejects new-certificate creation for reaching the
+limit. Revoking a certificate can invalidate apps signed with it; do not use
+this action if an existing certificate supports an app you need to keep running.
 
 ### An app does not install
 
@@ -157,8 +199,10 @@ sudo systemctl status iphoneloadly-refresh.timer --no-pager
 curl --fail -X POST http://127.0.0.1:8080/api/refresh
 ```
 
-Refresh is not a guarantee: it needs an active in-memory Apple session, a
-reachable phone, and an app whose last successful installation is six days old.
+Refresh is not a guarantee: it needs Apple signing to be ready, a reachable
+phone, and an app whose last successful installation is six days old. A saved
+encrypted sign-in can restore the Apple login after restart, though Apple may
+still require 2FA.
 
 ## Advanced paths
 

@@ -112,7 +112,7 @@ sudo idevicepair pair
 sudo idevicepair validate
 sudo ideviceinfo -k DeviceName
 sudo ideviceinfo -k ProductVersion
-sudo iphoneloadly-pymobiledevice3 lockdown wifi-connections on
+sudo iphoneloadly-pymobiledevice3 lockdown wifi-connections --state on
 ```
 
 Confirm that at least one device pairing record exists without printing its filename:
@@ -167,6 +167,9 @@ sudo /opt/iphoneloadly-tools/pymobiledevice3/bin/python \
 ```
 
 This diagnostic does not pair, install an IPA, or print pairing-record material.
+The installer and API use this same Bonjour-discovered, pairing-record-validated
+TCP path automatically when the netmuxd/libimobiledevice enumeration path is
+unavailable; it never stores a device IP address or exposes a UDID to the UI.
 
 ## 6. Run the read-only preflight
 
@@ -174,7 +177,10 @@ This diagnostic does not pair, install an IPA, or print pairing-record material.
 sudo bash scripts/preflight-wifi.sh --udid '<UDID>'
 ```
 
-The preflight does not pair, write pairing data or install an IPA. Warnings are expected if the phone is away or no UDID was supplied. Failures must be resolved before application code is connected to the device.
+The preflight does not pair, write pairing data or install an IPA. When exactly
+one trusted Wi-Fi device is visible, it validates that device automatically;
+with multiple devices, pass `--udid` only for a focused diagnostic. Failures
+must be resolved before application code is connected to the device.
 
 ## 7. Collect diagnostics safely
 

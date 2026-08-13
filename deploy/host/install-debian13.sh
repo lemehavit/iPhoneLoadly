@@ -8,6 +8,10 @@ NETMUXD_SHA256="85b6598284fc639f2a282584461d05e2090b79bdf3ec949d2a5e5d3dc655dde4
 NETMUXD_BINARY_SHA256="d42e0d1ed1a29c38693083db919e4cb2e1ce9e08799fa19a2ee388882d9bcc23"
 NETMUXD_URL="https://github.com/jkcoxson/netmuxd/releases/download/v${NETMUXD_VERSION}/${NETMUXD_ASSET}"
 PYMOBILEDEVICE3_VERSION="10.7.3"
+RUST_VERSION="1.89.0"
+RUSTUP_INIT_URL="https://sh.rustup.rs"
+RUSTUP_HOME="/opt/iphoneloadly-tools/rustup"
+CARGO_HOME="/opt/iphoneloadly-tools/cargo"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -99,6 +103,17 @@ fi
     "pymobiledevice3==${PYMOBILEDEVICE3_VERSION}"
 ln -sfn "${PMD3_VENV}/bin/pymobiledevice3" /usr/local/bin/iphoneloadly-pymobiledevice3
 
+RUSTUP_INSTALLER="${DOWNLOAD_DIR}/rustup-init.sh"
+curl --fail --location --proto '=https' --tlsv1.2 \
+    --output "${RUSTUP_INSTALLER}" \
+    "${RUSTUP_INIT_URL}"
+RUSTUP_INIT_SKIP_PATH_CHECK=yes RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}" \
+    sh "${RUSTUP_INSTALLER}" -y --profile minimal --default-toolchain "${RUST_VERSION}"
+"${CARGO_HOME}/bin/rustup" default "${RUST_VERSION}"
+"${CARGO_HOME}/bin/rustc" --version | grep -Fq "rustc ${RUST_VERSION}" \
+    || fail "Rust ${RUST_VERSION} installation verification failed"
+ln -sfn "${CARGO_HOME}/bin/cargo" /usr/local/bin/iphoneloadly-cargo
+
 install -o root -g root -m 0644 \
     "${SYSTEMD_SOURCE}" \
     /etc/systemd/system/iphoneloadly-netmuxd.service
@@ -111,6 +126,7 @@ printf '\nHost preparation complete.\n'
 printf 'netmuxd release: v%s\n' "${NETMUXD_VERSION}"
 printf 'netmuxd binary SHA-256: %s\n' "${NETMUXD_ACTUAL_SHA}"
 printf 'pymobiledevice3: %s\n' "${PYMOBILEDEVICE3_VERSION}"
+printf 'Rust toolchain: %s\n' "${RUST_VERSION}"
 printf 'mux group: %s\n' "$(getent group iphoneloadly-mux)"
 printf 'mux socket: /run/iphoneloadly/mux.sock\n'
 printf '\nNo firewall, Proxmox, USB-port, pairing, or Apple-account settings were changed.\n'

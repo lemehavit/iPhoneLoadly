@@ -31,13 +31,18 @@ if curl --fail --silent --max-time 5 http://127.0.0.1:6970/ >/dev/null; then pas
 [[ -d /var/lib/iphoneloadly && -w /var/lib/iphoneloadly ]] && pass 'application state directory is writable' || fail 'application state directory is unavailable'
 if [[ -f /etc/iphoneloadly/api.env ]]; then
   if [[ "$(stat -c '%a' /etc/iphoneloadly/api.env 2>/dev/null)" == 600 ]]; then pass 'API configuration permissions are 0600'; else warn 'API configuration should be mode 0600'; fi
-  device_id="$(config_value IPHONELOADLY_DEVICE_ID)"
-  device_ip="$(config_value IPHONELOADLY_DEVICE_IP)"
-  pairing_file="$(config_value IPHONELOADLY_PAIRING_FILE)"
-  if [[ -n "$device_id" && -n "$device_ip" ]]; then pass 'iPhone configuration is present'; else fail 'iPhone device ID or IP is missing'; fi
-  if [[ -r "$pairing_file" ]]; then pass 'pairing file is present'; else fail 'configured pairing file is unavailable'; fi
-  if [[ -n "$device_ip" ]]; then
-    if ping -c 1 -W 2 "$device_ip" >/dev/null 2>&1; then pass 'configured iPhone IP responds to ping'; else warn 'configured iPhone IP does not respond (a sleeping phone may be normal)'; fi
+  mux_socket="$(config_value IPHONELOADLY_MUX_SOCKET)"
+  pairing_dir="$(config_value IPHONELOADLY_PAIRING_DIR)"
+  if [[ -S "$mux_socket" ]]; then pass 'network mux socket is present'; else fail 'network mux socket is unavailable'; fi
+  if [[ -r "$pairing_dir" ]]; then pass 'pairing record directory is readable'; else fail 'pairing record directory is unavailable'; fi
+  if [[ -S "$mux_socket" ]] && command -v idevice_id >/dev/null 2>&1; then
+    network_ids="$(USBMUXD_SOCKET_ADDRESS="$mux_socket" idevice_id --network 2>/dev/null || true)"
+    if [[ -n "$network_ids" ]]; then
+      network_count="$(printf '%s\n' "$network_ids" | sed '/^[[:space:]]*$/d' | wc -l)"
+      pass "network mux reports ${network_count} Wi-Fi device(s); identifiers suppressed"
+    else
+      warn 'network mux reports no Wi-Fi devices (a sleeping phone may be normal)'
+    fi
   fi
 else fail '/etc/iphoneloadly/api.env is missing'; fi
 

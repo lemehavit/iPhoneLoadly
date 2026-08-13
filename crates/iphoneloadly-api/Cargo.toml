@@ -1,19 +1,24 @@
 [package]
 name = "iphoneloadly-api"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 publish = false
 
 [dependencies]
 async-trait = "0.1.89"
+aes-gcm = "0.10.3"
 axum = { version = "0.8.8", features = ["multipart"] }
+base64 = "0.22.1"
 idevice = { version = "=0.1.65", features = ["tcp", "usbmuxd"] }
 # Pin the same signing stack as iLoader. The Git branch is required because
 # published isideload releases do not contain its current signing backend.
-isideload = { version = "0.3.17", git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick" }
+isideload = { version = "0.3.17", git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick", features = ["fs-storage"] }
+mdns-sd = "0.20.3"
+plist = "1.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
+rand = "0.9.2"
 rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
 sha2 = "0.10.9"
 thiserror = "2.0.18"

@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::Read,
+    io::{Cursor, Read},
     path::{Component, Path},
 };
 
@@ -14,12 +14,14 @@ pub const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 20_000;
 pub const MAX_COMPRESSION_RATIO: u64 = 200;
+const MAX_INFO_PLIST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadMetadata {
     pub sha256: String,
     pub size_bytes: u64,
     pub app_bundle_path: String,
+    pub bundle_id: String,
     pub info_plist_present: bool,
 }
 
@@ -39,6 +41,8 @@ pub enum UploadError {
     InvalidPayload,
     #[error("application Info.plist is missing")]
     MissingInfoPlist,
+    #[error("application Info.plist does not contain a valid bundle identifier")]
+    InvalidBundleIdentifier,
 }
 
 pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
@@ -69,12 +73,13 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let mut expanded_bytes = 0_u64;
     let mut app_bundle: Option<String> = None;
     let mut info_plist_present = false;
+    let mut bundle_id = None;
     for index in 0..archive.len() {
-        let entry = archive
+        let mut entry = archive
             .by_index(index)
             .map_err(|_| UploadError::InvalidArchive)?;
-        let name = entry.name();
-        validate_archive_path(name)?;
+        let name = entry.name().to_owned();
+        validate_archive_path(&name)?;
         expanded_bytes = expanded_bytes.saturating_add(entry.size());
         if expanded_bytes > MAX_EXPANDED_BYTES {
             return Err(UploadError::ExpansionLimit);
@@ -85,7 +90,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
             return Err(UploadError::ExpansionLimit);
         }
 
-        if let Some(bundle) = main_bundle_from_entry(name) {
+        if let Some(bundle) = main_bundle_from_entry(&name) {
             match &app_bundle {
                 Some(existing) if existing != bundle => return Err(UploadError::InvalidPayload),
                 None => app_bundle = Some(bundle.to_owned()),
@@ -96,6 +101,22 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
             && name == format!("{bundle}/Info.plist")
         {
             info_plist_present = true;
+            if entry.size() > MAX_INFO_PLIST_BYTES {
+                return Err(UploadError::ExpansionLimit);
+            }
+            let mut info_plist = Vec::new();
+            entry
+                .read_to_end(&mut info_plist)
+                .map_err(|_| UploadError::InvalidArchive)?;
+            bundle_id = plist::Value::from_reader(Cursor::new(info_plist))
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_dictionary()?
+                        .get("CFBundleIdentifier")?
+                        .as_string()
+                        .map(str::to_owned)
+                });
         }
     }
 
@@ -103,12 +124,20 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     if !info_plist_present {
         return Err(UploadError::MissingInfoPlist);
     }
+    let bundle_id = bundle_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(UploadError::InvalidBundleIdentifier)?;
     Ok(UploadMetadata {
         sha256: format!("{:x}", hasher.finalize()),
         size_bytes: metadata.len(),
         app_bundle_path,
+        bundle_id,
         info_plist_present,
     })
+}
+
+pub fn bundle_identifier(path: &Path) -> Result<String, UploadError> {
+    Ok(inspect_ipa(path)?.bundle_id)
 }
 
 fn validate_archive_path(name: &str) -> Result<(), UploadError> {

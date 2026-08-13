@@ -4,7 +4,8 @@ For the supported beginner path, start with [INSTALL.md](../INSTALL.md). This
 document is retained for source-build and host-internals users.
 
 This guide installs iPhoneLoadly on Debian 13 amd64. The API stays on localhost;
-use an SSH tunnel from a browser machine rather than exposing it directly.
+use authenticated Caddy for `https://iphoneloadly.local` or an SSH tunnel rather
+than exposing it directly.
 
 ## 1. Obtain the repository and host prerequisites
 
@@ -49,13 +50,18 @@ bash deploy/release/build-release.sh
 ```
 
 Continue with `docs/operations/quick-start.md` and use the generated archive in
-`dist/`. The installer creates `/etc/iphoneloadly/api.env` from the device ID,
-iPhone IP, pairing plist path, and local anisette URL supplied on its command line.
-It does not accept or store an Apple-ID password or a two-factor code.
+`dist/`. The installer configures the dedicated network mux socket, pairing
+directory and local anisette URL; iPhone addresses and UDIDs are discovered at
+runtime and are not stored in the environment file. It does not accept or store
+an Apple-ID password or a two-factor code.
 
 Continue with `docs/operations/api-systemd.md` to enable the API and refresh timer.
 
 ## 4. Use the local dashboard
+
+For normal trusted-LAN access, follow `docs/operations/caddy-lan.md` and open
+`https://iphoneloadly.local`. Alternatively, create an SSH tunnel from the
+browser machine:
 
 From the browser machine:
 
@@ -63,9 +69,9 @@ From the browser machine:
 ssh -N -L 8080:127.0.0.1:8080 debian-user@debian-host
 ```
 
-Open `http://127.0.0.1:8080/`, sign in with Apple, complete 2FA, then upload and
-install an IPA. Apple credentials are held only in memory and must be entered again
-after an API or host restart.
+Open the dashboard, sign in with Apple, complete 2FA, then upload and install an
+IPA. Credentials remain in memory unless encrypted storage is explicitly enabled;
+Apple may still request 2FA after an API or host restart.
 
 ## Backup and restore
 

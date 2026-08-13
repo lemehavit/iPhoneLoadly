@@ -11,16 +11,20 @@ Internet unless an administrator deliberately configures an SSH tunnel or a
 separately authenticated Caddy reverse proxy. Do not publish the dashboard,
 Apple-login endpoints, or port 8080 to the Internet.
 
-Apple passwords and two-factor responses are submitted to the local dashboard
-and kept only in the process memory used for the current signing session. They
-are not written to iPhoneLoadly configuration or SQLite state. Restarting the
-API ends that session and requires another sign-in.
+Apple passwords and two-factor responses are submitted only to the local
+dashboard. Two-factor responses remain in process memory and are never persisted.
+Passwords remain in memory by default. If the user explicitly selects encrypted
+credential storage, iPhoneLoadly encrypts the Apple email and password with a
+root-only local key and attempts to restore sign-in after restart; Apple may still
+require 2FA. A root administrator can access both ciphertext and key, so this is
+protection at rest rather than protection from a compromised root account.
 
 The pairing record in `/var/lib/lockdown` is sensitive host-to-device
 authentication material. The API needs it to reach the configured phone over
 trusted Wi-Fi. Do not share it, place it in source control, or include its
-contents in support requests. Uploaded IPA files and SQLite metadata live in
-`/var/lib/iphoneloadly`; backups of that directory are sensitive too.
+contents in support requests. Uploaded IPA files, SQLite metadata, encrypted
+credentials and the local encryption key live in `/var/lib/iphoneloadly`;
+backups of that directory are sensitive too.
 
 The supplied API service currently runs as `root` because it reads the
 root-owned lockdown pairing record and uses host device-transport material.

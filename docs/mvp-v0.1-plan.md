@@ -208,7 +208,7 @@ Follow the [Debian 13.6 host preparation runbook](operations/debian13-host-prepa
 lsusb | grep -i apple
 idevicepair pair
 idevicepair validate
-pymobiledevice3 lockdown wifi-connections on
+pymobiledevice3 lockdown wifi-connections --state on
 # Disconnect the USB cable here.
 avahi-browse -rt _apple-mobdev2._tcp
 ideviceinfo --network -u <UDID> -k DeviceName
@@ -293,7 +293,7 @@ systemctl status usbmuxd
 idevice_id -l
 idevicepair pair
 idevicepair validate
-pymobiledevice3 lockdown wifi-connections on
+pymobiledevice3 lockdown wifi-connections --state on
 ```
 
 Disconnect the USB cable before every remaining device command.

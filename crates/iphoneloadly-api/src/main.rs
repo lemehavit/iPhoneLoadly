@@ -4,9 +4,11 @@ mod signing;
 mod store;
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as StdPath, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -15,9 +17,10 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
@@ -39,12 +42,28 @@ struct DeviceSummary {
     product_type: String,
     ios_version: String,
     connection_type: ConnectionType,
+    status: DeviceStatus,
+    install_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledAppSummary {
+    display_name: String,
+    bundle_id: String,
+    version: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ConnectionType {
     Network,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DeviceStatus {
+    Online,
 }
 
 /// Owns all Apple-account, 2FA, developer-resource, profile, and signing work.
@@ -65,11 +84,17 @@ struct SigningReadiness {
 #[async_trait]
 trait DeviceTransport: Send + Sync {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError>;
+    async fn list_installed_apps(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Vec<InstalledAppSummary>, TransportError>;
     async fn install_ipa(
         &self,
         signing: &signing::AppleSigningProvider,
+        device_id: Uuid,
         ipa_path: PathBuf,
-    ) -> Result<(), TransportError>;
+        progress: Box<dyn Fn(u8) + Send + Sync>,
+    ) -> Result<String, TransportError>;
 }
 
 #[derive(Debug, Error)]
@@ -102,112 +127,358 @@ impl SigningProvider for signing::AppleSigningProvider {
     }
 }
 
-struct UnconfiguredTransport;
-
-struct ConfiguredNetworkTransport {
-    device: DeviceSummary,
-}
-
-struct DirectTcpTransport {
-    id: Uuid,
-    address: IpAddr,
+/// Resolves trusted Wi-Fi devices without retaining a DHCP address in
+/// configuration or process memory. netmuxd is preferred; Bonjour plus a
+/// pairing-record-validated TCP connection is the compatibility fallback.
+struct NetmuxTransport {
+    mux_socket: String,
     pairing_path: PathBuf,
 }
 
 #[async_trait]
-impl DeviceTransport for UnconfiguredTransport {
+impl DeviceTransport for NetmuxTransport {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        Err(TransportError::Unavailable)
-    }
-
-    async fn install_ipa(
-        &self,
-        _: &signing::AppleSigningProvider,
-        _: PathBuf,
-    ) -> Result<(), TransportError> {
-        Err(TransportError::Unavailable)
-    }
-}
-
-#[async_trait]
-impl DeviceTransport for ConfiguredNetworkTransport {
-    async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        Ok(vec![self.device.clone()])
-    }
-
-    async fn install_ipa(
-        &self,
-        _: &signing::AppleSigningProvider,
-        _: PathBuf,
-    ) -> Result<(), TransportError> {
-        Err(TransportError::Unavailable)
-    }
-}
-
-#[async_trait]
-impl DeviceTransport for DirectTcpTransport {
-    async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        use idevice::IdeviceService;
-        use idevice::pairing_file::PairingFile;
-        use idevice::provider::TcpProvider;
-        use idevice::services::lockdown::LockdownClient;
-
-        let pairing_file = PairingFile::read_from_file(&self.pairing_path)
-            .map_err(|_| TransportError::Unavailable)?;
-        let provider = TcpProvider {
-            addr: self.address,
-            scope_id: None,
-            pairing_file: pairing_file.clone(),
-            label: "iPhoneLoadly".into(),
-        };
-        let mut client = LockdownClient::connect(&provider)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        client
-            .start_session(&pairing_file)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let device_name = client
-            .get_value(Some("DeviceName"), None)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let product_type = client
-            .get_value(Some("ProductType"), None)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let ios_version = client
-            .get_value(Some("ProductVersion"), None)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        Ok(vec![DeviceSummary {
-            id: self.id,
-            display_name: device_name.as_string().unwrap_or("iPhone").to_owned(),
-            product_type: product_type.as_string().unwrap_or("unknown").to_owned(),
-            ios_version: ios_version.as_string().unwrap_or("unknown").to_owned(),
-            connection_type: ConnectionType::Network,
-        }])
+        Ok(self
+            .reachable_network_devices()
+            .await?
+            .into_iter()
+            .map(|(_, _, summary)| summary)
+            .collect())
     }
 
     async fn install_ipa(
         &self,
         signing: &signing::AppleSigningProvider,
+        device_id: Uuid,
         ipa_path: PathBuf,
-    ) -> Result<(), TransportError> {
-        use idevice::pairing_file::PairingFile;
-        use idevice::provider::TcpProvider;
+        progress: Box<dyn Fn(u8) + Send + Sync>,
+    ) -> Result<String, TransportError> {
+        let (udid, address, _) = self
+            .reachable_network_devices()
+            .await?
+            .into_iter()
+            .find(|(udid, _, _)| device_id_for_udid(udid) == device_id)
+            .ok_or(TransportError::Unavailable)?;
+        let provider = self.provider_for(&udid, address)?;
+        signing
+            .install_ipa(&provider, ipa_path, progress)
+            .await
+            .map_err(|_| TransportError::InstallFailed)
+    }
 
-        let pairing_file = PairingFile::read_from_file(&self.pairing_path)
-            .map_err(|_| TransportError::Unavailable)?;
-        let provider = TcpProvider {
-            addr: self.address,
+    async fn list_installed_apps(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Vec<InstalledAppSummary>, TransportError> {
+        use idevice::{IdeviceService, services::installation_proxy::InstallationProxyClient};
+        let (udid, address, _) = self
+            .reachable_network_devices()
+            .await?
+            .into_iter()
+            .find(|(udid, _, _)| device_id_for_udid(udid) == device_id)
+            .ok_or(TransportError::Unavailable)?;
+        let provider = self.provider_for(&udid, address)?;
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(10),
+            InstallationProxyClient::connect(&provider),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        let mut options = plist::Dictionary::new();
+        options.insert(
+            "ApplicationType".into(),
+            plist::Value::String("User".into()),
+        );
+        let values = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.browse(Some(plist::Value::Dictionary(options))),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        Ok(values
+            .into_iter()
+            .filter_map(|value| {
+                let info = value.as_dictionary()?;
+                let bundle_id = info.get("CFBundleIdentifier")?.as_string()?.to_owned();
+                let display_name = info
+                    .get("CFBundleDisplayName")
+                    .or_else(|| info.get("CFBundleName"))
+                    .and_then(|v| v.as_string())
+                    .unwrap_or(&bundle_id)
+                    .to_owned();
+                let version = info
+                    .get("CFBundleShortVersionString")
+                    .or_else(|| info.get("CFBundleVersion"))
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("—")
+                    .to_owned();
+                Some(InstalledAppSummary {
+                    display_name,
+                    bundle_id,
+                    version,
+                })
+            })
+            .collect())
+    }
+}
+
+impl NetmuxTransport {
+    async fn reachable_network_devices(
+        &self,
+    ) -> Result<Vec<(String, IpAddr, DeviceSummary)>, TransportError> {
+        let mut reachable = self
+            .reachable_candidates(self.netmux_network_devices().await.unwrap_or_default())
+            .await;
+        if reachable.is_empty() {
+            let bonjour_candidates = self.bonjour_candidates().await?;
+            reachable = self.reachable_candidates(bonjour_candidates).await;
+        }
+        if reachable.is_empty() {
+            Err(TransportError::Unavailable)
+        } else {
+            Ok(reachable)
+        }
+    }
+
+    async fn reachable_candidates(
+        &self,
+        candidates: Vec<(String, IpAddr)>,
+    ) -> Vec<(String, IpAddr, DeviceSummary)> {
+        let mut reachable = Vec::new();
+        let mut attempted = HashSet::new();
+        let mut identified_udids = HashSet::new();
+        for (udid, address) in candidates {
+            if identified_udids.contains(&udid) || !attempted.insert((udid.clone(), address)) {
+                continue;
+            }
+            match self.describe_device(&udid, address).await {
+                Ok(summary) => {
+                    identified_udids.insert(udid.clone());
+                    reachable.push((udid, address, summary));
+                }
+                Err(_) => {
+                    tracing::debug!(device_id = %device_id_for_udid(&udid), "skipping unreachable or untrusted network device")
+                }
+            }
+        }
+        reachable
+    }
+
+    async fn netmux_network_devices(&self) -> Result<Vec<(String, IpAddr)>, TransportError> {
+        #[cfg(not(unix))]
+        {
+            let _ = &self.mux_socket;
+            Err(TransportError::Unavailable)
+        }
+        #[cfg(unix)]
+        {
+            use idevice::usbmuxd::{Connection, UsbmuxdAddr};
+
+            let address = UsbmuxdAddr::UnixSocket(self.mux_socket.clone());
+            let mut connection = tokio::time::timeout(Duration::from_secs(3), address.connect(0))
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
+            let devices = tokio::time::timeout(Duration::from_secs(3), connection.get_devices())
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
+            Ok(devices
+                .into_iter()
+                .filter_map(|device| match device.connection_type {
+                    Connection::Network(address) => Some((device.udid, address)),
+                    Connection::Usb | Connection::Unknown(_) => None,
+                })
+                .collect())
+        }
+    }
+
+    async fn bonjour_candidates(&self) -> Result<Vec<(String, IpAddr)>, TransportError> {
+        let addresses = tokio::task::spawn_blocking(discover_mobdev2_ipv4_addresses)
+            .await
+            .map_err(|_| TransportError::Unavailable)??;
+        let udids = pairing_record_udids(&self.pairing_path)?;
+        Ok(udids
+            .into_iter()
+            .flat_map(|udid| {
+                addresses
+                    .iter()
+                    .copied()
+                    .map(move |address| (udid.clone(), address))
+            })
+            .collect())
+    }
+
+    fn provider_for(
+        &self,
+        udid: &str,
+        address: IpAddr,
+    ) -> Result<idevice::provider::TcpProvider, TransportError> {
+        use idevice::pairing_file::PairingFile;
+
+        let pairing_path = pairing_record_path(&self.pairing_path, udid);
+        let pairing_file =
+            PairingFile::read_from_file(pairing_path).map_err(|_| TransportError::Unavailable)?;
+        Ok(idevice::provider::TcpProvider {
+            addr: address,
             scope_id: None,
             pairing_file,
             label: "iPhoneLoadly".into(),
-        };
-        signing
-            .install_ipa(&provider, ipa_path)
+        })
+    }
+
+    async fn describe_device(
+        &self,
+        udid: &str,
+        address: IpAddr,
+    ) -> Result<DeviceSummary, TransportError> {
+        use idevice::IdeviceService;
+        use idevice::services::lockdown::LockdownClient;
+
+        let provider = self.provider_for(udid, address)?;
+        let pairing_file = provider.pairing_file.clone();
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(5), LockdownClient::connect(&provider))
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
+        tokio::time::timeout(Duration::from_secs(5), client.start_session(&pairing_file))
             .await
-            .map_err(|_| TransportError::InstallFailed)
+            .map_err(|_| TransportError::Unavailable)?
+            .map_err(|_| TransportError::Unavailable)?;
+        let device_name = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_value(Some("DeviceName"), None),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        let product_type = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_value(Some("ProductType"), None),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        let ios_version = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_value(Some("ProductVersion"), None),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        Ok(DeviceSummary {
+            id: device_id_for_udid(udid),
+            display_name: device_name.as_string().unwrap_or("iPhone").to_owned(),
+            product_type: product_type.as_string().unwrap_or("unknown").to_owned(),
+            ios_version: ios_version.as_string().unwrap_or("unknown").to_owned(),
+            connection_type: ConnectionType::Network,
+            status: DeviceStatus::Online,
+            install_eligible: true,
+        })
+    }
+}
+
+fn pairing_record_path(pairing_dir: &StdPath, udid: &str) -> PathBuf {
+    pairing_dir.join(format!("{udid}.plist"))
+}
+
+fn pairing_record_udids(pairing_dir: &StdPath) -> Result<Vec<String>, TransportError> {
+    let entries = std::fs::read_dir(pairing_dir).map_err(|_| TransportError::Unavailable)?;
+    Ok(entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".plist").map(str::to_owned))
+        .filter(|udid| udid != "SystemConfiguration")
+        .collect())
+}
+
+fn discover_mobdev2_ipv4_addresses() -> Result<Vec<IpAddr>, TransportError> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+    let daemon = ServiceDaemon::new().map_err(|_| TransportError::Unavailable)?;
+    let receiver = daemon
+        .browse("_apple-mobdev2._tcp.local.")
+        .map_err(|_| TransportError::Unavailable)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut addresses = HashSet::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Ok(event) = receiver.recv_timeout(remaining) else {
+            break;
+        };
+        if let ServiceEvent::ServiceResolved(service) = event {
+            addresses.extend(
+                service
+                    .get_addresses()
+                    .iter()
+                    .filter(|address| address.is_ipv4())
+                    .map(|address| address.to_ip_addr()),
+            );
+        }
+    }
+    drop(receiver);
+    let _ = daemon.stop_browse("_apple-mobdev2._tcp.local.");
+    let _ = daemon.shutdown();
+    if addresses.is_empty() {
+        Err(TransportError::Unavailable)
+    } else {
+        Ok(addresses.into_iter().collect())
+    }
+}
+
+/// The browser and SQLite use an internal UUID. Apple UDIDs remain private and
+/// are only used in memory to resolve the currently announced network device.
+fn device_id_for_udid(udid: &str) -> Uuid {
+    let digest = Sha256::digest(udid.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartAppleLoginRequest, device_id_for_udid, managed_app};
+    use crate::store::ManagedAppIdentity;
+
+    #[test]
+    fn device_id_is_stable_for_non_uuid_apple_udids() {
+        let first = device_id_for_udid("00008110-001A2B3C00000000");
+        assert_eq!(first, device_id_for_udid("00008110-001A2B3C00000000"));
+        assert_ne!(first, device_id_for_udid("00008110-001A2B3C00000001"));
+    }
+
+    #[test]
+    fn login_request_reads_browser_save_credentials_field() {
+        let request: StartAppleLoginRequest = serde_json::from_str(
+            r#"{"email":"person@example.test","password":"secret","saveCredentials":true}"#,
+        )
+        .expect("deserialize browser login request");
+        assert!(request.save_credentials);
+    }
+
+    #[test]
+    fn managed_apps_require_service_install_history() {
+        let identities = vec![
+            ManagedAppIdentity {
+                installed_bundle_id: Some("com.example.current.TEAM123".into()),
+                source_bundle_id: Some("com.example.current".into()),
+            },
+            ManagedAppIdentity {
+                installed_bundle_id: None,
+                source_bundle_id: Some("com.example.legacy".into()),
+            },
+        ];
+
+        assert!(managed_app("com.example.current.TEAM123", &identities));
+        assert!(!managed_app("com.example.current.OTHERTEAM", &identities));
+        assert!(managed_app("com.example.legacy.OLDTEAM", &identities));
+        assert!(!managed_app(
+            "com.example.legacymalicious.OLDTEAM",
+            &identities
+        ));
+        assert!(!managed_app("com.apple.Pages", &identities));
     }
 }
 
@@ -215,12 +486,14 @@ impl DeviceTransport for DirectTcpTransport {
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
+    version: &'static str,
     signing: SigningReadiness,
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
         signing: state.signing.readiness().await,
     })
 }
@@ -250,9 +523,29 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartAppleLoginRequest {
     email: String,
     password: String,
+    #[serde(default)]
+    save_credentials: bool,
+}
+
+#[derive(Serialize)]
+struct CertificateRecoveryResponse {
+    message: &'static str,
+}
+
+async fn request_certificate_recovery(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<CertificateRecoveryResponse>) {
+    state.signing.request_certificate_recovery();
+    (
+        StatusCode::ACCEPTED,
+        Json(CertificateRecoveryResponse {
+            message: "Certificate recovery is armed for one new Apple sign-in. Sign in again; if Apple reports a certificate limit, iPhoneLoadly will revoke one older development certificate and continue.",
+        }),
+    )
 }
 
 async fn start_apple_login(
@@ -266,13 +559,64 @@ async fn start_apple_login(
         )
             .into_response();
     }
+    if request.save_credentials
+        && state
+            .signing
+            .save_credentials(&request.email, &request.password)
+            .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to save encrypted credentials."})),
+        )
+            .into_response();
+    }
     match state.signing.begin_login(request.email, request.password).await {
-        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Ok(status) => {
+            if request.save_credentials {
+                state.signing.set_saved_login_id(status.id).await;
+            }
+            (StatusCode::ACCEPTED, Json(status)).into_response()
+        }
         Err(signing::SigningError::MissingAnisetteUrl) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"message":"Configure IPHONELOADLY_ANISETTE_URL with a trusted anisette service before signing in."})),
         ).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to start Apple sign-in."}))).into_response(),
+    }
+}
+
+async fn saved_apple_login(State(state): State<AppState>) -> impl IntoResponse {
+    match state.signing.saved_login_status().await {
+        Ok(Some(status)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"saved":true,"login":status})),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"saved":state.signing.has_saved_credentials()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to read saved sign-in state."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_saved_apple_login(State(state): State<AppState>) -> impl IntoResponse {
+    match state.signing.delete_saved_credentials() {
+        Ok(()) => {
+            state.signing.clear_saved_login_id().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to remove saved credentials."})),
+        )
+            .into_response(),
     }
 }
 
@@ -314,11 +658,58 @@ async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "message": "Wi-Fi device transport is not configured yet."
+                "message": "Wi-Fi device discovery is unavailable. Check netmuxd and the dedicated mux socket."
             })),
         )
             .into_response(),
     }
+}
+
+async fn rescan_devices(State(state): State<AppState>) -> impl IntoResponse {
+    list_devices(State(state)).await
+}
+
+async fn list_device_apps(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let identities = match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::managed_app_identities(&database, id).map_err(|_| ()))
+    {
+        Ok(identities) => identities,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message":"Unable to read managed app history."})),
+            )
+                .into_response();
+        }
+    };
+    match state.devices.list_installed_apps(id).await {
+        Ok(mut apps) => {
+            apps.retain(|app| managed_app(&app.bundle_id, &identities));
+            apps.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+            (StatusCode::OK, Json(apps)).into_response()
+        }
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"The selected trusted iPhone is not reachable over Wi-Fi."}))).into_response(),
+    }
+}
+
+fn managed_app(bundle_id: &str, identities: &[store::ManagedAppIdentity]) -> bool {
+    identities.iter().any(|identity| {
+        if let Some(installed_bundle_id) = &identity.installed_bundle_id {
+            return installed_bundle_id == bundle_id;
+        }
+        identity.source_bundle_id.as_ref().is_some_and(|source| {
+            bundle_id == source
+                || bundle_id
+                    .strip_prefix(source)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -343,23 +734,30 @@ async fn create_install_job(
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}),
+                serde_json::json!({"message":"Wi-Fi device discovery is unavailable. Check netmuxd and try again."}),
             ),
         )
             .into_response(),
     };
-    if !devices.iter().any(|device| device.id == request.device_id) {
+    let Some(device) = devices.iter().find(|device| device.id == request.device_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"message":"The requested iPhone was not found on the trusted Wi-Fi transport."})),
         ).into_response();
-    }
+    };
 
     let id = Uuid::now_v7();
     let ipa_path = state.database.lock().map_err(|_| ()).and_then(|database| {
         let path = store::app_path(&database, request.app_id).map_err(|_| ())?;
         let path = path.ok_or(())?;
-        store::insert_job(&database, id, request.app_id, request.device_id).map_err(|_| ())?;
+        store::insert_job(
+            &database,
+            id,
+            request.app_id,
+            request.device_id,
+            &device.display_name,
+        )
+        .map_err(|_| ())?;
         Ok::<_, ()>(PathBuf::from(path))
     });
     let Ok(ipa_path) = ipa_path else {
@@ -369,7 +767,12 @@ async fn create_install_job(
         )
             .into_response();
     };
-    tokio::spawn(run_install_job(state.clone(), id, ipa_path));
+    tokio::spawn(run_install_job(
+        state.clone(),
+        id,
+        request.device_id,
+        ipa_path,
+    ));
     let job = jobs::InstallJob {
         id,
         phase: jobs::JobPhase::Queued,
@@ -397,7 +800,7 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::json!({"message":"The configured iPhone is not reachable over Wi-Fi."}),
+                serde_json::json!({"message":"Wi-Fi device discovery is unavailable. Check netmuxd and try again."}),
             ),
         )
             .into_response(),
@@ -427,38 +830,83 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
             if store::active_job_exists(&database, app_id, device_id).map_err(|_| ())? {
                 return Ok(false);
             }
-            store::insert_job(&database, id, app_id, device_id).map_err(|_| ())?;
+            let device_label = devices
+                .iter()
+                .find(|device| device.id == device_id)
+                .map(|device| device.display_name.as_str())
+                .unwrap_or("Trusted iPhone");
+            store::insert_job(&database, id, app_id, device_id, device_label).map_err(|_| ())?;
             Ok(true)
         });
         if matches!(inserted, Ok(true)) {
             queued += 1;
-            tokio::spawn(run_install_job(state.clone(), id, PathBuf::from(ipa_path)));
+            tokio::spawn(run_install_job(
+                state.clone(),
+                id,
+                device_id,
+                PathBuf::from(ipa_path),
+            ));
         }
     }
     (StatusCode::ACCEPTED, Json(RefreshResponse { queued })).into_response()
 }
 
-async fn run_install_job(state: AppState, id: Uuid, ipa_path: PathBuf) {
-    set_job_phase(&state.database, id, "connecting");
-    set_job_phase(&state.database, id, "installing");
-    let result = state.devices.install_ipa(&state.signing, ipa_path).await;
-    if result.is_err() {
-        tracing::warn!(job_id = %id, "IPA installation failed");
+async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: PathBuf) {
+    set_job_status(&state.database, id, "connecting", Some(0));
+    set_job_status(&state.database, id, "signing", Some(1));
+    let progress_database = state.database.clone();
+    let result = state
+        .devices
+        .install_ipa(
+            &state.signing,
+            device_id,
+            ipa_path,
+            Box::new(move |progress| {
+                let phase = if progress >= 40 {
+                    "transferring"
+                } else {
+                    "signing"
+                };
+                set_job_status(&progress_database, id, phase, Some(progress));
+            }),
+        )
+        .await;
+    match result {
+        Ok(bundle_id) => {
+            if let Ok(connection) = state.database.lock() {
+                let _ = store::set_job_installed_bundle_id(&connection, id, &bundle_id);
+            }
+            set_job_status(&state.database, id, "succeeded", Some(100));
+        }
+        Err(error) => {
+            tracing::warn!(job_id = %id, error = %error, "IPA installation failed");
+            set_job_failure(
+                &state.database,
+                id,
+                match error {
+                    TransportError::Unavailable => "iphone_unavailable",
+                    TransportError::InstallFailed => "installation_failed",
+                },
+            );
+            set_job_status(&state.database, id, "failed", None);
+        }
     }
-    set_job_phase(
-        &state.database,
-        id,
-        if result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        },
-    );
 }
 
-fn set_job_phase(database: &Arc<Mutex<rusqlite::Connection>>, id: Uuid, phase: &str) {
+fn set_job_status(
+    database: &Arc<Mutex<rusqlite::Connection>>,
+    id: Uuid,
+    phase: &str,
+    progress_percent: Option<u8>,
+) {
     if let Ok(connection) = database.lock() {
-        let _ = store::update_job_phase(&connection, id, phase);
+        let _ = store::update_job_status(&connection, id, phase, progress_percent);
+    }
+}
+
+fn set_job_failure(database: &Arc<Mutex<rusqlite::Connection>>, id: Uuid, failure_code: &str) {
+    if let Ok(connection) = database.lock() {
+        let _ = store::set_job_failure(&connection, id, failure_code);
     }
 }
 
@@ -466,7 +914,9 @@ fn job_message(phase: &str) -> &'static str {
     match phase {
         "queued" => "Installation job is queued.",
         "connecting" => "Connecting to the trusted iPhone over Wi-Fi.",
-        "installing" => "Signing and installing the IPA.",
+        "signing" => "Signing the IPA.",
+        "transferring" => "Transferring and installing the IPA on the iPhone.",
+        "installing" => "Transferring and installing the IPA on the iPhone.",
         "succeeded" => "IPA was signed and installed.",
         "failed" => "Installation failed. Check the server logs for redacted diagnostics.",
         _ => "Installation job status is unavailable.",
@@ -487,6 +937,8 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
                 "appId": job.app_id,
                 "deviceId": job.device_id,
                 "phase": job.phase,
+                "progressPercent": job.progress_percent,
+                "failureCode": job.failure_code,
                 "publicMessage": job_message(&job.phase)
             })),
         )
@@ -499,6 +951,115 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"message":"Unable to read installation job."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_install_jobs(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::list_recent_jobs(&database, 20).map_err(|_| ()))
+    {
+        Ok(jobs) => Json(serde_json::json!(
+            jobs.into_iter()
+                .map(|job| serde_json::json!({
+                    "id": job.id,
+                    "appId": job.app_id,
+                    "deviceLabel": job.device_label,
+                    "phase": job.phase,
+                    "progressPercent": job.progress_percent,
+                    "createdAt": job.created_at,
+                    "completedAt": job.completed_at,
+                    "failureCode": job.failure_code,
+                    "publicMessage": job_message(&job.phase)
+                }))
+                .collect::<Vec<_>>()
+        )),
+        Err(_) => Json(serde_json::json!({"message":"Unable to read installation history."})),
+    }
+}
+
+async fn refresh_attention(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::refresh_attention(&database).map_err(|_| ()))
+    {
+        Ok(items) => Json(serde_json::json!(
+            items
+                .into_iter()
+                .map(|item| serde_json::json!({
+                    "appId": item.app_id,
+                    "deviceLabel": item.device_label,
+                    "ageHours": item.age_hours,
+                    "retryFailed": item.retry_failed,
+                }))
+                .collect::<Vec<_>>()
+        )),
+        Err(_) => Json(serde_json::json!({"message":"Unable to read refresh warnings."})),
+    }
+}
+
+async fn installation_validity(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::installation_validity(&database).map_err(|_| ()))
+    {
+        Ok(items) => Json(serde_json::json!(
+            items
+                .into_iter()
+                .map(|item| serde_json::json!({
+                    "appId": item.app_id,
+                    "deviceLabel": item.device_label,
+                    "remainingDays": item.remaining_days,
+                    "completedAt": item.completed_at,
+                }))
+                .collect::<Vec<_>>()
+        )),
+        Err(_) => Json(serde_json::json!({"message":"Unable to read IPA validity."})),
+    }
+}
+
+async fn delete_ipa(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let deletion = state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::mark_app_deleted(&database, id).map_err(|_| ()));
+    match deletion {
+        Ok(store::AppDeletion::Ready { storage_path }) => {
+            if tokio::fs::remove_file(&storage_path).await.is_ok() {
+                (StatusCode::NO_CONTENT, ()).into_response()
+            } else {
+                if let Ok(database) = state.database.lock() {
+                    let _ = store::restore_app(&database, id);
+                }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message":"Unable to remove the IPA file from server storage."})),
+                )
+                    .into_response()
+            }
+        }
+        Ok(store::AppDeletion::ActiveJob) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"message":"This IPA cannot be removed while an installation or refresh job is active."})),
+        )
+            .into_response(),
+        Ok(store::AppDeletion::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Uploaded IPA was not found."})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to remove the IPA."})),
         )
             .into_response(),
     }
@@ -581,6 +1142,7 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
                     &metadata.sha256,
                     &final_path.to_string_lossy(),
                     metadata.size_bytes,
+                    &metadata.bundle_id,
                 )
                 .map_err(|_| ())
             });
@@ -616,71 +1178,72 @@ async fn main() {
         .with_target(false)
         .init();
 
-    let database_path = PathBuf::from("data/iphoneloadly.db");
+    let data_dir = PathBuf::from("data");
+    let database_path = data_dir.join("iphoneloadly.db");
     let database = store::initialize(&database_path).expect("initialize SQLite store");
-    let devices: Arc<dyn DeviceTransport> = match (
-        std::env::var("IPHONELOADLY_DEVICE_ID"),
-        std::env::var("IPHONELOADLY_DEVICE_IP"),
-        std::env::var("IPHONELOADLY_PAIRING_FILE"),
-    ) {
-        (Ok(id), Ok(address), Ok(pairing_path)) => {
-            match (Uuid::parse_str(&id), address.parse::<IpAddr>()) {
-                (Ok(id), Ok(address)) => Arc::new(DirectTcpTransport {
-                    id,
-                    address,
-                    pairing_path: pairing_path.into(),
-                }),
-                _ => Arc::new(UnconfiguredTransport),
-            }
-        }
-        _ => match (
-            std::env::var("IPHONELOADLY_DEVICE_ID"),
-            std::env::var("IPHONELOADLY_DEVICE_NAME"),
-            std::env::var("IPHONELOADLY_DEVICE_PRODUCT"),
-            std::env::var("IPHONELOADLY_DEVICE_IOS_VERSION"),
-        ) {
-            (Ok(id), Ok(display_name), Ok(product_type), Ok(ios_version)) => {
-                match Uuid::parse_str(&id) {
-                    Ok(id) => Arc::new(ConfiguredNetworkTransport {
-                        device: DeviceSummary {
-                            id,
-                            display_name,
-                            product_type,
-                            ios_version,
-                            connection_type: ConnectionType::Network,
-                        },
-                    }),
-                    Err(_) => Arc::new(UnconfiguredTransport),
+    for (id, path) in store::apps_missing_bundle_id(&database).unwrap_or_default() {
+        match ipa::bundle_identifier(StdPath::new(&path)) {
+            Ok(bundle_id) => {
+                if let Err(error) = store::set_app_bundle_id(&database, id, &bundle_id) {
+                    tracing::warn!(app_id = %id, error = %error, "unable to migrate IPA bundle identifier");
                 }
             }
-            _ => Arc::new(UnconfiguredTransport),
-        },
-    };
+            Err(error) => {
+                tracing::warn!(app_id = %id, error = %error, "unable to inspect existing IPA during migration");
+            }
+        }
+    }
+    let mux_socket = std::env::var("IPHONELOADLY_MUX_SOCKET")
+        .unwrap_or_else(|_| "/run/iphoneloadly/mux.sock".into());
+    let pairing_dir =
+        std::env::var("IPHONELOADLY_PAIRING_DIR").unwrap_or_else(|_| "/var/lib/lockdown".into());
+    let devices: Arc<dyn DeviceTransport> = Arc::new(NetmuxTransport {
+        mux_socket,
+        pairing_path: pairing_dir.into(),
+    });
     let state = AppState {
         signing: signing::AppleSigningProvider::new(
             std::env::var("IPHONELOADLY_ANISETTE_URL").ok(),
+            data_dir.join("signing"),
         ),
         devices,
-        apps_dir: PathBuf::from("data/apps"),
+        apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
     };
     tokio::fs::create_dir_all(&state.apps_dir)
         .await
         .expect("create app storage");
+    if let Err(error) = state.signing.restore_saved_login().await {
+        tracing::warn!(error = %error, "unable to restore saved Apple sign-in");
+    }
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
         .route("/api/signing/sessions", post(start_apple_login))
+        .route(
+            "/api/signing/saved-session",
+            get(saved_apple_login).delete(delete_saved_apple_login),
+        )
+        .route(
+            "/api/signing/certificate-recovery",
+            post(request_certificate_recovery),
+        )
         .route("/api/signing/sessions/{id}", get(get_apple_login))
         .route(
             "/api/signing/sessions/{id}/two-factor",
             post(submit_apple_two_factor),
         )
         .route("/api/devices", get(list_devices))
+        .route("/api/devices/{id}/apps", get(list_device_apps))
+        .route("/api/devices/rescan", post(rescan_devices))
         .route("/api/apps", get(list_apps).post(upload_ipa))
+        .route("/api/apps/{id}", delete(delete_ipa))
         .route("/api/install-jobs", post(create_install_job))
+        .route("/api/install-jobs", get(list_install_jobs))
         .route("/api/install-jobs/{id}", get(get_install_job))
         .route("/api/refresh", post(trigger_refresh))
+        .route("/api/refresh-attention", get(refresh_attention))
+        .route("/api/installation-validity", get(installation_validity))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
         .with_state(state);
 

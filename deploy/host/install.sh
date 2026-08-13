@@ -30,6 +30,73 @@ fi
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n[%s/6] %s...\n' "$1" "$2"; }
+
+single_usb_udid() {
+  local -a devices=()
+  mapfile -t devices < <(idevice_id --list 2>/dev/null | sed '/^[[:space:]]*$/d')
+  case "${#devices[@]}" in
+    1) printf '%s\n' "${devices[0]}" ;;
+    0) fail 'No iPhone was detected over USB. Check the cable, unlock the phone, and accept Trust This Computer.' ;;
+    *) fail 'More than one iPhone is connected over USB. Disconnect every phone except the one to onboard.' ;;
+  esac
+}
+
+wait_for_usb_pairing() {
+  local device_udid="$1"
+  local deadline
+  deadline=$((SECONDS + 120))
+
+  printf 'Waiting up to 120 seconds for Trust This Computer to be accepted on the iPhone.\n'
+  while (( SECONDS < deadline )); do
+    if idevicepair -u "${device_udid}" validate >/dev/null 2>&1; then
+      printf 'SUCCESS: Validated pairing with device %s\n' "${device_udid}"
+      return 0
+    fi
+
+    # Running pair again is intentional: before trust is accepted it keeps the
+    # pairing request active; after acceptance it completes without new input.
+    idevicepair -u "${device_udid}" pair >/dev/null 2>&1 || true
+    sleep 2
+  done
+
+  fail 'Pairing was not validated within 120 seconds. Keep USB connected, unlock the iPhone, accept Trust This Computer, then run the installer again.'
+}
+
+wait_for_network_device() {
+  local expected_udid="$1"
+  local deadline network_ids network_ips network_ip remaining probe_timeout
+  deadline=$((SECONDS + 90))
+  while (( SECONDS < deadline )); do
+    network_ids="$(USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock idevice_id --network 2>/dev/null || true)"
+    if printf '%s\n' "${network_ids}" | grep -Fxq "${expected_udid}" &&
+      USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock \
+        ideviceinfo --network -u "${expected_udid}" -k DeviceName >/dev/null 2>&1; then
+      return 0
+    fi
+    # Debian's libimobiledevice may fail to enumerate the current netmuxd
+    # socket even though netmuxd has discovered the phone. Validate only
+    # Bonjour-advertised IPv4 addresses with the existing pairing record.
+    remaining=$((deadline - SECONDS))
+    probe_timeout=$((remaining < 3 ? remaining : 3))
+    (( probe_timeout > 0 )) || break
+    network_ips="$(timeout "${probe_timeout}s" avahi-browse -p -t -r _apple-mobdev2._tcp 2>/dev/null \
+      | awk -F ';' '$1 == "=" && $3 == "IPv4" { print $8 }' \
+      | sort -u || true)"
+    while IFS= read -r network_ip; do
+      [[ -n "${network_ip}" ]] || continue
+      remaining=$((deadline - SECONDS))
+      probe_timeout=$((remaining < 5 ? remaining : 5))
+      (( probe_timeout > 0 )) || break 2
+      if timeout "${probe_timeout}s" /opt/iphoneloadly-tools/pymobiledevice3/bin/python \
+        "${PACKAGE_ROOT}/scripts/verify-wifi-direct.py" \
+        --host "${network_ip}" --udid "${expected_udid}" >/dev/null 2>&1; then
+        return 0
+      fi
+    done <<< "${network_ips}"
+    sleep 2
+  done
+  return 1
+}
 if [[ "${1:-}" == "--check-package-layout" ]]; then
   for required in \
     "${PACKAGE_ROOT}/bin/iphoneloadly-api" \
@@ -71,21 +138,22 @@ curl --fail --silent --max-time 5 http://127.0.0.1:6970/ >/dev/null || fail 'Loc
 printf 'OK\n'
 
 step 4 'Pairing and Wi-Fi setup'
-printf 'Connect and unlock the iPhone, accept Trust This Computer, then press Enter. '
+printf 'Connect and unlock exactly one iPhone, accept Trust This Computer, then press Enter. '
 read -r
-idevicepair pair
-idevicepair validate
-iphoneloadly-pymobiledevice3 lockdown wifi-connections on
-printf 'Disconnect USB. Enter the iPhone UDID and current Wi-Fi IP without printing pairing data.\n'
-read -r -p 'UDID: ' device_id
-read -r -p 'iPhone IP: ' device_ip
-[[ "$device_id" =~ ^[0-9A-Fa-f-]+$ && -n "$device_ip" ]] || fail 'A UDID and iPhone IP are required.'
-pairing_file="/var/lib/lockdown/${device_id}.plist"
-[[ -r "$pairing_file" ]] || fail 'Pairing record was not found at the expected path.'
+device_udid="$(single_usb_udid)"
+wait_for_usb_pairing "${device_udid}"
+ideviceinfo -u "${device_udid}" -k DeviceName >/dev/null
+iphoneloadly-pymobiledevice3 lockdown wifi-connections --state on
+systemctl restart iphoneloadly-netmuxd.service
+printf 'Disconnect USB. iPhoneLoadly now verifies this phone over Wi-Fi; no UDID or IP address is required.\n'
+read -r -p 'Press Enter after disconnecting USB. '
+wait_for_network_device "${device_udid}" \
+  || fail 'The trusted iPhone did not become reachable over Wi-Fi within 90 seconds. Keep USB disconnected and run iphoneloadly-doctor and preflight-wifi.sh.'
+printf 'OK: trusted iPhone is reachable over Wi-Fi.\n'
 
 step 5 'Installing iPhoneLoadly'
-bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}" --device-id "$device_id" --device-ip "$device_ip" --pairing-file "$pairing_file"
+bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}"
 
 step 6 'Checking installation'
 iphoneloadly-doctor || true
-printf '\niPhoneLoadly installation complete ✓\n\nNext:\n1. Open an SSH tunnel: ssh -N -L 8080:127.0.0.1:8080 USER@SERVER\n2. Open http://127.0.0.1:8080/ in your browser.\n3. Sign in with your Apple ID and upload an IPA.\n\nDocumentation: https://github.com/lemehavit/iPhoneLoadly/blob/main/docs/INSTALL.md\n'
+printf '\niPhoneLoadly installation complete ✓\n\nNext:\n1. Configure authenticated Caddy using docs/operations/caddy-lan.md.\n2. Open https://iphoneloadly.local (or use an SSH tunnel as an administrator fallback).\n3. Sign in with your Apple ID and upload an IPA.\n\nDocumentation: https://github.com/lemehavit/iPhoneLoadly/blob/main/docs/INSTALL.md\n'

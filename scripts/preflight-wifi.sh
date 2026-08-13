@@ -123,15 +123,25 @@ if [[ -S "${MUX_SOCKET}" ]] && command -v idevice_id >/dev/null 2>&1; then
     fi
 fi
 
+if [[ -z "${UDID}" && -n "${NETWORK_IDS:-}" ]]; then
+    mapfile -t DISCOVERED_IDS < <(printf '%s\n' "${NETWORK_IDS}" | sed '/^[[:space:]]*$/d')
+    if [[ "${#DISCOVERED_IDS[@]}" -eq 1 ]]; then
+        UDID="${DISCOVERED_IDS[0]}"
+        pass "exactly one network device is available for a targeted lockdownd check"
+    elif [[ "${#DISCOVERED_IDS[@]}" -gt 1 ]]; then
+        warn "multiple network devices are available; use --udid only for an explicit diagnostic"
+    fi
+fi
+
 if [[ -n "${UDID}" ]]; then
     if USBMUXD_SOCKET_ADDRESS="${MUX_SOCKET}" \
         timeout 15 ideviceinfo --network -u "${UDID}" -k DeviceName >/dev/null 2>&1; then
-        pass "lockdownd query succeeded over the network for the supplied UDID"
+        pass "lockdownd query succeeded over the network for the selected device"
     else
-        fail "lockdownd query failed over the network for the supplied UDID"
+        fail "lockdownd query failed over the network for the selected device"
     fi
 else
-    warn "no --udid supplied; the targeted lockdownd query was skipped"
+    warn "no single network device was available; the targeted lockdownd query was skipped"
 fi
 
 printf '\nSummary: %d pass, %d warning, %d failure\n' \

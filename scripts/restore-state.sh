@@ -33,7 +33,7 @@ anisette_archive="${backup_dir}/anisette-libs.tar.gz"
   cd "${backup_dir}"
   sha256sum -c SHA256SUMS
 )
-tar -tzf "${system_archive}" | grep -qx 'var/lib/iphoneloadly/' \
+tar -tzf "${system_archive}" | grep -qE '^var/lib/iphoneloadly(/|$)' \
   || { echo "System archive does not contain iPhoneLoadly state." >&2; exit 1; }
 tar -tzf "${anisette_archive}" >/dev/null
 printf 'Backup verification succeeded: %s\n' "${backup_dir}"
