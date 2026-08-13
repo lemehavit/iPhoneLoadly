@@ -370,13 +370,22 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 
 #[cfg(test)]
 mod tests {
-    use super::device_id_for_udid;
+    use super::{StartAppleLoginRequest, device_id_for_udid};
 
     #[test]
     fn device_id_is_stable_for_non_uuid_apple_udids() {
         let first = device_id_for_udid("00008110-001A2B3C00000000");
         assert_eq!(first, device_id_for_udid("00008110-001A2B3C00000000"));
         assert_ne!(first, device_id_for_udid("00008110-001A2B3C00000001"));
+    }
+
+    #[test]
+    fn login_request_reads_browser_save_credentials_field() {
+        let request: StartAppleLoginRequest = serde_json::from_str(
+            r#"{"email":"person@example.test","password":"secret","saveCredentials":true}"#,
+        )
+        .expect("deserialize browser login request");
+        assert!(request.save_credentials);
     }
 }
 
@@ -419,6 +428,7 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartAppleLoginRequest {
     email: String,
     password: String,
