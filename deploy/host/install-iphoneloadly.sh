@@ -82,7 +82,7 @@ IPHONELOADLY_MUX_SOCKET=/run/iphoneloadly/mux.sock
 IPHONELOADLY_PAIRING_DIR=/var/lib/lockdown
 EOF
 
-sudo install -d -o root -g root -m 0755 /opt/iphoneloadly/bin /var/lib/iphoneloadly /etc/iphoneloadly /usr/share/iphoneloadly
+sudo install -d -o root -g root -m 0755 /opt/iphoneloadly/bin /var/lib/iphoneloadly /etc/iphoneloadly /usr/share/iphoneloadly /usr/share/iphoneloadly/scripts
 sudo install -o root -g root -m 0755 "${api_binary}" /opt/iphoneloadly/bin/iphoneloadly-api
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-api.service" /etc/systemd/system/iphoneloadly-api.service
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.service" /etc/systemd/system/iphoneloadly-refresh.service
