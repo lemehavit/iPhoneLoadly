@@ -69,4 +69,8 @@ cat >"${output}" <<EOF
 </plist>
 EOF
 
+# The profile contains only a public CA certificate. Make it convenient to copy
+# from the server without granting access to Caddy's certificate directory.
+chmod 0644 "${output}"
+
 printf 'Created iOS profile containing only the public Caddy root certificate: %s\n' "${output}"
