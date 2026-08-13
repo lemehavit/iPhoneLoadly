@@ -41,6 +41,27 @@ single_usb_udid() {
   esac
 }
 
+wait_for_usb_pairing() {
+  local device_udid="$1"
+  local deadline
+  deadline=$((SECONDS + 120))
+
+  printf 'Waiting up to 120 seconds for Trust This Computer to be accepted on the iPhone.\n'
+  while (( SECONDS < deadline )); do
+    if idevicepair -u "${device_udid}" validate >/dev/null 2>&1; then
+      printf 'SUCCESS: Validated pairing with device %s\n' "${device_udid}"
+      return 0
+    fi
+
+    # Running pair again is intentional: before trust is accepted it keeps the
+    # pairing request active; after acceptance it completes without new input.
+    idevicepair -u "${device_udid}" pair >/dev/null 2>&1 || true
+    sleep 2
+  done
+
+  fail 'Pairing was not validated within 120 seconds. Keep USB connected, unlock the iPhone, accept Trust This Computer, then run the installer again.'
+}
+
 wait_for_network_device() {
   local expected_udid="$1"
   local deadline network_ids network_ips network_ip remaining probe_timeout
@@ -120,8 +141,7 @@ step 4 'Pairing and Wi-Fi setup'
 printf 'Connect and unlock exactly one iPhone, accept Trust This Computer, then press Enter. '
 read -r
 device_udid="$(single_usb_udid)"
-idevicepair -u "${device_udid}" pair
-idevicepair -u "${device_udid}" validate
+wait_for_usb_pairing "${device_udid}"
 ideviceinfo -u "${device_udid}" -k DeviceName >/dev/null
 iphoneloadly-pymobiledevice3 lockdown wifi-connections --state on
 systemctl restart iphoneloadly-netmuxd.service
