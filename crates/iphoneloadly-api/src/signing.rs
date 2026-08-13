@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use idevice::provider::TcpProvider;
 use isideload::{
@@ -121,6 +128,7 @@ pub struct AppleSigningProvider {
     anisette_url: Option<String>,
     sideloader: Mutex<Option<Sideloader>>,
     attempts: Mutex<HashMap<Uuid, Arc<LoginAttempt>>>,
+    certificate_recovery_requested: AtomicBool,
 }
 
 #[derive(Debug, Error)]
@@ -145,6 +153,7 @@ impl AppleSigningProvider {
             anisette_url: anisette_url.filter(|url| !url.trim().is_empty()),
             sideloader: Mutex::new(None),
             attempts: Mutex::new(HashMap::new()),
+            certificate_recovery_requested: AtomicBool::new(false),
         })
     }
 
@@ -156,6 +165,14 @@ impl AppleSigningProvider {
         self.anisette_url.is_some()
     }
 
+    /// Arms one subsequent interactive login to revoke an older development
+    /// certificate only if Apple rejects a new certificate for hitting its
+    /// certificate limit. This never makes an Apple request by itself.
+    pub fn request_certificate_recovery(&self) {
+        self.certificate_recovery_requested
+            .store(true, Ordering::Release);
+    }
+
     pub async fn begin_login(
         self: &Arc<Self>,
         email: String,
@@ -165,6 +182,9 @@ impl AppleSigningProvider {
             .anisette_url
             .clone()
             .ok_or(SigningError::MissingAnisetteUrl)?;
+        let revoke_old_certificate = self
+            .certificate_recovery_requested
+            .swap(false, Ordering::AcqRel);
         let id = Uuid::now_v7();
         let attempt = Arc::new(LoginAttempt::new(id));
         self.attempts.lock().await.insert(id, attempt.clone());
@@ -225,7 +245,11 @@ impl AppleSigningProvider {
             let sideloader = SideloaderBuilder::new(developer_session, email)
                 .machine_name("iPhoneLoadly".into())
                 .storage(Box::new(InMemoryStorage::new()))
-                .max_certs_behavior(MaxCertsBehavior::Error)
+                .max_certs_behavior(if revoke_old_certificate {
+                    MaxCertsBehavior::Revoke
+                } else {
+                    MaxCertsBehavior::Error
+                })
                 .build();
             *provider.sideloader.lock().await = Some(sideloader);
             background_attempt.ready().await;

@@ -422,6 +422,23 @@ struct StartAppleLoginRequest {
     password: String,
 }
 
+#[derive(Serialize)]
+struct CertificateRecoveryResponse {
+    message: &'static str,
+}
+
+async fn request_certificate_recovery(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<CertificateRecoveryResponse>) {
+    state.signing.request_certificate_recovery();
+    (
+        StatusCode::ACCEPTED,
+        Json(CertificateRecoveryResponse {
+            message: "Certificate recovery is armed for one new Apple sign-in. Sign in again; if Apple reports a certificate limit, iPhoneLoadly will revoke one older development certificate and continue.",
+        }),
+    )
+}
+
 async fn start_apple_login(
     State(state): State<AppState>,
     Json(request): Json<StartAppleLoginRequest>,
@@ -825,6 +842,10 @@ async fn main() {
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
         .route("/api/signing/sessions", post(start_apple_login))
+        .route(
+            "/api/signing/certificate-recovery",
+            post(request_certificate_recovery),
+        )
         .route("/api/signing/sessions/{id}", get(get_apple_login))
         .route(
             "/api/signing/sessions/{id}/two-factor",

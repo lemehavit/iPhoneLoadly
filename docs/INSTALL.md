@@ -143,6 +143,15 @@ Enter the password and 2FA response only in the local dashboard. A delayed or
 failed 2FA interaction can time out; start a new sign-in. Any API restart ends
 the memory-only signing session.
 
+### Apple reports that the development-certificate limit is reached
+
+For a free Apple developer account, select **Frigör gammalt
+utvecklingscertifikat** in the dashboard, confirm the warning, and then sign in
+again. The next signing session revokes one older development certificate only
+if Apple rejects new-certificate creation for reaching the limit. Revoking a
+certificate can invalidate apps signed with it; do not use this action if an
+existing certificate supports an app you need to keep running.
+
 ### An app does not install
 
 Check the job in the dashboard, then inspect redacted service logs:
