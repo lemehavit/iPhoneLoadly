@@ -46,6 +46,14 @@ struct DeviceSummary {
     install_eligible: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledAppSummary {
+    display_name: String,
+    bundle_id: String,
+    version: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ConnectionType {
@@ -76,6 +84,10 @@ struct SigningReadiness {
 #[async_trait]
 trait DeviceTransport: Send + Sync {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError>;
+    async fn list_installed_apps(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Vec<InstalledAppSummary>, TransportError>;
     async fn install_ipa(
         &self,
         signing: &signing::AppleSigningProvider,
@@ -152,6 +164,63 @@ impl DeviceTransport for NetmuxTransport {
             .install_ipa(&provider, ipa_path, progress)
             .await
             .map_err(|_| TransportError::InstallFailed)
+    }
+
+    async fn list_installed_apps(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Vec<InstalledAppSummary>, TransportError> {
+        use idevice::{IdeviceService, services::installation_proxy::InstallationProxyClient};
+        let (udid, address, _) = self
+            .reachable_network_devices()
+            .await?
+            .into_iter()
+            .find(|(udid, _, _)| device_id_for_udid(udid) == device_id)
+            .ok_or(TransportError::Unavailable)?;
+        let provider = self.provider_for(&udid, address)?;
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(10),
+            InstallationProxyClient::connect(&provider),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        let mut options = plist::Dictionary::new();
+        options.insert(
+            "ApplicationType".into(),
+            plist::Value::String("User".into()),
+        );
+        let values = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.browse(Some(plist::Value::Dictionary(options))),
+        )
+        .await
+        .map_err(|_| TransportError::Unavailable)?
+        .map_err(|_| TransportError::Unavailable)?;
+        Ok(values
+            .into_iter()
+            .filter_map(|value| {
+                let info = value.as_dictionary()?;
+                let bundle_id = info.get("CFBundleIdentifier")?.as_string()?.to_owned();
+                let display_name = info
+                    .get("CFBundleDisplayName")
+                    .or_else(|| info.get("CFBundleName"))
+                    .and_then(|v| v.as_string())
+                    .unwrap_or(&bundle_id)
+                    .to_owned();
+                let version = info
+                    .get("CFBundleShortVersionString")
+                    .or_else(|| info.get("CFBundleVersion"))
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("—")
+                    .to_owned();
+                Some(InstalledAppSummary {
+                    display_name,
+                    bundle_id,
+                    version,
+                })
+            })
+            .collect())
     }
 }
 
@@ -572,6 +641,19 @@ async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn rescan_devices(State(state): State<AppState>) -> impl IntoResponse {
     list_devices(State(state)).await
+}
+
+async fn list_device_apps(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state.devices.list_installed_apps(id).await {
+        Ok(mut apps) => {
+            apps.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+            (StatusCode::OK, Json(apps)).into_response()
+        }
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"The selected trusted iPhone is not reachable over Wi-Fi."}))).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1084,6 +1166,7 @@ async fn main() {
             post(submit_apple_two_factor),
         )
         .route("/api/devices", get(list_devices))
+        .route("/api/devices/{id}/apps", get(list_device_apps))
         .route("/api/devices/rescan", post(rescan_devices))
         .route("/api/apps", get(list_apps).post(upload_ipa))
         .route("/api/apps/{id}", delete(delete_ipa))
