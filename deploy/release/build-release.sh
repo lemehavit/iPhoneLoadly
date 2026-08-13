@@ -18,6 +18,11 @@ rm -rf -- "${release_dir}"
 mkdir -p "${release_dir}/bin" "${release_dir}/deploy/host" "${release_dir}/deploy/systemd" "${release_dir}/deploy/caddy" "${release_dir}/scripts" "${release_dir}/docs"
 
 install -m 0755 "${repo_root}/target/release/iphoneloadly-api" "${release_dir}/bin/iphoneloadly-api"
+install -m 0644 "${repo_root}/VERSION" "${release_dir}/VERSION"
+install -m 0644 "${repo_root}/README.md" "${release_dir}/README.md"
+install -m 0644 "${repo_root}/CHANGELOG.md" "${release_dir}/CHANGELOG.md"
+install -m 0644 "${repo_root}/SECURITY.md" "${release_dir}/SECURITY.md"
+install -m 0644 "${repo_root}/LICENSE" "${release_dir}/LICENSE"
 install -m 0755 "${repo_root}/deploy/host/install-iphoneloadly.sh" "${release_dir}/install-iphoneloadly.sh"
 install -m 0755 "${repo_root}/deploy/host/install.sh" "${release_dir}/install.sh"
 install -m 0755 "${repo_root}/deploy/host/install-debian13.sh" "${release_dir}/deploy/host/install-debian13.sh"
@@ -29,7 +34,7 @@ install -m 0755 "${repo_root}/scripts/backup-state.sh" "${release_dir}/scripts/b
 install -m 0755 "${repo_root}/scripts/restore-state.sh" "${release_dir}/scripts/restore-state.sh"
 install -m 0755 "${repo_root}/scripts/preflight-wifi.sh" "${release_dir}/scripts/preflight-wifi.sh"
 install -m 0755 "${repo_root}/scripts/iphoneloadly-doctor.sh" "${release_dir}/scripts/iphoneloadly-doctor.sh"
-install -m 0644 "${repo_root}/docs/INSTALL.md" "${release_dir}/docs/INSTALL.md"
+cp -a "${repo_root}/docs/." "${release_dir}/docs/"
 install -m 0644 "${repo_root}/deploy/host/THIRD_PARTY_NOTICES.md" "${release_dir}/THIRD_PARTY_NOTICES.md"
 
 (cd "${dist_root}" && tar -czf "${release_name}.tar.gz" "${release_name}")

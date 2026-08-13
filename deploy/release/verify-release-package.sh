@@ -18,6 +18,11 @@ package_dir="${temporary_root}/iphoneloadly-v${version}-linux-amd64"
 
 for required in \
   bin/iphoneloadly-api \
+  VERSION \
+  README.md \
+  CHANGELOG.md \
+  SECURITY.md \
+  LICENSE \
   install.sh \
   install-iphoneloadly.sh \
   deploy/host/install-debian13.sh \
@@ -29,9 +34,30 @@ for required in \
   scripts/preflight-wifi.sh \
   scripts/backup-state.sh \
   scripts/restore-state.sh \
-  docs/INSTALL.md; do
+  docs/INSTALL.md \
+  docs/operations/caddy-lan.md \
+  docs/operations/api-systemd.md; do
   [[ -f "${package_dir}/${required}" ]] || { echo "Release archive is missing: ${required}" >&2; exit 1; }
 done
+
+[[ "$(tr -d '[:space:]' < "${package_dir}/VERSION")" == "${version}" ]] \
+  || { echo 'Release archive contains the wrong VERSION.' >&2; exit 1; }
+
+if find "${package_dir}" -type f \( \
+  -name '*.ipa' -o -name '*.mobileprovision' -o -name '*.p12' -o \
+  -name '*.pfx' -o -name '*.pem' -o -name '*.key' -o -name '*.db' -o \
+  -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.plist' -o \
+  -name '*.env' \) -print -quit | grep -q .; then
+  echo 'Release archive contains a forbidden runtime or credential file.' >&2
+  exit 1
+fi
+
+if grep -RIlE --binary-files=without-match \
+  'gho_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY' \
+  "${package_dir}" | grep -q .; then
+  echo 'Release archive contains a high-confidence credential pattern.' >&2
+  exit 1
+fi
 
 bash "${package_dir}/install.sh" --check-package-layout
 bash "${package_dir}/install-iphoneloadly.sh" --check-package-layout

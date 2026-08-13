@@ -486,12 +486,14 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
+    version: &'static str,
     signing: SigningReadiness,
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
         signing: state.signing.readiness().await,
     })
 }

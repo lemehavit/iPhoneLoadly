@@ -156,4 +156,4 @@ bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}"
 
 step 6 'Checking installation'
 iphoneloadly-doctor || true
-printf '\niPhoneLoadly installation complete ✓\n\nNext:\n1. Open an SSH tunnel: ssh -N -L 8080:127.0.0.1:8080 USER@SERVER\n2. Open http://127.0.0.1:8080/ in your browser.\n3. Sign in with your Apple ID and upload an IPA.\n\nDocumentation: https://github.com/lemehavit/iPhoneLoadly/blob/main/docs/INSTALL.md\n'
+printf '\niPhoneLoadly installation complete ✓\n\nNext:\n1. Configure authenticated Caddy using docs/operations/caddy-lan.md.\n2. Open https://iphoneloadly.local (or use an SSH tunnel as an administrator fallback).\n3. Sign in with your Apple ID and upload an IPA.\n\nDocumentation: https://github.com/lemehavit/iPhoneLoadly/blob/main/docs/INSTALL.md\n'

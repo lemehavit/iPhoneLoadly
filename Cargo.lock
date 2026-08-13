@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "iphoneloadly-api"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "aes-gcm 0.10.3",
  "async-trait",

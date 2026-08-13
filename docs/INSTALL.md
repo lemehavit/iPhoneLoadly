@@ -29,9 +29,9 @@ Expected checksum result:
 iphoneloadly-v<VERSION>-linux-amd64.tar.gz: OK
 ```
 
-There is no published release asset yet if the Releases page is empty. Until the
-first release, use the advanced source-build instructions in
-[from-scratch.md](operations/from-scratch.md); do not substitute an unverified
+The current alpha release is `v0.2.0-alpha.1`. If that release is unavailable,
+use the advanced source-build instructions in
+[from-scratch.md](operations/from-scratch.md); never substitute an unverified
 archive from another site.
 
 ## 2. Start the local anisette service
@@ -84,15 +84,25 @@ below before repeating the pairing ceremony.
 
 ## 4. Open the dashboard and install an IPA
 
+For normal use on a trusted LAN, configure the authenticated Caddy endpoint by
+following [caddy-lan.md](operations/caddy-lan.md), then open:
+
+```text
+https://iphoneloadly.local
+```
+
+An SSH tunnel remains available as an administrator fallback:
+
 From your own computer, make an SSH tunnel to the Debian host:
 
 ```bash
 ssh -N -L 8080:127.0.0.1:8080 YOUR_USER@YOUR_SERVER
 ```
 
-Open `http://127.0.0.1:8080/`, sign in with your Apple ID, complete 2FA, upload
-an IPA, select the discovered phone, and create an installation job. The password
-and 2FA response live only in memory; sign in again after an API or server restart.
+Open the dashboard, sign in with your Apple ID, complete 2FA, upload an IPA,
+select the discovered phone, and create an installation job. The password stays
+in memory unless you explicitly select encrypted credential storage; 2FA is never
+saved. Apple may still require 2FA after an API or server restart.
 The job view shows signing progress and then the device-transfer phase. Use
 **Ta bort vald IPA från servern** to permanently remove an uploaded IPA when it
 is no longer needed; it is unavailable while that IPA has an active installation
@@ -103,8 +113,10 @@ refresh for an app whose last successful install is at least six days old. If th
 phone is unavailable, a later hourly run retries automatically; use the History
 and diagnostics view to see each result.
 
-For LAN dashboard access, optionally configure [Caddy](operations/caddy-lan.md).
-Do this only on a trusted LAN with authentication; never expose it to the Internet.
+The Overview shows remaining free-signing days for successful installations and
+lists only apps that iPhoneLoadly installed on the selected trusted iPhone.
+
+Use Caddy only on a trusted LAN with authentication; never expose it to the Internet.
 
 ## Troubleshooting
 
