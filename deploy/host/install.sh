@@ -43,15 +43,36 @@ single_usb_udid() {
 
 wait_for_network_device() {
   local expected_udid="$1"
-  local attempt network_ids
-  for attempt in {1..18}; do
+  local deadline network_ids network_ips network_ip remaining probe_timeout
+  deadline=$((SECONDS + 90))
+  while (( SECONDS < deadline )); do
     network_ids="$(USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock idevice_id --network 2>/dev/null || true)"
     if printf '%s\n' "${network_ids}" | grep -Fxq "${expected_udid}" &&
       USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock \
         ideviceinfo --network -u "${expected_udid}" -k DeviceName >/dev/null 2>&1; then
       return 0
     fi
-    sleep 5
+    # Debian's libimobiledevice may fail to enumerate the current netmuxd
+    # socket even though netmuxd has discovered the phone. Validate only
+    # Bonjour-advertised IPv4 addresses with the existing pairing record.
+    remaining=$((deadline - SECONDS))
+    probe_timeout=$((remaining < 3 ? remaining : 3))
+    (( probe_timeout > 0 )) || break
+    network_ips="$(timeout "${probe_timeout}s" avahi-browse -p -t -r _apple-mobdev2._tcp 2>/dev/null \
+      | awk -F ';' '$1 == "=" && $3 == "IPv4" { print $8 }' \
+      | sort -u || true)"
+    while IFS= read -r network_ip; do
+      [[ -n "${network_ip}" ]] || continue
+      remaining=$((deadline - SECONDS))
+      probe_timeout=$((remaining < 5 ? remaining : 5))
+      (( probe_timeout > 0 )) || break 2
+      if timeout "${probe_timeout}s" /opt/iphoneloadly-tools/pymobiledevice3/bin/python \
+        "${PACKAGE_ROOT}/scripts/verify-wifi-direct.py" \
+        --host "${network_ip}" --udid "${expected_udid}" >/dev/null 2>&1; then
+        return 0
+      fi
+    done <<< "${network_ips}"
+    sleep 2
   done
   return 1
 }

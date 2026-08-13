@@ -4,10 +4,11 @@ mod signing;
 mod store;
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     path::{Path as StdPath, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -113,8 +114,9 @@ impl SigningProvider for signing::AppleSigningProvider {
     }
 }
 
-/// Resolves trusted Wi-Fi devices through netmuxd every time rather than
-/// retaining a DHCP address in configuration or process memory.
+/// Resolves trusted Wi-Fi devices without retaining a DHCP address in
+/// configuration or process memory. netmuxd is preferred; Bonjour plus a
+/// pairing-record-validated TCP connection is the compatibility fallback.
 struct NetmuxTransport {
     mux_socket: String,
     pairing_path: PathBuf,
@@ -123,15 +125,12 @@ struct NetmuxTransport {
 #[async_trait]
 impl DeviceTransport for NetmuxTransport {
     async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
-        let devices = self.network_devices().await?;
-        let mut summaries = Vec::new();
-        for (udid, address) in devices {
-            match self.describe_device(&udid, address).await {
-                Ok(summary) => summaries.push(summary),
-                Err(_) => tracing::debug!(device_id = %device_id_for_udid(&udid), "skipping unreachable or untrusted network device"),
-            }
-        }
-        Ok(summaries)
+        Ok(self
+            .reachable_network_devices()
+            .await?
+            .into_iter()
+            .map(|(_, _, summary)| summary)
+            .collect())
     }
 
     async fn install_ipa(
@@ -140,11 +139,11 @@ impl DeviceTransport for NetmuxTransport {
         device_id: Uuid,
         ipa_path: PathBuf,
     ) -> Result<(), TransportError> {
-        let (udid, address) = self
-            .network_devices()
+        let (udid, address, _) = self
+            .reachable_network_devices()
             .await?
             .into_iter()
-            .find(|(udid, _)| device_id_for_udid(udid) == device_id)
+            .find(|(udid, _, _)| device_id_for_udid(udid) == device_id)
             .ok_or(TransportError::Unavailable)?;
         let provider = self.provider_for(&udid, address)?;
         signing
@@ -155,7 +154,48 @@ impl DeviceTransport for NetmuxTransport {
 }
 
 impl NetmuxTransport {
-    async fn network_devices(&self) -> Result<Vec<(String, IpAddr)>, TransportError> {
+    async fn reachable_network_devices(
+        &self,
+    ) -> Result<Vec<(String, IpAddr, DeviceSummary)>, TransportError> {
+        let mut reachable = self
+            .reachable_candidates(self.netmux_network_devices().await.unwrap_or_default())
+            .await;
+        if reachable.is_empty() {
+            let bonjour_candidates = self.bonjour_candidates().await?;
+            reachable = self.reachable_candidates(bonjour_candidates).await;
+        }
+        if reachable.is_empty() {
+            Err(TransportError::Unavailable)
+        } else {
+            Ok(reachable)
+        }
+    }
+
+    async fn reachable_candidates(
+        &self,
+        candidates: Vec<(String, IpAddr)>,
+    ) -> Vec<(String, IpAddr, DeviceSummary)> {
+        let mut reachable = Vec::new();
+        let mut attempted = HashSet::new();
+        let mut identified_udids = HashSet::new();
+        for (udid, address) in candidates {
+            if identified_udids.contains(&udid) || !attempted.insert((udid.clone(), address)) {
+                continue;
+            }
+            match self.describe_device(&udid, address).await {
+                Ok(summary) => {
+                    identified_udids.insert(udid.clone());
+                    reachable.push((udid, address, summary));
+                }
+                Err(_) => {
+                    tracing::debug!(device_id = %device_id_for_udid(&udid), "skipping unreachable or untrusted network device")
+                }
+            }
+        }
+        reachable
+    }
+
+    async fn netmux_network_devices(&self) -> Result<Vec<(String, IpAddr)>, TransportError> {
         #[cfg(not(unix))]
         {
             let _ = &self.mux_socket;
@@ -184,6 +224,22 @@ impl NetmuxTransport {
         }
     }
 
+    async fn bonjour_candidates(&self) -> Result<Vec<(String, IpAddr)>, TransportError> {
+        let addresses = tokio::task::spawn_blocking(discover_mobdev2_ipv4_addresses)
+            .await
+            .map_err(|_| TransportError::Unavailable)??;
+        let udids = pairing_record_udids(&self.pairing_path)?;
+        Ok(udids
+            .into_iter()
+            .flat_map(|udid| {
+                addresses
+                    .iter()
+                    .copied()
+                    .map(move |address| (udid.clone(), address))
+            })
+            .collect())
+    }
+
     fn provider_for(
         &self,
         udid: &str,
@@ -192,8 +248,8 @@ impl NetmuxTransport {
         use idevice::pairing_file::PairingFile;
 
         let pairing_path = pairing_record_path(&self.pairing_path, udid);
-        let pairing_file = PairingFile::read_from_file(pairing_path)
-            .map_err(|_| TransportError::Unavailable)?;
+        let pairing_file =
+            PairingFile::read_from_file(pairing_path).map_err(|_| TransportError::Unavailable)?;
         Ok(idevice::provider::TcpProvider {
             addr: address,
             scope_id: None,
@@ -212,13 +268,11 @@ impl NetmuxTransport {
 
         let provider = self.provider_for(udid, address)?;
         let pairing_file = provider.pairing_file.clone();
-        let mut client = tokio::time::timeout(
-            Duration::from_secs(5),
-            LockdownClient::connect(&provider),
-        )
-        .await
-        .map_err(|_| TransportError::Unavailable)?
-        .map_err(|_| TransportError::Unavailable)?;
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(5), LockdownClient::connect(&provider))
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
         tokio::time::timeout(Duration::from_secs(5), client.start_session(&pairing_file))
             .await
             .map_err(|_| TransportError::Unavailable)?
@@ -258,6 +312,49 @@ impl NetmuxTransport {
 
 fn pairing_record_path(pairing_dir: &StdPath, udid: &str) -> PathBuf {
     pairing_dir.join(format!("{udid}.plist"))
+}
+
+fn pairing_record_udids(pairing_dir: &StdPath) -> Result<Vec<String>, TransportError> {
+    let entries = std::fs::read_dir(pairing_dir).map_err(|_| TransportError::Unavailable)?;
+    Ok(entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".plist").map(str::to_owned))
+        .filter(|udid| udid != "SystemConfiguration")
+        .collect())
+}
+
+fn discover_mobdev2_ipv4_addresses() -> Result<Vec<IpAddr>, TransportError> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+    let daemon = ServiceDaemon::new().map_err(|_| TransportError::Unavailable)?;
+    let receiver = daemon
+        .browse("_apple-mobdev2._tcp.local.")
+        .map_err(|_| TransportError::Unavailable)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut addresses = HashSet::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Ok(event) = receiver.recv_timeout(remaining) else {
+            break;
+        };
+        if let ServiceEvent::ServiceResolved(service) = event {
+            addresses.extend(
+                service
+                    .get_addresses()
+                    .iter()
+                    .filter(|address| address.is_ipv4())
+                    .map(|address| address.to_ip_addr()),
+            );
+        }
+    }
+    drop(receiver);
+    let _ = daemon.stop_browse("_apple-mobdev2._tcp.local.");
+    let _ = daemon.shutdown();
+    if addresses.is_empty() {
+        Err(TransportError::Unavailable)
+    } else {
+        Ok(addresses.into_iter().collect())
+    }
 }
 
 /// The browser and SQLite use an internal UUID. Apple UDIDs remain private and
@@ -443,7 +540,12 @@ async fn create_install_job(
         )
             .into_response();
     };
-    tokio::spawn(run_install_job(state.clone(), id, request.device_id, ipa_path));
+    tokio::spawn(run_install_job(
+        state.clone(),
+        id,
+        request.device_id,
+        ipa_path,
+    ));
     let job = jobs::InstallJob {
         id,
         phase: jobs::JobPhase::Queued,
@@ -702,8 +804,8 @@ async fn main() {
     let database = store::initialize(&database_path).expect("initialize SQLite store");
     let mux_socket = std::env::var("IPHONELOADLY_MUX_SOCKET")
         .unwrap_or_else(|_| "/run/iphoneloadly/mux.sock".into());
-    let pairing_dir = std::env::var("IPHONELOADLY_PAIRING_DIR")
-        .unwrap_or_else(|_| "/var/lib/lockdown".into());
+    let pairing_dir =
+        std::env::var("IPHONELOADLY_PAIRING_DIR").unwrap_or_else(|_| "/var/lib/lockdown".into());
     let devices: Arc<dyn DeviceTransport> = Arc::new(NetmuxTransport {
         mux_socket,
         pairing_path: pairing_dir.into(),

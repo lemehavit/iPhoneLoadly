@@ -167,6 +167,9 @@ sudo /opt/iphoneloadly-tools/pymobiledevice3/bin/python \
 ```
 
 This diagnostic does not pair, install an IPA, or print pairing-record material.
+The installer and API use this same Bonjour-discovered, pairing-record-validated
+TCP path automatically when the netmuxd/libimobiledevice enumeration path is
+unavailable; it never stores a device IP address or exposes a UDID to the UI.
 
 ## 6. Run the read-only preflight
 
