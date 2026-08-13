@@ -170,7 +170,7 @@ systemctl status netmuxd
 idevice_id -l
 idevicepair pair
 idevicepair validate
-pymobiledevice3 lockdown wifi-connections on
+pymobiledevice3 lockdown wifi-connections --state on
 # Disconnect USB before continuing.
 avahi-browse -rt _apple-mobdev2._tcp
 ideviceinfo --network -u <UDID> -k DeviceName

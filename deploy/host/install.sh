@@ -102,7 +102,7 @@ device_udid="$(single_usb_udid)"
 idevicepair -u "${device_udid}" pair
 idevicepair -u "${device_udid}" validate
 ideviceinfo -u "${device_udid}" -k DeviceName >/dev/null
-iphoneloadly-pymobiledevice3 lockdown wifi-connections on
+iphoneloadly-pymobiledevice3 lockdown wifi-connections --state on
 systemctl restart iphoneloadly-netmuxd.service
 printf 'Disconnect USB. iPhoneLoadly now verifies this phone over Wi-Fi; no UDID or IP address is required.\n'
 read -r -p 'Press Enter after disconnecting USB. '

@@ -112,7 +112,7 @@ sudo idevicepair pair
 sudo idevicepair validate
 sudo ideviceinfo -k DeviceName
 sudo ideviceinfo -k ProductVersion
-sudo iphoneloadly-pymobiledevice3 lockdown wifi-connections on
+sudo iphoneloadly-pymobiledevice3 lockdown wifi-connections --state on
 ```
 
 Confirm that at least one device pairing record exists without printing its filename:
