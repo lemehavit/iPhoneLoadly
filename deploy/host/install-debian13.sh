@@ -37,6 +37,7 @@ apt-get install --yes --no-install-recommends \
     avahi-utils \
     build-essential \
     ca-certificates \
+    cargo \
     curl \
     ideviceinstaller \
     jq \
@@ -46,6 +47,7 @@ apt-get install --yes --no-install-recommends \
     python3-pip \
     python3-dev \
     python3-venv \
+    rustc \
     tar \
     unzip \
     usbmuxd

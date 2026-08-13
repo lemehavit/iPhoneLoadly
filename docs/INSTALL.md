@@ -62,7 +62,8 @@ Connect and unlock the iPhone before starting. The assistant installs Debian
 packages, verifies the pinned `netmuxd` archive and binary checksums, installs
 the systemd units, performs the pairing ceremony, enables Wi-Fi connections,
 creates safe configuration, starts the API and refresh timer, and runs a health
-check. It does not save Apple credentials or expose port 8080.
+check. The source-install path also installs the Debian Rust compiler and Cargo
+needed to build the API. It does not save Apple credentials or expose port 8080.
 
 When the installer asks for the Trust This Computer confirmation, it waits up to
 120 seconds for the iPhone response. Keep the phone connected and unlocked, then
