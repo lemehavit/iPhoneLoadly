@@ -845,6 +845,28 @@ async fn list_install_jobs(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn refresh_attention(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::refresh_attention(&database).map_err(|_| ()))
+    {
+        Ok(items) => Json(serde_json::json!(
+            items
+                .into_iter()
+                .map(|item| serde_json::json!({
+                    "appId": item.app_id,
+                    "deviceLabel": item.device_label,
+                    "ageHours": item.age_hours,
+                    "retryFailed": item.retry_failed,
+                }))
+                .collect::<Vec<_>>()
+        )),
+        Err(_) => Json(serde_json::json!({"message":"Unable to read refresh warnings."})),
+    }
+}
+
 async fn delete_ipa(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
     let deletion = state
         .database
@@ -1047,6 +1069,7 @@ async fn main() {
         .route("/api/install-jobs", get(list_install_jobs))
         .route("/api/install-jobs/{id}", get(get_install_job))
         .route("/api/refresh", post(trigger_refresh))
+        .route("/api/refresh-attention", get(refresh_attention))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
         .with_state(state);
 

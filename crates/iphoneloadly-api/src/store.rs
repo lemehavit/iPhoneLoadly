@@ -21,6 +21,13 @@ pub struct StoredApp {
     pub size_bytes: u64,
 }
 
+pub struct RefreshAttention {
+    pub app_id: Uuid,
+    pub device_label: String,
+    pub age_hours: i64,
+    pub retry_failed: bool,
+}
+
 pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
@@ -144,6 +151,38 @@ pub fn refresh_due_targets(connection: &Connection) -> rusqlite::Result<Vec<(Uui
                 Uuid::parse_str(&device_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
                 row.get(2)?,
             ))
+        })?
+        .collect()
+}
+
+pub fn refresh_attention(connection: &Connection) -> rusqlite::Result<Vec<RefreshAttention>> {
+    let mut statement = connection.prepare(
+        "SELECT jobs.app_id, jobs.device_label,
+                CAST((julianday('now') - julianday(jobs.completed_at)) * 24 AS INTEGER),
+                EXISTS(
+                    SELECT 1 FROM jobs AS failed
+                    WHERE failed.app_id = jobs.app_id AND failed.device_id = jobs.device_id
+                      AND failed.phase = 'failed' AND failed.created_at > jobs.completed_at
+                )
+         FROM jobs
+         JOIN apps ON apps.id = jobs.app_id
+         WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
+           AND jobs.completed_at = (
+                SELECT MAX(latest.completed_at) FROM jobs AS latest
+                WHERE latest.app_id = jobs.app_id AND latest.device_id = jobs.device_id
+                  AND latest.phase = 'succeeded'
+           )
+           AND (julianday('now') - julianday(jobs.completed_at)) * 24 >= 120",
+    )?;
+    statement
+        .query_map([], |row| {
+            let app_id: String = row.get(0)?;
+            Ok(RefreshAttention {
+                app_id: Uuid::parse_str(&app_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                device_label: row.get(1)?,
+                age_hours: row.get(2)?,
+                retry_failed: row.get(3)?,
+            })
         })?
         .collect()
 }
