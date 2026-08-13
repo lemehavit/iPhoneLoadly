@@ -8,6 +8,7 @@ pub struct StoredJob {
     pub app_id: Uuid,
     pub device_id: Uuid,
     pub phase: String,
+    pub progress_percent: Option<u8>,
 }
 
 pub struct StoredApp {
@@ -26,7 +27,8 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
             sha256 TEXT NOT NULL UNIQUE,
             storage_path TEXT NOT NULL UNIQUE,
             size_bytes INTEGER NOT NULL,
-            uploaded_at TEXT NOT NULL
+            uploaded_at TEXT NOT NULL,
+            deleted_at TEXT
         );
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
@@ -34,20 +36,31 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
             device_id TEXT NOT NULL,
             phase TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            completed_at TEXT
+            completed_at TEXT,
+            progress_percent INTEGER
         );
         ",
     )?;
-    let has_completed_at = {
+    let job_columns = {
         let mut columns = connection.prepare("PRAGMA table_info(jobs)")?;
         columns
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|name| name == "completed_at")
     };
-    if !has_completed_at {
+    if !job_columns.iter().any(|name| name == "completed_at") {
         connection.execute_batch("ALTER TABLE jobs ADD COLUMN completed_at TEXT;")?;
+    }
+    if !job_columns.iter().any(|name| name == "progress_percent") {
+        connection.execute_batch("ALTER TABLE jobs ADD COLUMN progress_percent INTEGER;")?;
+    }
+    let app_columns = {
+        let mut columns = connection.prepare("PRAGMA table_info(apps)")?;
+        columns
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !app_columns.iter().any(|name| name == "deleted_at") {
+        connection.execute_batch("ALTER TABLE apps ADD COLUMN deleted_at TEXT;")?;
     }
     connection.execute_batch(
         "UPDATE jobs SET completed_at = created_at
@@ -71,7 +84,8 @@ pub fn insert_app(
 }
 
 pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<String>> {
-    let mut statement = connection.prepare("SELECT storage_path FROM apps WHERE id = ?1")?;
+    let mut statement =
+        connection.prepare("SELECT storage_path FROM apps WHERE id = ?1 AND deleted_at IS NULL")?;
     let mut rows = statement.query([id.to_string()])?;
     match rows.next()? {
         Some(row) => Ok(Some(row.get(0)?)),
@@ -81,7 +95,7 @@ pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<St
 
 pub fn list_apps(connection: &Connection) -> rusqlite::Result<Vec<StoredApp>> {
     let mut statement =
-        connection.prepare("SELECT id, sha256, size_bytes FROM apps ORDER BY uploaded_at DESC")?;
+        connection.prepare("SELECT id, sha256, size_bytes FROM apps WHERE deleted_at IS NULL ORDER BY uploaded_at DESC")?;
     statement
         .query_map([], |row| {
             let id: String = row.get(0)?;
@@ -98,7 +112,7 @@ pub fn refresh_due_targets(connection: &Connection) -> rusqlite::Result<Vec<(Uui
     let mut statement = connection.prepare(
         "SELECT jobs.app_id, jobs.device_id, apps.storage_path
          FROM jobs JOIN apps ON apps.id = jobs.app_id
-         WHERE jobs.phase = 'succeeded'
+         WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
            AND jobs.completed_at = (
                 SELECT MAX(latest.completed_at) FROM jobs AS latest
                 WHERE latest.app_id = jobs.app_id
@@ -129,7 +143,7 @@ pub fn active_job_exists(
         "SELECT EXISTS(
             SELECT 1 FROM jobs
             WHERE app_id = ?1 AND device_id = ?2
-              AND phase IN ('queued', 'connecting', 'installing')
+              AND phase IN ('queued', 'connecting', 'signing', 'transferring', 'installing')
         )",
         (app_id.to_string(), device_id.to_string()),
         |row| row.get(0),
@@ -150,8 +164,8 @@ pub fn insert_job(
 }
 
 pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<StoredJob>> {
-    let mut statement =
-        connection.prepare("SELECT id, app_id, device_id, phase FROM jobs WHERE id = ?1")?;
+    let mut statement = connection
+        .prepare("SELECT id, app_id, device_id, phase, progress_percent FROM jobs WHERE id = ?1")?;
     let mut rows = statement.query([id.to_string()])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
@@ -165,20 +179,58 @@ pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<St
         app_id: Uuid::parse_str(&app_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
         device_id: Uuid::parse_str(&device_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
         phase: row.get(3)?,
+        progress_percent: row.get::<_, Option<i64>>(4)?.map(|value| value as u8),
     }))
 }
 
-pub fn update_job_phase(connection: &Connection, id: Uuid, phase: &str) -> rusqlite::Result<()> {
+pub fn update_job_status(
+    connection: &Connection,
+    id: Uuid,
+    phase: &str,
+    progress_percent: Option<u8>,
+) -> rusqlite::Result<()> {
     if phase == "succeeded" {
         connection.execute(
-            "UPDATE jobs SET phase = ?1, completed_at = datetime('now') WHERE id = ?2",
-            (phase, id.to_string()),
+            "UPDATE jobs SET phase = ?1, progress_percent = ?2, completed_at = datetime('now') WHERE id = ?3",
+            (phase, progress_percent.map(i64::from), id.to_string()),
         )?;
     } else {
         connection.execute(
-            "UPDATE jobs SET phase = ?1 WHERE id = ?2",
-            (phase, id.to_string()),
+            "UPDATE jobs SET phase = ?1, progress_percent = ?2 WHERE id = ?3",
+            (phase, progress_percent.map(i64::from), id.to_string()),
         )?;
     }
+    Ok(())
+}
+
+pub enum AppDeletion {
+    Ready { storage_path: String },
+    ActiveJob,
+    NotFound,
+}
+
+pub fn mark_app_deleted(connection: &Connection, id: Uuid) -> rusqlite::Result<AppDeletion> {
+    let Some(path) = app_path(connection, id)? else {
+        return Ok(AppDeletion::NotFound);
+    };
+    if connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE app_id = ?1 AND phase IN ('queued', 'connecting', 'signing', 'transferring', 'installing'))",
+        [id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(AppDeletion::ActiveJob);
+    }
+    connection.execute(
+        "UPDATE apps SET deleted_at = datetime('now') WHERE id = ?1 AND deleted_at IS NULL",
+        [id.to_string()],
+    )?;
+    Ok(AppDeletion::Ready { storage_path: path })
+}
+
+pub fn restore_app(connection: &Connection, id: Uuid) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE apps SET deleted_at = NULL WHERE id = ?1",
+        [id.to_string()],
+    )?;
     Ok(())
 }

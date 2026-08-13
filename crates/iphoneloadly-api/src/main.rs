@@ -17,7 +17,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -81,6 +81,7 @@ trait DeviceTransport: Send + Sync {
         signing: &signing::AppleSigningProvider,
         device_id: Uuid,
         ipa_path: PathBuf,
+        progress: Box<dyn Fn(u8) + Send + Sync>,
     ) -> Result<(), TransportError>;
 }
 
@@ -138,6 +139,7 @@ impl DeviceTransport for NetmuxTransport {
         signing: &signing::AppleSigningProvider,
         device_id: Uuid,
         ipa_path: PathBuf,
+        progress: Box<dyn Fn(u8) + Send + Sync>,
     ) -> Result<(), TransportError> {
         let (udid, address, _) = self
             .reachable_network_devices()
@@ -147,7 +149,7 @@ impl DeviceTransport for NetmuxTransport {
             .ok_or(TransportError::Unavailable)?;
         let provider = self.provider_for(&udid, address)?;
         signing
-            .install_ipa(&provider, ipa_path)
+            .install_ipa(&provider, ipa_path, progress)
             .await
             .map_err(|_| TransportError::InstallFailed)
     }
@@ -637,16 +639,29 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: PathBuf) {
-    set_job_phase(&state.database, id, "connecting");
-    set_job_phase(&state.database, id, "installing");
+    set_job_status(&state.database, id, "connecting", Some(0));
+    set_job_status(&state.database, id, "signing", Some(1));
+    let progress_database = state.database.clone();
     let result = state
         .devices
-        .install_ipa(&state.signing, device_id, ipa_path)
+        .install_ipa(
+            &state.signing,
+            device_id,
+            ipa_path,
+            Box::new(move |progress| {
+                let phase = if progress >= 50 {
+                    "transferring"
+                } else {
+                    "signing"
+                };
+                set_job_status(&progress_database, id, phase, Some(progress));
+            }),
+        )
         .await;
     if result.is_err() {
         tracing::warn!(job_id = %id, "IPA installation failed");
     }
-    set_job_phase(
+    set_job_status(
         &state.database,
         id,
         if result.is_ok() {
@@ -654,12 +669,18 @@ async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: P
         } else {
             "failed"
         },
+        if result.is_ok() { Some(100) } else { None },
     );
 }
 
-fn set_job_phase(database: &Arc<Mutex<rusqlite::Connection>>, id: Uuid, phase: &str) {
+fn set_job_status(
+    database: &Arc<Mutex<rusqlite::Connection>>,
+    id: Uuid,
+    phase: &str,
+    progress_percent: Option<u8>,
+) {
     if let Ok(connection) = database.lock() {
-        let _ = store::update_job_phase(&connection, id, phase);
+        let _ = store::update_job_status(&connection, id, phase, progress_percent);
     }
 }
 
@@ -667,7 +688,9 @@ fn job_message(phase: &str) -> &'static str {
     match phase {
         "queued" => "Installation job is queued.",
         "connecting" => "Connecting to the trusted iPhone over Wi-Fi.",
-        "installing" => "Signing and installing the IPA.",
+        "signing" => "Signing the IPA.",
+        "transferring" => "Transferring and installing the IPA on the iPhone.",
+        "installing" => "Transferring and installing the IPA on the iPhone.",
         "succeeded" => "IPA was signed and installed.",
         "failed" => "Installation failed. Check the server logs for redacted diagnostics.",
         _ => "Installation job status is unavailable.",
@@ -688,6 +711,7 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
                 "appId": job.app_id,
                 "deviceId": job.device_id,
                 "phase": job.phase,
+                "progressPercent": job.progress_percent,
                 "publicMessage": job_message(&job.phase)
             })),
         )
@@ -700,6 +724,45 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"message":"Unable to read installation job."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_ipa(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let deletion = state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::mark_app_deleted(&database, id).map_err(|_| ()));
+    match deletion {
+        Ok(store::AppDeletion::Ready { storage_path }) => {
+            if tokio::fs::remove_file(&storage_path).await.is_ok() {
+                (StatusCode::NO_CONTENT, ()).into_response()
+            } else {
+                if let Ok(database) = state.database.lock() {
+                    let _ = store::restore_app(&database, id);
+                }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message":"Unable to remove the IPA file from server storage."})),
+                )
+                    .into_response()
+            }
+        }
+        Ok(store::AppDeletion::ActiveJob) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"message":"This IPA cannot be removed while an installation or refresh job is active."})),
+        )
+            .into_response(),
+        Ok(store::AppDeletion::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Uploaded IPA was not found."})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to remove the IPA."})),
         )
             .into_response(),
     }
@@ -854,6 +917,7 @@ async fn main() {
         .route("/api/devices", get(list_devices))
         .route("/api/devices/rescan", post(rescan_devices))
         .route("/api/apps", get(list_apps).post(upload_ipa))
+        .route("/api/apps/{id}", delete(delete_ipa))
         .route("/api/install-jobs", post(create_install_job))
         .route("/api/install-jobs/{id}", get(get_install_job))
         .route("/api/refresh", post(trigger_refresh))

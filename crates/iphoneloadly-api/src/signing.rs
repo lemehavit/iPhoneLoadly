@@ -268,14 +268,24 @@ impl AppleSigningProvider {
         &self,
         provider: &TcpProvider,
         ipa_path: std::path::PathBuf,
+        progress: impl Fn(u8) + Send + Sync + 'static,
     ) -> Result<(), SigningError> {
         let mut sideloader = self.sideloader.lock().await;
         let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
         sideloader
-            // The API accepts an optional asynchronous progress callback. The
-            // job API currently reports phases only, so consume progress here
-            // until per-byte progress is persisted in a later increment.
-            .install_app(provider, ipa_path, false, Some(|_progress: f32| async {}))
+            .install_app(
+                provider,
+                ipa_path,
+                false,
+                Some(move |signing_progress: f32| {
+                    // `isideload` reports signing progress, then performs the
+                    // device transfer internally without exposing per-byte
+                    // callbacks. Reserve the latter half for that visible
+                    // transfer/installation phase rather than inventing it.
+                    progress((signing_progress.clamp(0.0, 1.0) * 50.0) as u8);
+                    async {}
+                }),
+            )
             .await
             .map_err(|_| SigningError::InstallFailed)?;
         Ok(())

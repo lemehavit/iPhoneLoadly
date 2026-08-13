@@ -93,6 +93,10 @@ ssh -N -L 8080:127.0.0.1:8080 YOUR_USER@YOUR_SERVER
 Open `http://127.0.0.1:8080/`, sign in with your Apple ID, complete 2FA, upload
 an IPA, select the discovered phone, and create an installation job. The password
 and 2FA response live only in memory; sign in again after an API or server restart.
+The job view shows signing progress and then the device-transfer phase. Use
+**Ta bort vald IPA från servern** to permanently remove an uploaded IPA when it
+is no longer needed; it is unavailable while that IPA has an active installation
+or refresh job, and a removed IPA cannot be refreshed later.
 
 The refresh timer runs daily at about 03:00 with up to a 20-minute delay. It only
 queues a refresh for an app whose last successful install is at least six days
