@@ -107,7 +107,7 @@ RUSTUP_INSTALLER="${DOWNLOAD_DIR}/rustup-init.sh"
 curl --fail --location --proto '=https' --tlsv1.2 \
     --output "${RUSTUP_INSTALLER}" \
     "${RUSTUP_INIT_URL}"
-RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}" \
+RUSTUP_INIT_SKIP_PATH_CHECK=yes RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}" \
     sh "${RUSTUP_INSTALLER}" -y --profile minimal --default-toolchain "${RUST_VERSION}"
 "${CARGO_HOME}/bin/rustup" default "${RUST_VERSION}"
 "${CARGO_HOME}/bin/rustc" --version | grep -Fq "rustc ${RUST_VERSION}" \

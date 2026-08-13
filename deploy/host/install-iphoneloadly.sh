@@ -62,8 +62,12 @@ command -v sudo >/dev/null || { echo "sudo is required." >&2; exit 1; }
 
 if [[ -z "${api_binary}" ]]; then
   cargo_binary="/opt/iphoneloadly-tools/cargo/bin/cargo"
+  rustup_home="/opt/iphoneloadly-tools/rustup"
+  cargo_home="/opt/iphoneloadly-tools/cargo"
+  rust_toolchain="1.89.0"
   [[ -x "${cargo_binary}" ]] || { echo "The managed Rust toolchain is missing. Run: sudo bash deploy/host/install-debian13.sh" >&2; exit 1; }
-  (cd "${repo_root}" && "${cargo_binary}" build --locked --release -p iphoneloadly-api)
+  (cd "${repo_root}" && RUSTUP_HOME="${rustup_home}" CARGO_HOME="${cargo_home}" RUSTUP_TOOLCHAIN="${rust_toolchain}" \
+    "${cargo_binary}" build --locked --release -p iphoneloadly-api)
   api_binary="${repo_root}/target/release/iphoneloadly-api"
 fi
 [[ -x "${api_binary}" ]] || { echo "API binary is not executable: ${api_binary}" >&2; exit 1; }
