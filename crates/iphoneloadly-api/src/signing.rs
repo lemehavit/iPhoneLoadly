@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use idevice::provider::TcpProvider;
 use isideload::{
     anisette::remote_v3::RemoteV3AnisetteProvider,
@@ -19,7 +21,7 @@ use isideload::{
     },
     util::{device::IdeviceInfo, fs_storage::FsStorage, storage::InMemoryStorage},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
@@ -133,6 +135,19 @@ pub struct AppleSigningProvider {
     sideloader: Mutex<Option<Sideloader>>,
     attempts: Mutex<HashMap<Uuid, Arc<LoginAttempt>>>,
     certificate_recovery_requested: AtomicBool,
+    saved_login_id: Mutex<Option<Uuid>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedCredentials {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedCredentials {
+    nonce: String,
+    ciphertext: String,
 }
 
 #[derive(Debug, Error)]
@@ -149,6 +164,8 @@ pub enum SigningError {
     NotReady,
     #[error("IPA installation failed")]
     InstallFailed,
+    #[error("encrypted credential storage failed")]
+    CredentialStorage,
 }
 
 impl AppleSigningProvider {
@@ -159,6 +176,7 @@ impl AppleSigningProvider {
             sideloader: Mutex::new(None),
             attempts: Mutex::new(HashMap::new()),
             certificate_recovery_requested: AtomicBool::new(false),
+            saved_login_id: Mutex::new(None),
         })
     }
 
@@ -168,6 +186,119 @@ impl AppleSigningProvider {
 
     pub fn has_anisette_url(&self) -> bool {
         self.anisette_url.is_some()
+    }
+
+    fn credentials_path(&self) -> PathBuf {
+        self.signing_storage_path.join("saved-credentials.json")
+    }
+
+    fn credentials_key_path(&self) -> PathBuf {
+        self.signing_storage_path.join("credentials.key")
+    }
+
+    fn credential_key(&self) -> Result<[u8; 32], SigningError> {
+        std::fs::create_dir_all(&self.signing_storage_path)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let path = self.credentials_key_path();
+        if let Ok(bytes) = std::fs::read(&path) {
+            return bytes
+                .try_into()
+                .map_err(|_| SigningError::CredentialStorage);
+        }
+        let key: [u8; 32] = rand::random();
+        std::fs::write(&path, key).map_err(|_| SigningError::CredentialStorage)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(key)
+    }
+
+    pub fn save_credentials(&self, email: &str, password: &str) -> Result<(), SigningError> {
+        let key = self.credential_key()?;
+        let nonce: [u8; 12] = rand::random();
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|_| SigningError::CredentialStorage)?;
+        let plaintext = serde_json::to_vec(&SavedCredentials {
+            email: email.into(),
+            password: password.into(),
+        })
+        .map_err(|_| SigningError::CredentialStorage)?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let record = serde_json::to_vec(&EncryptedCredentials {
+            nonce: BASE64.encode(nonce),
+            ciphertext: BASE64.encode(ciphertext),
+        })
+        .map_err(|_| SigningError::CredentialStorage)?;
+        let path = self.credentials_path();
+        std::fs::write(&path, record).map_err(|_| SigningError::CredentialStorage)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn delete_saved_credentials(&self) -> Result<(), SigningError> {
+        match std::fs::remove_file(self.credentials_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(SigningError::CredentialStorage),
+        }
+    }
+
+    pub async fn clear_saved_login_id(&self) {
+        *self.saved_login_id.lock().await = None;
+    }
+
+    pub fn has_saved_credentials(&self) -> bool {
+        self.credentials_path().is_file()
+    }
+
+    pub async fn set_saved_login_id(&self, id: Uuid) {
+        *self.saved_login_id.lock().await = Some(id);
+    }
+
+    pub async fn restore_saved_login(
+        self: &Arc<Self>,
+    ) -> Result<Option<LoginStatus>, SigningError> {
+        let record = match std::fs::read(self.credentials_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(SigningError::CredentialStorage),
+        };
+        let encrypted: EncryptedCredentials =
+            serde_json::from_slice(&record).map_err(|_| SigningError::CredentialStorage)?;
+        let nonce = BASE64
+            .decode(encrypted.nonce)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        if nonce.len() != 12 {
+            return Err(SigningError::CredentialStorage);
+        }
+        let ciphertext = BASE64
+            .decode(encrypted.ciphertext)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let cipher = Aes256Gcm::new_from_slice(&self.credential_key()?)
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| SigningError::CredentialStorage)?;
+        let saved: SavedCredentials =
+            serde_json::from_slice(&plaintext).map_err(|_| SigningError::CredentialStorage)?;
+        let status = self.begin_login(saved.email, saved.password).await?;
+        *self.saved_login_id.lock().await = Some(status.id);
+        Ok(Some(status))
+    }
+
+    pub async fn saved_login_status(&self) -> Result<Option<LoginStatus>, SigningError> {
+        let Some(id) = *self.saved_login_id.lock().await else {
+            return Ok(None);
+        };
+        self.login_status(id).await.map(Some)
     }
 
     /// Arms one subsequent interactive login to revoke an older development

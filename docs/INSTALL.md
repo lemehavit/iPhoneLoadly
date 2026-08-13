@@ -145,7 +145,12 @@ sudo systemctl status iphoneloadly-api --no-pager
 
 Enter the password and 2FA response only in the local dashboard. A delayed or
 failed 2FA interaction can time out; start a new sign-in. Any API restart ends
-the memory-only signing session.
+the memory-only signing session unless you explicitly selected **Save
+credentials encrypted on this server**. That optional setting stores the Apple
+email and password encrypted with a root-only local key; on restart the service
+attempts to sign in again. Apple may still require a new 2FA response. Use
+**Remove saved credentials** to delete the encrypted record. A server root user
+can access the encryption key, so enable this only on a server you administer.
 
 ### Apple reports that the development-certificate limit is reached
 

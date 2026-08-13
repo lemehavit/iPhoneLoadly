@@ -422,6 +422,8 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
 struct StartAppleLoginRequest {
     email: String,
     password: String,
+    #[serde(default)]
+    save_credentials: bool,
 }
 
 #[derive(Serialize)]
@@ -452,13 +454,64 @@ async fn start_apple_login(
         )
             .into_response();
     }
+    if request.save_credentials
+        && state
+            .signing
+            .save_credentials(&request.email, &request.password)
+            .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to save encrypted credentials."})),
+        )
+            .into_response();
+    }
     match state.signing.begin_login(request.email, request.password).await {
-        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Ok(status) => {
+            if request.save_credentials {
+                state.signing.set_saved_login_id(status.id).await;
+            }
+            (StatusCode::ACCEPTED, Json(status)).into_response()
+        }
         Err(signing::SigningError::MissingAnisetteUrl) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"message":"Configure IPHONELOADLY_ANISETTE_URL with a trusted anisette service before signing in."})),
         ).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to start Apple sign-in."}))).into_response(),
+    }
+}
+
+async fn saved_apple_login(State(state): State<AppState>) -> impl IntoResponse {
+    match state.signing.saved_login_status().await {
+        Ok(Some(status)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"saved":true,"login":status})),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"saved":state.signing.has_saved_credentials()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to read saved sign-in state."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_saved_apple_login(State(state): State<AppState>) -> impl IntoResponse {
+    match state.signing.delete_saved_credentials() {
+        Ok(()) => {
+            state.signing.clear_saved_login_id().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to remove saved credentials."})),
+        )
+            .into_response(),
     }
 }
 
@@ -956,10 +1009,17 @@ async fn main() {
     tokio::fs::create_dir_all(&state.apps_dir)
         .await
         .expect("create app storage");
+    if let Err(error) = state.signing.restore_saved_login().await {
+        tracing::warn!(error = %error, "unable to restore saved Apple sign-in");
+    }
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
         .route("/api/signing/sessions", post(start_apple_login))
+        .route(
+            "/api/signing/saved-session",
+            get(saved_apple_login).delete(delete_saved_apple_login),
+        )
         .route(
             "/api/signing/certificate-recovery",
             post(request_certificate_recovery),
