@@ -28,6 +28,13 @@ pub struct RefreshAttention {
     pub retry_failed: bool,
 }
 
+pub struct InstallationValidity {
+    pub app_id: Uuid,
+    pub device_label: String,
+    pub remaining_days: i64,
+    pub completed_at: String,
+}
+
 pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
@@ -182,6 +189,35 @@ pub fn refresh_attention(connection: &Connection) -> rusqlite::Result<Vec<Refres
                 device_label: row.get(1)?,
                 age_hours: row.get(2)?,
                 retry_failed: row.get(3)?,
+            })
+        })?
+        .collect()
+}
+
+pub fn installation_validity(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<InstallationValidity>> {
+    let mut statement = connection.prepare(
+        "SELECT jobs.app_id, jobs.device_label,
+                MAX(0, CAST((168 - ((julianday('now') - julianday(jobs.completed_at)) * 24) + 23) / 24 AS INTEGER)),
+                jobs.completed_at
+         FROM jobs JOIN apps ON apps.id = jobs.app_id
+         WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
+           AND jobs.completed_at = (
+                SELECT MAX(latest.completed_at) FROM jobs AS latest
+                WHERE latest.app_id = jobs.app_id AND latest.device_id = jobs.device_id
+                  AND latest.phase = 'succeeded'
+           )
+         ORDER BY jobs.completed_at DESC",
+    )?;
+    statement
+        .query_map([], |row| {
+            let app_id: String = row.get(0)?;
+            Ok(InstallationValidity {
+                app_id: Uuid::parse_str(&app_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                device_label: row.get(1)?,
+                remaining_days: row.get(2)?,
+                completed_at: row.get(3)?,
             })
         })?
         .collect()
