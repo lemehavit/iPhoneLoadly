@@ -32,7 +32,8 @@ iPhone from a Debian server.
 3. The host creates a local pairing record, which is sensitive device-access material.
 4. Wi-Fi connections are enabled; later app work uses the trusted network path.
 5. You sign into Apple through the local dashboard and complete 2FA when asked.
-6. iPhoneLoadly signs and installs uploaded IPA files for the configured phone.
+6. iPhoneLoadly discovers trusted iPhones on Wi-Fi, then signs and installs an
+   uploaded IPA for the selected phone.
 7. Its systemd timer checks whether a successful installation is about six days old
    and queues a refresh when the Apple signing session and phone are available.
 

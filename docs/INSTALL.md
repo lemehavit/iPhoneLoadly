@@ -68,10 +68,12 @@ check. It does not save Apple credentials or expose port 8080.
 sudo bash ./install.sh
 ```
 
-During setup, accept **Trust This Computer** on the phone, then disconnect USB
-when prompted. Enter the phone’s UDID and current Wi-Fi IP only at the local
-terminal. If the pairing record is not found, stop and use the explicit pairing
-steps in [debian13-host-preparation.md](operations/debian13-host-preparation.md).
+During setup, connect and unlock exactly one iPhone, then accept **Trust This
+Computer** on the phone. Disconnect USB when prompted. The installer identifies
+that phone, enables Wi-Fi connections, and verifies the same trusted device over
+the network before it continues; it never asks you to enter a UDID or IP address.
+If that verification times out, keep USB disconnected and use the diagnostics
+below before repeating the pairing ceremony.
 
 ## 4. Open the dashboard and install an IPA
 
@@ -114,11 +116,11 @@ then disconnect USB. Confirm both devices use the same Wi-Fi/LAN and run:
 
 ```bash
 sudo iphoneloadly-doctor
-sudo bash /usr/share/iphoneloadly/scripts/preflight-wifi.sh --udid '<UDID>'
+sudo bash /usr/share/iphoneloadly/scripts/preflight-wifi.sh
 ```
 
 If Bonjour or direct Wi-Fi fails, check Wi-Fi client isolation, VLAN multicast
-filtering, the configured IP, and `iphoneloadly-netmuxd` status. Do not delete
+filtering and `iphoneloadly-netmuxd` status. Do not delete
 pairing records unless you intentionally want to pair again.
 
 ### Apple sign-in fails

@@ -49,9 +49,10 @@ bash deploy/release/build-release.sh
 ```
 
 Continue with `docs/operations/quick-start.md` and use the generated archive in
-`dist/`. The installer creates `/etc/iphoneloadly/api.env` from the device ID,
-iPhone IP, pairing plist path, and local anisette URL supplied on its command line.
-It does not accept or store an Apple-ID password or a two-factor code.
+`dist/`. The installer configures the dedicated network mux socket, pairing
+directory and local anisette URL; iPhone addresses and UDIDs are discovered at
+runtime and are not stored in the environment file. It does not accept or store
+an Apple-ID password or a two-factor code.
 
 Continue with `docs/operations/api-systemd.md` to enable the API and refresh timer.
 

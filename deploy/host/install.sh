@@ -30,6 +30,31 @@ fi
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n[%s/6] %s...\n' "$1" "$2"; }
+
+single_usb_udid() {
+  local -a devices=()
+  mapfile -t devices < <(idevice_id --list 2>/dev/null | sed '/^[[:space:]]*$/d')
+  case "${#devices[@]}" in
+    1) printf '%s\n' "${devices[0]}" ;;
+    0) fail 'No iPhone was detected over USB. Check the cable, unlock the phone, and accept Trust This Computer.' ;;
+    *) fail 'More than one iPhone is connected over USB. Disconnect every phone except the one to onboard.' ;;
+  esac
+}
+
+wait_for_network_device() {
+  local expected_udid="$1"
+  local attempt network_ids
+  for attempt in {1..18}; do
+    network_ids="$(USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock idevice_id --network 2>/dev/null || true)"
+    if printf '%s\n' "${network_ids}" | grep -Fxq "${expected_udid}" &&
+      USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock \
+        ideviceinfo --network -u "${expected_udid}" -k DeviceName >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
 if [[ "${1:-}" == "--check-package-layout" ]]; then
   for required in \
     "${PACKAGE_ROOT}/bin/iphoneloadly-api" \
@@ -71,13 +96,19 @@ curl --fail --silent --max-time 5 http://127.0.0.1:6970/ >/dev/null || fail 'Loc
 printf 'OK\n'
 
 step 4 'Pairing and Wi-Fi setup'
-printf 'Connect and unlock the iPhone, accept Trust This Computer, then press Enter. '
+printf 'Connect and unlock exactly one iPhone, accept Trust This Computer, then press Enter. '
 read -r
-idevicepair pair
-idevicepair validate
+device_udid="$(single_usb_udid)"
+idevicepair -u "${device_udid}" pair
+idevicepair -u "${device_udid}" validate
+ideviceinfo -u "${device_udid}" -k DeviceName >/dev/null
 iphoneloadly-pymobiledevice3 lockdown wifi-connections on
-printf 'Disconnect USB. iPhoneLoadly discovers trusted Wi-Fi devices automatically; no UDID or IP address is required.\n'
+systemctl restart iphoneloadly-netmuxd.service
+printf 'Disconnect USB. iPhoneLoadly now verifies this phone over Wi-Fi; no UDID or IP address is required.\n'
 read -r -p 'Press Enter after disconnecting USB. '
+wait_for_network_device "${device_udid}" \
+  || fail 'The trusted iPhone did not become reachable over Wi-Fi within 90 seconds. Keep USB disconnected and run iphoneloadly-doctor and preflight-wifi.sh.'
+printf 'OK: trusted iPhone is reachable over Wi-Fi.\n'
 
 step 5 'Installing iPhoneLoadly'
 bash "$APP_INSTALLER" "${API_ARGUMENTS[@]}"

@@ -174,7 +174,10 @@ This diagnostic does not pair, install an IPA, or print pairing-record material.
 sudo bash scripts/preflight-wifi.sh --udid '<UDID>'
 ```
 
-The preflight does not pair, write pairing data or install an IPA. Warnings are expected if the phone is away or no UDID was supplied. Failures must be resolved before application code is connected to the device.
+The preflight does not pair, write pairing data or install an IPA. When exactly
+one trusted Wi-Fi device is visible, it validates that device automatically;
+with multiple devices, pass `--udid` only for a focused diagnostic. Failures
+must be resolved before application code is connected to the device.
 
 ## 7. Collect diagnostics safely
 
