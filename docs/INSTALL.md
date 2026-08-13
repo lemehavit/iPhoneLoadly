@@ -98,9 +98,10 @@ The job view shows signing progress and then the device-transfer phase. Use
 is no longer needed; it is unavailable while that IPA has an active installation
 or refresh job, and a removed IPA cannot be refreshed later.
 
-The refresh timer runs daily at about 03:00 with up to a 20-minute delay. It only
-queues a refresh for an app whose last successful install is at least six days
-old, and only succeeds while both the signing session and phone are available.
+The refresh timer runs hourly with up to a 10-minute delay. It only queues a
+refresh for an app whose last successful install is at least six days old. If the
+phone is unavailable, a later hourly run retries automatically; use the History
+and diagnostics view to see each result.
 
 For LAN dashboard access, optionally configure [Caddy](operations/caddy-lan.md).
 Do this only on a trusted LAN with authentication; never expose it to the Internet.
@@ -186,8 +187,10 @@ sudo systemctl status iphoneloadly-refresh.timer --no-pager
 curl --fail -X POST http://127.0.0.1:8080/api/refresh
 ```
 
-Refresh is not a guarantee: it needs an active in-memory Apple session, a
-reachable phone, and an app whose last successful installation is six days old.
+Refresh is not a guarantee: it needs Apple signing to be ready, a reachable
+phone, and an app whose last successful installation is six days old. A saved
+encrypted sign-in can restore the Apple login after restart, though Apple may
+still require 2FA.
 
 ## Advanced paths
 

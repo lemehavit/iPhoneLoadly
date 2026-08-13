@@ -1,10 +1,12 @@
 [Unit]
-Description=Run iPhoneLoadly IPA refresh once per day
+Description=Retry due iPhoneLoadly IPA refreshes hourly
 
 [Timer]
-OnCalendar=*-*-* 03:00:00
+# A due app is at least six days old. Running hourly provides many bounded
+# opportunities to catch an iPhone that was asleep or temporarily off Wi-Fi.
+OnCalendar=hourly
 Persistent=true
-RandomizedDelaySec=20m
+RandomizedDelaySec=10m
 Unit=iphoneloadly-refresh.service
 
 [Install]

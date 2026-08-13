@@ -35,7 +35,14 @@ For logs:
 sudo journalctl -u iphoneloadly-api -f
 ```
 
-## Daily refresh timer
+## Automatic refresh retry timer
+
+The timer runs hourly with a random delay of up to ten minutes. It does not queue
+anything until an IPA/device pair is at least six days past its last successful
+installation. If the phone is asleep or unavailable, a later hourly run retries
+when it is reachable; the dashboard history records the outcome. After a restart,
+this requires Apple signing to be ready. A deliberately saved encrypted sign-in
+can restore it automatically, although Apple may still request 2FA.
 
 The timer checks each day, but only queues an IPA/device pair once its latest
 successful installation is at least six days old—about one day before the free
