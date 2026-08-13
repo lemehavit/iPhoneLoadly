@@ -409,7 +409,7 @@ impl AppleSigningProvider {
         provider: &TcpProvider,
         ipa_path: std::path::PathBuf,
         progress: impl Fn(u8) + Send + Sync + 'static,
-    ) -> Result<(), SigningError> {
+    ) -> Result<String, SigningError> {
         let mut sideloader = self.sideloader.lock().await;
         let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
         let progress = Arc::new(progress);
@@ -439,6 +439,15 @@ impl AppleSigningProvider {
             )
             .await
             .map_err(|_| SigningError::InstallFailed)?;
+        let signed_info = plist::Value::from_file(signed_app_path.join("Info.plist"))
+            .map_err(|_| SigningError::InstallFailed)?;
+        let installed_bundle_id = signed_info
+            .as_dictionary()
+            .and_then(|info| info.get("CFBundleIdentifier"))
+            .and_then(plist::Value::as_string)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or(SigningError::InstallFailed)?;
 
         // The upstream installer reports actual AFC-upload and installation
         // percentages. Reserve the final 60% of the job for those values.
@@ -450,7 +459,7 @@ impl AppleSigningProvider {
         })
         .await
         .map_err(|_| SigningError::InstallFailed)?;
-        Ok(())
+        Ok(installed_bundle_id)
     }
 
     pub async fn submit_two_factor(

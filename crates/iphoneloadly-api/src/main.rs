@@ -94,7 +94,7 @@ trait DeviceTransport: Send + Sync {
         device_id: Uuid,
         ipa_path: PathBuf,
         progress: Box<dyn Fn(u8) + Send + Sync>,
-    ) -> Result<(), TransportError>;
+    ) -> Result<String, TransportError>;
 }
 
 #[derive(Debug, Error)]
@@ -152,7 +152,7 @@ impl DeviceTransport for NetmuxTransport {
         device_id: Uuid,
         ipa_path: PathBuf,
         progress: Box<dyn Fn(u8) + Send + Sync>,
-    ) -> Result<(), TransportError> {
+    ) -> Result<String, TransportError> {
         let (udid, address, _) = self
             .reachable_network_devices()
             .await?
@@ -270,7 +270,7 @@ impl NetmuxTransport {
         #[cfg(not(unix))]
         {
             let _ = &self.mux_socket;
-            return Err(TransportError::Unavailable);
+            Err(TransportError::Unavailable)
         }
         #[cfg(unix)]
         {
@@ -439,7 +439,8 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartAppleLoginRequest, device_id_for_udid};
+    use super::{StartAppleLoginRequest, device_id_for_udid, managed_app};
+    use crate::store::ManagedAppIdentity;
 
     #[test]
     fn device_id_is_stable_for_non_uuid_apple_udids() {
@@ -455,6 +456,29 @@ mod tests {
         )
         .expect("deserialize browser login request");
         assert!(request.save_credentials);
+    }
+
+    #[test]
+    fn managed_apps_require_service_install_history() {
+        let identities = vec![
+            ManagedAppIdentity {
+                installed_bundle_id: Some("com.example.current.TEAM123".into()),
+                source_bundle_id: Some("com.example.current".into()),
+            },
+            ManagedAppIdentity {
+                installed_bundle_id: None,
+                source_bundle_id: Some("com.example.legacy".into()),
+            },
+        ];
+
+        assert!(managed_app("com.example.current.TEAM123", &identities));
+        assert!(!managed_app("com.example.current.OTHERTEAM", &identities));
+        assert!(managed_app("com.example.legacy.OLDTEAM", &identities));
+        assert!(!managed_app(
+            "com.example.legacymalicious.OLDTEAM",
+            &identities
+        ));
+        assert!(!managed_app("com.apple.Pages", &identities));
     }
 }
 
@@ -647,13 +671,43 @@ async fn list_device_apps(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let identities = match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::managed_app_identities(&database, id).map_err(|_| ()))
+    {
+        Ok(identities) => identities,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message":"Unable to read managed app history."})),
+            )
+                .into_response();
+        }
+    };
     match state.devices.list_installed_apps(id).await {
         Ok(mut apps) => {
+            apps.retain(|app| managed_app(&app.bundle_id, &identities));
             apps.sort_by(|a, b| a.display_name.cmp(&b.display_name));
             (StatusCode::OK, Json(apps)).into_response()
         }
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"The selected trusted iPhone is not reachable over Wi-Fi."}))).into_response(),
     }
+}
+
+fn managed_app(bundle_id: &str, identities: &[store::ManagedAppIdentity]) -> bool {
+    identities.iter().any(|identity| {
+        if let Some(installed_bundle_id) = &identity.installed_bundle_id {
+            return installed_bundle_id == bundle_id;
+        }
+        identity.source_bundle_id.as_ref().is_some_and(|source| {
+            bundle_id == source
+                || bundle_id
+                    .strip_prefix(source)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -815,27 +869,26 @@ async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: P
             }),
         )
         .await;
-    if let Err(error) = &result {
-        tracing::warn!(job_id = %id, error = %error, "IPA installation failed");
-        set_job_failure(
-            &state.database,
-            id,
-            match error {
-                TransportError::Unavailable => "iphone_unavailable",
-                TransportError::InstallFailed => "installation_failed",
-            },
-        );
+    match result {
+        Ok(bundle_id) => {
+            if let Ok(connection) = state.database.lock() {
+                let _ = store::set_job_installed_bundle_id(&connection, id, &bundle_id);
+            }
+            set_job_status(&state.database, id, "succeeded", Some(100));
+        }
+        Err(error) => {
+            tracing::warn!(job_id = %id, error = %error, "IPA installation failed");
+            set_job_failure(
+                &state.database,
+                id,
+                match error {
+                    TransportError::Unavailable => "iphone_unavailable",
+                    TransportError::InstallFailed => "installation_failed",
+                },
+            );
+            set_job_status(&state.database, id, "failed", None);
+        }
     }
-    set_job_status(
-        &state.database,
-        id,
-        if result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        },
-        if result.is_ok() { Some(100) } else { None },
-    );
 }
 
 fn set_job_status(
@@ -1087,6 +1140,7 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
                     &metadata.sha256,
                     &final_path.to_string_lossy(),
                     metadata.size_bytes,
+                    &metadata.bundle_id,
                 )
                 .map_err(|_| ())
             });
@@ -1125,6 +1179,18 @@ async fn main() {
     let data_dir = PathBuf::from("data");
     let database_path = data_dir.join("iphoneloadly.db");
     let database = store::initialize(&database_path).expect("initialize SQLite store");
+    for (id, path) in store::apps_missing_bundle_id(&database).unwrap_or_default() {
+        match ipa::bundle_identifier(StdPath::new(&path)) {
+            Ok(bundle_id) => {
+                if let Err(error) = store::set_app_bundle_id(&database, id, &bundle_id) {
+                    tracing::warn!(app_id = %id, error = %error, "unable to migrate IPA bundle identifier");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(app_id = %id, error = %error, "unable to inspect existing IPA during migration");
+            }
+        }
+    }
     let mux_socket = std::env::var("IPHONELOADLY_MUX_SOCKET")
         .unwrap_or_else(|_| "/run/iphoneloadly/mux.sock".into());
     let pairing_dir =
