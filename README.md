@@ -48,8 +48,8 @@ uploaded IPAs, encrypted credentials, local keys and backups are sensitive data.
 
 ## Install iPhoneLoadly
 
-- [Illustrerad användarguide](docs/USER_GUIDE.md)
-- [Installationsguide](docs/INSTALL.md)
+- [Illustrated user guide](docs/USER_GUIDE.md)
+- [Installation guide](docs/INSTALL.md)
 
 Follow the single beginner path in [docs/INSTALL.md](docs/INSTALL.md). It starts
 with an empty Debian 13 host, uses a GitHub Release archive when one is available,

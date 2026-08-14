@@ -104,7 +104,7 @@ select the discovered phone, and create an installation job. The password stays
 in memory unless you explicitly select encrypted credential storage; 2FA is never
 saved. Apple may still require 2FA after an API or server restart.
 The job view shows signing progress and then the device-transfer phase. Use
-**Ta bort vald IPA från servern** to permanently remove an uploaded IPA when it
+**Delete selected IPA from server** to permanently remove an uploaded IPA when it
 is no longer needed; it is unavailable while that IPA has an active installation
 or refresh job, and a removed IPA cannot be refreshed later.
 
@@ -184,8 +184,8 @@ can access the encryption key, so enable this only on a server you administer.
 
 For a free Apple developer account, iPhoneLoadly saves its signing key in its
 root-only service data directory and reuses the matching Apple certificate
-after a new login. You should therefore only select **Frigör gammalt
-utvecklingscertifikat** if Apple explicitly reports that the certificate limit
+after a new login. You should therefore only select **Release an old
+development certificate** if Apple explicitly reports that the certificate limit
 has been reached. The next signing session then revokes one older development
 certificate only if Apple rejects new-certificate creation for reaching the
 limit. Revoking a certificate can invalidate apps signed with it; do not use

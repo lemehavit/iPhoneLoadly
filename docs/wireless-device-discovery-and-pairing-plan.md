@@ -1,141 +1,139 @@
-# Plan: automatisk iPhone-upptäckt och trådlös parkoppling
+# Plan: automatic iPhone discovery and wireless pairing
 
-## Beslut i korthet
+## Decision summary
 
-Arbetet delas i två separata produktfunktioner:
+The work is divided into two separate product features:
 
-1. **Automatisk upptäckt av redan betrodda iPhones.** Detta ska vara den
-   stabila standardvägen och ersätta manuellt angivet UDID och fast IP-adress.
-   Den fungerar med nuvarande Wi-Fi/Lockdown-transport efter en första USB-
-   parkoppling.
-2. **Trådlös första parkoppling.** Detta byggs som en separat, feature-flaggad
-   iOS 27-funktion. Apples publika stöd börjar med iOS/iPadOS 27 och Xcode 27
-   Device Hub. Den pinnade `idevice`-versionen innehåller byggblock för samma
-   enhetsinitierade RemotePairing-flöde, men hela kedjan måste bevisas på riktig
-   iPhone och Debian innan den får räknas som produktionsstöd.
+1. **Automatic discovery of already trusted iPhones.** This is the stable,
+   default path. It replaces manually configured UDIDs and fixed IP addresses
+   and uses the current Wi-Fi/Lockdown transport after the initial USB pairing.
+2. **Wireless first-time pairing.** This is a separate, feature-flagged iOS 27
+   capability. Apple's public support starts with iOS/iPadOS 27 and Xcode 27
+   Device Hub. The pinned `idevice` version contains building blocks for the
+   same device-initiated RemotePairing flow, but the complete chain must be
+   proven on real iPhone and Debian hardware before it is considered production
+   support.
 
-iOS 26 och äldre behåller en USB-anslutning första gången. Efter den ska all
-normal användning, ominstallation och förnyelse fungera trådlöst och utan
-manuell IP-konfiguration.
+iOS 26 and earlier still require USB for the first connection. After that,
+normal use, reinstallation, and refresh must work wirelessly without manual IP
+configuration.
 
-## Mål
+## Goals
 
-- Hitta samtliga nåbara, betrodda iPhones på det lokala nätverket automatiskt.
-- Hantera flera telefoner och växlande DHCP-adresser.
-- Visa online-, offline- och parkopplingsstatus tydligt i webbgränssnittet.
-- Aldrig installera via USB av misstag; installation och förnyelse förblir
-  Wi-Fi-only.
-- Ge iOS 27-användare ett tidsbegränsat, användarinitierat flöde för trådlös
-  första parkoppling.
-- Behålla USB-onboarding som pålitlig fallback.
-- Inte exponera UDID, pairing records, nycklar eller generiska enhetstunnlar via
-  API eller loggar.
+- Automatically find every reachable, trusted iPhone on the local network.
+- Support multiple phones and changing DHCP addresses.
+- Clearly show online, offline, and pairing states in the web interface.
+- Never install over USB accidentally; installation and refresh remain
+  Wi-Fi-only operations.
+- Give iOS 27 users a time-limited, user-initiated wireless first-pairing flow.
+- Keep USB onboarding as a reliable fallback.
+- Never expose UDIDs, pairing records, keys, or generic device tunnels through
+  the API or logs.
 
-## Avgränsningar
+## Non-goals
 
-- Ingen emulering av Apple TV:s PIN-protokoll på äldre iOS. Apple TV och vanlig
-  iPhone har olika onboardingbeteende.
-- Ingen nätverksskanning av hela subnät eller port 62078. Upptäckt ska ske via
-  DNS-SD/mDNS och `netmuxd`, inte genom aggressiv IP-skanning.
-- Ingen automatisk parkoppling utan en explicit åtgärd från administratören och
-  ett godkännande på telefonen.
-- Ingen produktionsgaranti för iOS 27 innan hårdvarugrinden i fas 4 är godkänd.
-- Ingen generell TCP-, usbmuxd- eller RSD-proxy via webb-API:t.
+- Do not emulate the Apple TV PIN protocol on older iOS versions. Apple TV and
+  iPhone use different onboarding behavior.
+- Do not scan entire subnets or port 62078. Discovery must use DNS-SD/mDNS and
+  `netmuxd`, not aggressive IP scanning.
+- Do not pair automatically without an explicit administrator action and
+  approval on the phone.
+- Do not claim production support for iOS 27 before the phase 4 hardware gate.
+- Do not expose a general-purpose TCP, usbmuxd, or RSD proxy through the web API.
 
-## Nuläge och tekniska luckor
+## Current state and technical gaps
 
-Nuvarande implementation:
+The current implementation:
 
-- kräver `IPHONELOADLY_DEVICE_ID`, `IPHONELOADLY_DEVICE_IP` och
+- requires `IPHONELOADLY_DEVICE_ID`, `IPHONELOADLY_DEVICE_IP`, and
   `IPHONELOADLY_PAIRING_FILE`;
-- skapar en enda `DirectTcpTransport` med fast IP-adress;
-- returnerar högst en telefon från `GET /api/devices`;
-- har redan Avahi, `netmuxd` och en separat mux-socket på
+- creates one `DirectTcpTransport` with a fixed IP address;
+- returns at most one phone from `GET /api/devices`;
+- already includes Avahi, `netmuxd`, and a dedicated mux socket at
   `/run/iphoneloadly/mux.sock`;
-- kontrollerar `_apple-mobdev2._tcp` och `idevice_id --network` i preflight,
-  men använder inte denna upptäckt i API:t;
-- låter `signing.rs` både signera och installera och accepterar endast
-  `TcpProvider`, vilket blockerar en alternativ RSD-installationsväg;
-- behandlar enhets-ID som Rust-typen `Uuid`. Ett Apple-UDID är en separat
-  identifierartyp och får inte parsas eller exponeras som appens interna UUID.
+- checks `_apple-mobdev2._tcp` and `idevice_id --network` during preflight but
+  does not use that discovery in the API;
+- lets `signing.rs` both sign and install and accepts only `TcpProvider`, which
+  blocks an alternative RSD installation path; and
+- treats device IDs as Rust `Uuid` values. An Apple UDID is a separate identifier
+  type and must not be parsed or exposed as the application's internal UUID.
 
-Det första arbetet är därför inte ny protokollkod. Det är att koppla det redan
-installerade `netmuxd`-lagret till backend och införa en riktig enhetskatalog.
+The first task is therefore not new protocol code. It is connecting the
+existing `netmuxd` layer to the backend and introducing a real device registry.
 
-## Stödmatris
+## Support matrix
 
-| Enhetstillstånd | Upptäckt | Första parkoppling | Installation |
+| Device state | Discovery | First pairing | Installation |
 |---|---|---|---|
-| Redan USB-parad, Wi-Fi aktiverat | Automatisk via `netmuxd`/mDNS | Inte tillämpligt | Befintlig Lockdown-väg över Wi-Fi |
-| Oparad iPhone, iOS 26 eller äldre | Ska inte visas som installerbar | USB krävs en gång | Wi-Fi efter slutförd onboarding |
-| Oparad iPhone, iOS 27+ | Under aktiv pairing-session | Experimentell RemotePairing | Avgörs av hårdvarugrind: Lockdown eller RSD |
-| Offline/sovande, tidigare känd | Visas som offline efter timeout | Inte tillämpligt | Blockeras tills telefonen är nåbar |
-| Endast synlig via USB | Kan visas som onboardingstatus | USB-onboarding tillåten | Installation blockeras på USB |
+| Previously paired over USB, Wi-Fi enabled | Automatic through `netmuxd`/mDNS | Not applicable | Existing Lockdown path over Wi-Fi |
+| Unpaired iPhone, iOS 26 or earlier | Must not appear as installable | USB required once | Wi-Fi after onboarding |
+| Unpaired iPhone, iOS 27+ | Visible during an active pairing session | Experimental RemotePairing | Determined by hardware gate: Lockdown or RSD |
+| Offline or sleeping, previously known | Shown as offline after timeout | Not applicable | Blocked until reachable |
+| Visible only over USB | May appear as onboarding state | USB onboarding allowed | Installation over USB blocked |
 
-## Önskat användarflöde
+## Intended user flow
 
-### Redan parad telefon
+### Previously paired phone
 
-1. Användaren öppnar dashboarden.
-2. Backend läser nätverksenheter från `netmuxd` och frågar Lockdown efter namn,
-   modell och iOS-version med kort timeout.
-3. Telefonen visas automatiskt som **Online via Wi-Fi**.
-4. Användaren väljer IPA och telefon och startar installationen.
-5. Backend slår upp telefonens aktuella mux-post på nytt precis före jobbet.
-   En gammal IP-adress eller gammal UI-lista används aldrig.
+1. The user opens the dashboard.
+2. The backend reads network devices from `netmuxd` and queries Lockdown for
+   name, model, and iOS version with a short timeout.
+3. The phone appears automatically as **Online via Wi-Fi**.
+4. The user selects an IPA and phone and starts installation.
+5. The backend resolves the phone's current mux entry again immediately before
+   starting the job. It never trusts a stale IP address or UI snapshot.
 
-### Äldre eller USB-baserad första onboarding
+### USB-based first onboarding
 
-1. UI visar **Lägg till iPhone med USB** och stegvisa instruktioner.
-2. Telefonen ansluts och låses upp; användaren godkänner **Lita på den här
-   datorn**.
-3. Ett setup-verktyg parar, validerar och aktiverar Wi-Fi connections.
-4. `netmuxd` startas om eller laddar om pairing record.
-5. USB kopplas ur och onboarding godkänns först när samma telefon kan frågas via
-   nätverket.
-6. Ingen manuell inmatning av UDID eller IP-adress behövs.
+1. The UI shows **Add iPhone with USB** and step-by-step instructions.
+2. The phone is connected and unlocked, and the user accepts **Trust This
+   Computer**.
+3. A setup tool pairs, validates, and enables Wi-Fi connections.
+4. `netmuxd` restarts or reloads the pairing record.
+5. USB is disconnected. Onboarding succeeds only after the same phone can be
+   queried over the network.
+6. The user never enters a UDID or IP address manually.
 
-### Trådlös första onboarding på iOS 27+
+### Wireless first onboarding on iOS 27+
 
-1. Administratören väljer **Lägg till iPhone trådlöst**.
-2. Backend öppnar en enda tidsbegränsad pairing-session och annonserar en stabil
-   värdidentitet som `_remotepairing-pairable-host._tcp.local`.
-3. iPhone hittar värden. Exakt meny och instruktionstext fastställs i
-   hårdvaruspiken och dokumenteras per iOS-version.
-4. Telefonen ansluter till pairing-porten och driver RemotePairing-flödet.
-5. Backend visar en sexsiffrig engångskod i den autentiserade dashboarden.
-6. Användaren skriver koden på telefonen och godkänner trust-dialogen.
-7. Backend sparar RemotePairing-identiteten och värdens `altIRK` krypterat,
-   stoppar annonsen och stänger pairing-porten.
-8. Backend bevisar en betrodd transport och läser enhetsinfo.
-9. Telefonen läggs inte till som **installerbar** förrän ett signerat testpaket
-   faktiskt kan installeras över Wi-Fi.
+1. The administrator selects **Add iPhone wirelessly**.
+2. The backend opens one time-limited pairing session and advertises a stable
+   host identity as `_remotepairing-pairable-host._tcp.local`.
+3. The iPhone finds the host. The exact menu and instructions are established
+   during the hardware spike and documented per iOS version.
+4. The phone connects to the pairing port and drives the RemotePairing flow.
+5. The backend displays a six-digit one-time code in the authenticated dashboard.
+6. The user enters the code on the phone and accepts the trust dialog.
+7. The backend stores the RemotePairing identity and host `altIRK` encrypted,
+   then stops advertising and closes the pairing port.
+8. The backend proves a trusted transport and reads device information.
+9. The phone is not marked **installable** until a signed test package has
+   actually been installed over Wi-Fi.
 
-## Rekommenderad arkitektur
+## Recommended architecture
 
 ### 1. `DeviceRegistry`
 
-Inför en bakgrundstjänst som äger den aktuella bilden av alla enheter.
+Introduce a background service that owns the current view of all devices.
 
-Ansvar:
+Responsibilities:
 
-- läsa `ListDevices` från `/run/iphoneloadly/mux.sock`;
-- filtrera `idevice::usbmuxd::Connection::Network`;
-- aldrig använda en `Connection::Usb` för install eller refresh;
-- fråga Lockdown om `DeviceName`, `ProductType` och `ProductVersion`;
-- uppdatera `last_seen_at`, status och capabilities;
-- mappa Apple-UDID till ett internt, icke-känsligt enhets-ID;
-- hålla den riktiga mux-posten och UDID endast i processminnet;
-- återansluta efter `netmuxd`-omstart och nätverksbyte;
-- begränsa samtidiga frågor, exempelvis till fyra enheter;
-- använda timeout per enhet så att en sovande telefon inte blockerar listan.
+- read `ListDevices` from `/run/iphoneloadly/mux.sock`;
+- filter for `idevice::usbmuxd::Connection::Network`;
+- never use `Connection::Usb` for installation or refresh;
+- query Lockdown for `DeviceName`, `ProductType`, and `ProductVersion`;
+- update `last_seen_at`, status, and capabilities;
+- map Apple UDIDs to internal, non-sensitive device IDs;
+- keep real mux entries and UDIDs only in process memory;
+- reconnect after `netmuxd` restarts and network changes;
+- limit concurrent queries, for example to four devices; and
+- use a per-device timeout so one sleeping phone cannot block the list.
 
-Första implementationen kan polla var femte sekund. När den är stabil kan den
-kompletteras med `UsbmuxdConnection::listen` för snabbare connect/disconnect-
-händelser. En periodisk full resync ska finnas kvar eftersom event kan tappas
-vid daemon- eller socketomstart.
+The first implementation can poll every five seconds. Once stable, add
+`UsbmuxdConnection::listen` for faster connect/disconnect events. Keep periodic
+full resynchronization because daemon or socket restarts can lose events.
 
-Föreslagen intern gränsyta:
+Proposed internal interfaces:
 
 ```rust
 trait DeviceDiscovery: Send + Sync {
@@ -153,33 +151,32 @@ trait DeviceTransport: Send + Sync {
 }
 ```
 
-`ResolvedDevice` är ett kortlivat objekt. Det måste verifiera nätverkstypen och
-den aktuella trust-sessionen när jobbet startar; det får inte återanvända en IP
-från databasen.
+`ResolvedDevice` is short-lived. It must verify the network connection type and
+current trust session when a job starts and must not reuse an IP address from
+the database.
 
-### 2. Primär upptäcktsadapter: `NetmuxDiscovery`
+### 2. Primary discovery adapter: `NetmuxDiscovery`
 
-- Konfigurera `IPHONELOADLY_MUX_SOCKET`, standard
+- Configure `IPHONELOADLY_MUX_SOCKET`, defaulting to
   `/run/iphoneloadly/mux.sock`.
-- Anslut med `idevice::usbmuxd::UsbmuxdAddr::UnixSocket`.
-- Anropa `get_devices()` och behåll endast `Connection::Network`.
-- Skapa en `UsbmuxdProvider` från den valda posten.
-- Låt `netmuxd`/hostens pairing store tillhandahålla Lockdown record via
-  mux-protokollet. API-processen ska normalt inte läsa plist-filer direkt.
-- Behåll dagens `TcpProvider` som diagnostisk fallback, inte som ordinarie
-  konfiguration.
+- Connect with `idevice::usbmuxd::UsbmuxdAddr::UnixSocket`.
+- Call `get_devices()` and keep only `Connection::Network`.
+- Create a `UsbmuxdProvider` from the selected entry.
+- Let `netmuxd` and the host pairing store provide Lockdown records through the
+  mux protocol. The API process should not normally read plist files directly.
+- Keep the existing `TcpProvider` only as a diagnostic fallback.
 
-Denna väg tar samtidigt bort behovet av fast IP och gör DHCP-byte transparent.
+This removes the fixed-IP requirement and makes DHCP changes transparent.
 
-### 3. Beständig enhetskatalog
+### 3. Persistent device registry
 
-Lägg till en SQLite-tabell via en versionsstyrd migration, inte ytterligare
-`CREATE/ALTER`-logik direkt i `initialize`.
+Add a SQLite table through a versioned migration rather than more direct
+`CREATE/ALTER` logic in `initialize`.
 
 ```sql
 devices (
-  id TEXT PRIMARY KEY,                 -- internt UUIDv7
-  udid_hash TEXT NOT NULL UNIQUE,      -- HMAC-SHA256, aldrig rått UDID
+  id TEXT PRIMARY KEY,                 -- internal UUIDv7
+  udid_hash TEXT NOT NULL UNIQUE,      -- HMAC-SHA256, never raw UDID
   display_name TEXT NOT NULL,
   product_type TEXT,
   ios_version TEXT,
@@ -191,37 +188,34 @@ devices (
 );
 ```
 
-Regler:
+Rules:
 
-- `id` används i API, jobb och UI.
-- `udid_hash` skapas med en separat domännyckel och stabil master key.
-- Rått UDID används endast för det aktuella mux-anropet i minnet.
-- IP-adress lagras inte.
-- Tidigare kända enheter kan visas offline, men installation kräver en färsk
-  registry-post.
-- Befintliga jobb fortsätter använda sina nuvarande interna UUID:n. Om den
-  befintliga konfigurationen har ett giltigt internt ID importeras det vid
-  första start; annars skapas ett nytt och gamla jobb märks som legacy.
+- Use `id` in the API, jobs, and UI.
+- Create `udid_hash` with a separate domain key and stable master key.
+- Use raw UDIDs only for the current in-memory mux call.
+- Do not store IP addresses.
+- Previously known devices may appear offline, but installation requires a
+  fresh registry entry.
+- Existing jobs keep their internal UUIDs. Import a valid configured internal
+  ID on first start; otherwise create a new ID and mark old jobs as legacy.
 
-### 4. Separera signering från installation
+### 4. Separate signing from installation
 
-Refaktorera dagens `AppleSigningProvider::install_ipa(TcpProvider, ...)` till:
+Refactor `AppleSigningProvider::install_ipa(TcpProvider, ...)` into:
 
 1. `SigningProvider::sign(...) -> SignedArtifact`;
 2. `DeviceTransport::install_signed_ipa(...)`.
 
-Det är nödvändigt av två skäl:
+This is required because the same signed artifact must support classic
+Lockdown and a possible RSD/CoreDevice path, while the signing layer must not
+know about IP addresses, mux, or pairing records.
 
-- samma signerade artefakt ska kunna installeras via både klassisk Lockdown och
-  en eventuell RSD/CoreDevice-väg;
-- signeringslagret ska inte känna till IP-adress, mux eller pairing record.
-
-Den befintliga Lockdown/TCP-installationen implementeras först så att beteendet
-inte förändras. RSD-adaptern läggs bara till om fas 4 visar att den behövs.
+Implement the existing Lockdown/TCP installation first to preserve behavior.
+Add an RSD adapter only if phase 4 proves it is necessary.
 
 ### 5. `PairingCoordinator`
 
-Inför en separat abstraktion för onboarding:
+Introduce a separate onboarding abstraction:
 
 ```rust
 trait PairingCoordinator: Send + Sync {
@@ -231,100 +225,92 @@ trait PairingCoordinator: Send + Sync {
 }
 ```
 
-Endast en aktiv trådlös pairing-session tillåts i första versionen. Sessionen
-ska:
+Allow only one active wireless pairing session initially. The session must:
 
-- kräva autentiserad administratör och CSRF-skydd;
-- löpa ut efter fem minuter;
-- ha högst tre PIN-försök;
-- acceptera en telefon och därefter stänga lyssnaren;
-- sluta annonsera vid success, avbrott, timeout eller processavslut;
-- aldrig skriva PIN, pairing payload eller privata nycklar i logg.
+- require an authenticated administrator and CSRF protection;
+- expire after five minutes;
+- allow no more than three PIN attempts;
+- accept one phone and then close the listener;
+- stop advertising on success, cancellation, timeout, or process exit; and
+- never log PINs, pairing payloads, or private keys.
 
-Första implementationen kan ligga i API-processen eftersom nuvarande deployment
-kör direkt under systemd. Inför containerdrift flyttas den LAN-lyssnande delen
-till en liten host-agent bakom en privat Unix-socket; pairing-port och mDNS ska
-inte lösas med `--privileged` eller host networking.
+The first implementation may run in the API process because the current
+deployment runs directly under systemd. Before container deployment, move the
+LAN listener into a small host agent behind a private Unix socket. Do not solve
+pairing-port and mDNS access with `--privileged` or host networking.
 
-## iOS 27: prototypdesign
+## iOS 27 prototype design
 
-### Protokollbyggblock
+### Protocol building blocks
 
-Den pinnade `idevice = 0.1.65` innehåller:
+Pinned `idevice = 0.1.65` includes:
 
-- `remote_pairing::PairableHost` för det enhetsinitierade iOS 27-flödet;
-- `PairableHostInfo` och TXT-records för
+- `remote_pairing::PairableHost` for the device-initiated iOS 27 flow;
+- `PairableHostInfo` and TXT records for
   `_remotepairing-pairable-host._tcp.local`;
-- sexsiffrig PIN-callback;
-- `RpPairingFile`, `altIRK`, peer validation och tunnelfunktioner;
-- RSD- och installationstjänster bakom separata Cargo features.
+- a six-digit PIN callback;
+- `RpPairingFile`, `altIRK`, peer validation, and tunnel functions; and
+- RSD and installation services behind separate Cargo features.
 
-Aktivera inte hela `full`-featuren. Lägg efter spiken endast till minsta
-verifierade feature-set, sannolikt `remote_pairing`, `mdns`, `rsd` och den
-installationstjänst som testet faktiskt kräver. Lås fortsatt exakt version och
-lägg protokollanrop bakom egna adapters.
+Do not enable the complete `full` feature. After the spike, enable only the
+smallest verified feature set, likely `remote_pairing`, `mdns`, `rsd`, and the
+installation service the test requires. Keep the exact version pinned and hide
+protocol calls behind internal adapters.
 
-### mDNS-publicering
+### mDNS publication
 
-Spiken jämför två alternativ på målhosten:
+The spike compares:
 
-1. in-process DNS-SD med en liten Rust-library;
-2. Avahi över en begränsad, typad integration.
+1. in-process DNS-SD through a small Rust library;
+2. Avahi through a limited, typed integration.
 
-Välj den lösning som samtidigt kan:
+Choose a solution that coexists with `avahi-daemon`, publishes correct TXT
+records and IPv4/IPv6 addresses, stops deterministically, works with systemd
+hardening, and can be tested without constructing shell commands.
 
-- samexistera med `avahi-daemon`;
-- publicera korrekta TXT-records och IPv4/IPv6-adresser;
-- stoppas deterministiskt;
-- fungera med systemd-härdningen;
-- testas utan att bygga kommandosträngar eller använda ett shell.
+Use a fixed, configurable high TCP port so the firewall rule remains narrow.
+Listen only during an active session and reject routed WAN interfaces by default.
 
-Använd en fast konfigurerbar hög TCP-port så att brandväggsregeln kan vara smal.
-Porten ska bara lyssna under en aktiv session. Tillåt inte pairing över routade
-WAN-interface som standard.
+### Persistent secrets
 
-### Hemligheter som måste bestå
+- `RpPairingFile` for each wirelessly paired phone;
+- the host's stable RemotePairing identifier;
+- the host `altIRK`; and
+- the master key for encryption and UDID HMAC.
 
-- `RpPairingFile` för varje trådlöst parad telefon;
-- värdens stabila RemotePairing-identifierare;
-- värdens `altIRK`;
-- master key för kryptering och UDID-HMAC.
+Store this material encrypted with AEAD, owned by root or the service user, and
+mode `0600`, using separate key domains. Include it in backups only as an
+explicitly sensitive encrypted component. **Unpair** removes local pairing
+state and marks that device revoked without deleting any other phone's records.
 
-Lagra materialet som root/service-user-ägt `0600`, krypterat med AEAD och med
-separata nyckeldomäner. Ta med det i backup endast som en uttryckligt känslig,
-krypterad del. **Unpair** ska ta bort lokal pairing state och markera enheten
-revoked; det ska aldrig radera andra telefoners records.
+### Mandatory transport gate after pairing
 
-### Obligatorisk transportgrind efter pairing
+RemotePairing success does not prove IPA installation. The spike must determine
+which path works on iOS 27.
 
-RemotePairing-success är inte samma sak som bevisad IPA-installation. Spiken ska
-avgöra vilken av följande vägar som fungerar på iOS 27:
+#### Path A: classic Lockdown becomes available
 
-#### Väg A: klassisk Lockdown blir tillgänglig
+- The phone appears as a trusted `_apple-mobdev2._tcp`/`netmuxd` device.
+- A Lockdown session starts without USB.
+- The refactored existing installation adapter works.
 
-- Telefonen dyker upp som betrodd `_apple-mobdev2._tcp`/`netmuxd`-enhet.
-- En Lockdown-session kan startas utan USB.
-- Befintlig install-adapter kan användas efter refaktoreringen.
+This is the smallest and preferred product path when proven.
 
-Detta är den minsta och föredragna produktvägen om den kan bevisas.
+#### Path B: a separate RemotePairing/RSD transport is required
 
-#### Väg B: separat RemotePairing/RSD-transport krävs
+- Discover the phone's `_remotepairing._tcp` advertisement.
+- Cryptographically match it to the saved RemotePairing identity.
+- Establish a trusted userspace or system tunnel.
+- Read device information through RSD.
+- Install the signed IPA through a verified RSD/CoreDevice service.
 
-- Upptäck telefonens `_remotepairing._tcp`-annons.
-- Matcha annonsen kryptografiskt mot sparad RemotePairing-identitet.
-- Etablera en betrodd userspace- eller systemtunnel.
-- Läs enhetsinfo via RSD.
-- Installera den redan signerade IPA:n via verifierad RSD/CoreDevice-
-  installationstjänst.
+If path B is required, implement it as `RsdDeviceTransport`; never smuggle a
+tunnel address into `TcpProvider`. If RSD installation cannot be proven,
+wireless pairing remains a lab feature even if the pairing dialog works.
 
-Om väg B krävs ska den implementeras som `RsdDeviceTransport`; den får inte
-smuggla in en tunneladress i `TcpProvider`. Om installation via RSD inte kan
-bevisas ska trådlös pairing förbli labbfunktion, även om själva pairing-dialogen
-fungerar.
+## API proposal
 
-## API-förslag
-
-### Enheter
+### Devices
 
 `GET /api/devices`
 
@@ -332,7 +318,7 @@ fungerar.
 [
   {
     "id": "019...",
-    "displayName": "Min iPhone",
+    "displayName": "My iPhone",
     "productType": "iPhone17,1",
     "iosVersion": "27.0",
     "status": "online",
@@ -344,20 +330,21 @@ fungerar.
 ]
 ```
 
-Statusvärden ska vara stabila produktbegrepp: `online`, `offline`,
-`trustRequired`, `pairing`, `unsupported` och `revoked`. Råa Apple-/biblioteksfel
-ska inte bli API-kontrakt.
+Stable product states are `online`, `offline`, `trustRequired`, `pairing`,
+`unsupported`, and `revoked`. Raw Apple or library errors must not become the
+API contract.
 
-`POST /api/devices/rescan` begär en omedelbar resync men väntar inte på alla
-telefoner. Normalt behövs den inte eftersom registry kör i bakgrunden.
+`POST /api/devices/rescan` requests an immediate resynchronization without
+waiting for every phone. It should rarely be needed because the registry runs
+in the background.
 
-### Pairing-sessioner
+### Pairing sessions
 
-- `POST /api/pairing-sessions` med `{ "mode": "wireless" }`.
-- `GET /api/pairing-sessions/{id}` för polling i första UI-versionen.
-- `DELETE /api/pairing-sessions/{id}` för avbrott.
+- `POST /api/pairing-sessions` with `{ "mode": "wireless" }`.
+- `GET /api/pairing-sessions/{id}` for initial UI polling.
+- `DELETE /api/pairing-sessions/{id}` to cancel.
 
-Exempelstatus:
+Example status:
 
 ```json
 {
@@ -365,272 +352,201 @@ Exempelstatus:
   "phase": "awaitingDevice",
   "expiresAt": "2026-08-12T10:20:00Z",
   "setupCode": null,
-  "publicMessage": "Öppna parkoppling på din iPhone."
+  "publicMessage": "Open pairing on your iPhone."
 }
 ```
 
-När telefonen har anslutit blir fasen `awaitingCodeEntry` och `setupCode` visas
-endast i den autentiserade sessionen. Slutfaser: `verifyingTransport`, `ready`,
-`failed`, `cancelled`, `expired`.
+When the phone connects, the phase becomes `awaitingCodeEntry` and `setupCode`
+is shown only in the authenticated session. Final phases are
+`verifyingTransport`, `ready`, `failed`, `cancelled`, and `expired`.
 
-## UI-plan
+## UI plan
 
-Ersätt dagens enkla select-lista med ett enhetskort eller en rikare select:
+Replace the simple device select with device cards or a richer select showing:
 
-- namn, modell och iOS-version;
-- grön **Online via Wi-Fi** eller grå **Senast sedd ...**;
-- disabled Install-knapp om `installEligible` är false;
-- **Sök igen** för manuell resync;
-- **Lägg till iPhone** med valen USB och, när feature flag är på, trådlöst;
-- en stegvis pairingdialog med nedräkning, PIN och Cancel;
-- en tydlig experimentetikett för iOS 27 tills hårdvarumatrisen är godkänd;
-- ingen visning av rått UDID, IP, HostID eller pairing-filens sökväg.
+- name, model, and iOS version;
+- green **Online via Wi-Fi** or gray **Last seen ...** status;
+- a disabled Install button when `installEligible` is false;
+- **Scan again** for manual resynchronization;
+- **Add iPhone**, with USB and feature-flagged wireless options;
+- a step-by-step pairing dialog with countdown, PIN, and Cancel;
+- a clear experimental label for iOS 27 until the hardware matrix passes; and
+- no raw UDID, IP, HostID, or pairing-file path.
 
-UI:t ska hantera tomma tillstånd separat:
+Handle these empty states separately: no known devices, known devices offline,
+Bonjour available but trust missing, `netmuxd` unavailable, phone visible only
+through USB, and iOS version without wireless first-pairing support.
 
-- inga tidigare kända enheter;
-- kända men offline;
-- Bonjour fungerar men trust saknas;
-- `netmuxd` är nere;
-- telefon hittad endast via USB;
-- iOS-version stöder inte trådlös första pairing.
+## Security
 
-## Säkerhet
+- Start pairing only through an explicit administrator action.
+- Keep the API bound to localhost behind the existing TLS proxy.
+- Make the pairing port temporary, protocol-specific, and fail-safe.
+- Cryptographically verify device identity before trust and every reconnect;
+  never treat names or IP addresses as identity.
+- Encrypt pairing state at rest and decrypt it only in memory.
+- Log internal device ID and phase, never UDID, certificates, `altIRK`, PIN,
+  pairing plist, or complete TXT records.
+- Limit pairing attempts, session duration, and concurrency.
+- Never interpolate user values into shell commands.
+- Let `GET /healthz` report component health without listing devices or
+  sensitive status.
+- Verify backup and restore permissions and support restoring one phone without
+  printing pairing material.
 
-- Pairing startas endast genom explicit administratörsåtgärd.
-- API:t förblir bundet till localhost/TLS-proxy enligt befintlig modell.
-- Pairing-porten är tillfällig, protokollspecifik och stängs fail-safe.
-- Enhetens identitet måste verifieras kryptografiskt före trust och före varje
-  återanslutning; namn och IP är aldrig identitet.
-- Pairing state krypteras i vila och dekrypteras endast i minnet.
-- Logga internt device-ID och fas, aldrig UDID, certifikat, `altIRK`, PIN,
-  pairing plist eller fulla TXT-records.
-- Begränsa pairingförsök, sessionstid och samtidighet.
-- Inga användarvärden får interpoleras i shellkommandon.
-- `GET /healthz` får bara ange att discovery-komponenten fungerar, inte lista
-  enheter eller känslig status.
-- Backup/restore ska verifiera filrättigheter och kunna återställa en telefon i
-  taget utan att skriva ut pairingmaterial.
+## Operations and configuration
 
-## Drift- och konfigurationsändringar
+After automatic discovery is implemented:
 
-När automatisk discovery är införd:
-
-- lägg till `IPHONELOADLY_MUX_SOCKET=/run/iphoneloadly/mux.sock`;
-- ta bort produktkravet på `IPHONELOADLY_DEVICE_IP`;
-- ta bort produktkravet på `IPHONELOADLY_DEVICE_ID`;
-- ta bort API-tjänstens `ExecStartPre` för en specifik pairing-fil;
-- behåll `/var/lib/lockdown` på hosten och `netmuxd` som enda normala läsare;
-- ge API-användaren åtkomst endast till den dedikerade mux-katalogen;
-- kör API:t som en dedikerad användare i stället för root när pairing-/socket-
-  rättigheterna är lösta;
-- lägg readiness för mux/discovery i doctor och diagnostics;
-- dokumentera mDNS över VLAN, AP client isolation, IPv6 och brandvägg för
-  pairing-porten.
+- add `IPHONELOADLY_MUX_SOCKET=/run/iphoneloadly/mux.sock`;
+- remove production requirements for `IPHONELOADLY_DEVICE_IP` and
+  `IPHONELOADLY_DEVICE_ID`;
+- remove the API service `ExecStartPre` check for one pairing file;
+- keep `/var/lib/lockdown` on the host and make `netmuxd` its normal reader;
+- give the API user access only to the dedicated mux directory;
+- run the API as a dedicated user after pairing/socket permissions are solved;
+- add mux/discovery readiness to doctor and diagnostics; and
+- document mDNS across VLANs, AP client isolation, IPv6, and pairing-port
+  firewall requirements.
 
 Feature flags:
 
 ```text
 IPHONELOADLY_WIRELESS_PAIRING=off|experimental|on
-IPHONELOADLY_PAIRING_PORT=<fast hög port>
-IPHONELOADLY_PAIRING_INTERFACE=<tomt eller explicit LAN-interface>
+IPHONELOADLY_PAIRING_PORT=<fixed high port>
+IPHONELOADLY_PAIRING_INTERFACE=<empty or explicit LAN interface>
 ```
 
-`on` tillåts först efter att produktionsgrinden är godkänd. Okänd eller saknad
-konfiguration ska bete sig som `off`.
+Allow `on` only after the production gate. Unknown or missing configuration
+must behave as `off`.
 
-## Genomförandefaser
+## Delivery phases
 
-### Fas 0 – baslinje och adaptergränser
+### Phase 0: baseline and adapter boundaries
 
-Arbete:
+- Move device types and traits into separate modules.
+- Introduce `DeviceId` around the internal UUID and private `AppleUdid` type.
+- Move installation from `AppleSigningProvider` to the transport layer.
+- Add `FakeDeviceDiscovery`, `FakeDeviceTransport`, versioned SQLite migrations,
+  a `devices` table, and a regression test for current one-phone installation.
 
-- lägg enhetstyper och traits i egna moduler;
-- inför `DeviceId` som wrapper runt internt UUID och `AppleUdid` som privat
-  strängtyp;
-- flytta installation från `AppleSigningProvider` till transportlagret;
-- skapa `FakeDeviceDiscovery` och `FakeDeviceTransport`;
-- lägg SQLite-migrationsmekanism och `devices`-tabell;
-- skriv regressionstest för dagens en-telefon-installation.
+Acceptance: existing Wi-Fi installation is unchanged, Apple UDIDs are never
+parsed as UUIDs, and tests simulate multiple devices without hardware.
 
-Acceptans:
+### Phase 1: discover previously paired phones automatically
 
-- befintlig Wi-Fi-installation fungerar oförändrat;
-- ett Apple-UDID behöver aldrig parsas som `Uuid`;
-- tester kan simulera flera enheter utan hårdvara.
+- Implement `NetmuxDiscovery` against the dedicated socket.
+- Filter strictly for network connections.
+- Add registry cache, timeouts, resync, reconnect, bounded parallel metadata
+  queries, stable internal IDs, and persisted snapshots.
+- Replace environment-variable transport in production startup while keeping
+  fixed TCP configuration only for tests and diagnostics.
 
-Storlek: medel. Risk: medel, eftersom signering/install delas.
+Acceptance: two paired phones appear automatically; no IP or UDID is entered;
+DHCP changes, reconnect, sleep/wake, `netmuxd` restart, and host reboot require
+no reconfiguration; USB-only devices cannot be selected for installation.
 
-### Fas 1 – automatisk upptäckt av redan parade telefoner
+### Phase 2: multiple devices, API, and UI
 
-Arbete:
+- Extend `/api/devices` with status and capabilities.
+- Add `/rescan`, offline history, device-aware empty states, and fresh device
+  resolution at job start.
+- Limit active jobs per device and globally.
+- Make refresh skip offline devices with clear, redacted diagnostics.
 
-- implementera `NetmuxDiscovery` mot den dedikerade socketen;
-- filtrera strikt på network connection;
-- lägg registry-cache, timeouts, resync och reconnect;
-- hämta enhetsmetadata parallellt med begränsad samtidighet;
-- mappa till stabila interna ID:n och spara snapshots;
-- ersätt miljövariabeltransporten i produktionsstarten;
-- behåll fast TCP-konfiguration endast i test/diagnostik.
+Acceptance: jobs always target the correct phone during simultaneous connection
+changes, offline devices cannot start jobs, and no raw identifiers reach API/UI.
 
-Acceptans:
+### Phase 3: simplified USB onboarding
 
-- två redan parade telefoner visas automatiskt;
-- ingen IP eller UDID skrivs in;
-- DHCP-byte, Wi-Fi reconnect, telefon sleep/wake, `netmuxd`-restart och host-
-  reboot kräver inte ny konfiguration;
-- USB-only-enheter kan inte väljas för installation.
+- Remove manual UDID/IP prompts from the installer.
+- Identify the newly attached USB device unambiguously.
+- Pair, validate, enable Wi-Fi, require USB disconnection, and approve onboarding
+  only after a successful network query through the mux socket.
+- Require explicit selection when multiple USB devices are connected.
 
-Storlek: medel. Risk: låg–medel.
+Acceptance: a new iPhone is onboarded without copying UDID/IP, missed trust
+approval has a concrete recovery path, and pairing records never appear in the
+terminal.
 
-### Fas 2 – flera enheter, API och UI
+### Phase 4: iOS 27 hardware spike
 
-Arbete:
+Build a separate test binary before integrating with the web API. In order:
 
-- utöka `/api/devices` med status och capabilities;
-- lägg `/rescan` och offlinehistorik;
-- uppdatera dashboarden med enhetsstatus och tomma tillstånd;
-- slå upp vald enhet på nytt vid jobbstart;
-- lägg ett aktivt jobb per enhet och separat global begränsning;
-- gör refresh tolerant mot att en telefon är offline.
+1. advertise a pairable host with stable identity;
+2. prove iPhone discovery on a Debian LAN;
+3. complete PIN and trust;
+4. reuse the RemotePairing record after process and host restart;
+5. read name, UDID, and iOS version over trusted wireless transport;
+6. determine installation path A or B;
+7. sign and install a safe test IPA with USB physically disconnected;
+8. repeat after sleep/wake, Wi-Fi change, and reboot;
+9. test unpair and rejected/incorrect PIN; and
+10. record model, exact iOS build, network, dependency commit, and log code.
 
-Acceptans:
+Go only when the complete trust and installation chain works without USB on at
+least two iPhone models and two iOS 27 builds, survives restart without a new
+PIN, leaks no secrets, and uses reproducibly pinned upstream APIs. A no-go stops
+phase 5 but does not block phases 1–3.
 
-- jobb hamnar alltid på rätt telefon efter samtidiga connect/disconnect;
-- offlineenhet skapar inte ett installjobb;
-- refresh hoppar över offlineenheter med tydlig, redigerad diagnos;
-- inga råa identifierare visas i UI eller API.
+### Phase 5: experimental wireless pairing in the product
 
-Storlek: medel. Risk: medel.
+- Implement `PairingCoordinator`, time-limited mDNS, and pairing port.
+- Add encrypted secret storage, pairing-session API/UI, verified Lockdown or RSD
+  transport, cancel, timeout, rate limiting, cleanup, and unpair.
+- Keep the feature behind `experimental`.
 
-### Fas 3 – förenklad USB-onboarding
+Acceptance: browser-to-iPhone onboarding works without terminal or cable;
+cancellation leaves no port, advertisement, or partial state; unverified
+transports are not installable; and USB fallback always remains available.
 
-Arbete:
+### Phase 6: hardening and general enablement
 
-- ersätt manuell UDID/IP-fråga i installskriptet;
-- identifiera den nyanslutna USB-enheten entydigt;
-- para, validera och aktivera Wi-Fi;
-- kräva att USB kopplas ur;
-- godkänn först efter lyckad nätverksfråga via mux-socketen;
-- hantera fler än en ansluten USB-enhet genom explicit val, inte “första”.
+- Run the complete hardware matrix and long soak tests.
+- Fuzz/property-test mDNS TXT and pairing-message parsing.
+- Threat-model the LAN listener and secret store.
+- Verify backup/restore, unpair, and iOS upgrades.
+- Update installer, systemd, doctor, diagnostics, and user documentation.
+- Move LAN pairing to a host agent before containerization if necessary.
 
-Acceptans:
+Acceptance: at least 30 days of automatic reconnect/refresh tests without
+manual re-pairing; upgrade and rollback preserve USB-paired devices; security
+and log-redaction tests pass; support matrix and limitations are published.
 
-- en ny iPhone kan onboardas utan att användaren kopierar UDID eller IP;
-- ett missat Trust-godkännande ger en konkret återställningsväg;
-- pairing records visas aldrig i terminalen.
+## Test strategy
 
-Storlek: liten–medel. Risk: låg.
+### Unit and integration tests without phones
 
-### Fas 4 – iOS 27 hårdvaruspike
+- mux lists containing zero, one, or several network/USB devices;
+- duplicate entries for the same UDID;
+- device disappearance between listing and job start;
+- malformed and non-UUID Apple UDIDs;
+- timeout or broken pairing record for one of several phones;
+- disappearing and returning `netmuxd` socket;
+- stable internal ID mapping after restart;
+- no IP, UDID, PIN, or keys in serialized API errors or logs;
+- pairing state machine success, reject, timeout, cancel, and process stop;
+- migration and rollback with an existing database; and
+- refresh against online and offline targets.
 
-Spiken görs i ett separat testbinär först, inte i webb-API:t.
+### Hardware matrix
 
-Testordning:
+- one older iPhone on iOS 26 or earlier for USB onboarding and auto-discovery;
+- at least two iOS 27 models for wireless pairing;
+- a typical home network and a VLAN/mDNS-reflector network;
+- IPv4, IPv6, and dual stack;
+- AP client isolation as a negative test;
+- locked, unlocked, sleeping, and rebooted phone states;
+- host reboot, `netmuxd` restart, and DHCP lease change;
+- two phones online simultaneously; and
+- wrong PIN, rejected trust, timeout, and explicit unpair.
 
-1. annonsera pairable host med stabil identitet;
-2. bevisa att iPhone hittar hosten på Debian-LAN;
-3. genomför PIN och trust;
-4. spara och återanvänd RemotePairing record efter process- och host-restart;
-5. läs namn, UDID och iOS-version över betrodd trådlös transport;
-6. avgör väg A eller B för installation;
-7. signera en säker test-IPA och installera med USB fysiskt frånkopplad;
-8. upprepa efter telefon sleep/wake, Wi-Fi-byte och reboot;
-9. testa unpair och nekad/felaktig PIN;
-10. dokumentera modell, exakt iOS-build, nätverk, dependency-commit och loggkod.
+Record exact iOS build, model, Debian version, `idevice`/`netmuxd` versions, and
+transport path while redacting UDIDs and pairing material.
 
-Go-kriterium:
+## Observability and error model
 
-- hela trust- och installationskedjan fungerar utan USB på minst två iPhone-
-  modeller och två iOS 27-builds;
-- den överlever omstart utan ny PIN;
-- ingen hemlighet hamnar i loggar eller processargument;
-- upstream-API:t kan pinnas reproducerbart.
-
-No-go betyder att fas 5 inte byggs. Fas 1–3 levereras ändå.
-
-Storlek: medel som spike. Risk: hög och hårdvaruberoende.
-
-### Fas 5 – experimentell trådlös pairing i produkten
-
-Arbete:
-
-- implementera `PairingCoordinator`;
-- publicera tidsbegränsad mDNS och öppna pairing-port;
-- lägg krypterad secret store;
-- lägg pairing-session-API och UI-dialog;
-- implementera verifierad Lockdown- eller RSD-adapter från fas 4;
-- lägg cancel, timeout, rate limiting, cleanup och unpair;
-- håll allt bakom `experimental`.
-
-Acceptans:
-
-- komplett browser-till-iPhone-onboarding utan terminal eller kabel;
-- avbruten session lämnar ingen port, annons eller halv pairing state;
-- om installationstransporten inte verifieras visas enheten inte som
-  installerbar;
-- USB-fallbacken är alltid tillgänglig.
-
-Storlek: stor. Risk: hög.
-
-### Fas 6 – härdning och generell aktivering
-
-Arbete:
-
-- kör full hårdvarumatris och längre soak-test;
-- fuzz/property-testa parsing av mDNS TXT och pairingmeddelanden;
-- threat-model-review av LAN-lyssnaren och secret store;
-- verifiera backup/restore, unpair och ny iOS-uppgradering;
-- uppdatera installer, systemd, doctor, diagnostics och användardokumentation;
-- flytta LAN-pairing till host-agent innan containerisering om det behövs;
-- ändra feature flag från `experimental` till `on` först efter release gate.
-
-Acceptans:
-
-- minst 30 dagars automatiska reconnect/refresh-tester utan manuell re-pair;
-- uppgradering och rollback bevarar befintliga USB-parade enheter;
-- säkerhets- och loggredigeringstester passerar;
-- supportmatris och kända begränsningar är publicerade.
-
-Storlek: medel–stor. Risk: medel.
-
-## Teststrategi
-
-### Enhets- och integrationstester utan telefon
-
-- mux-lista med noll, en och flera network/USB-enheter;
-- dubbla poster för samma UDID;
-- enhet försvinner mellan listning och jobbstart;
-- felaktigt och icke-UUID-format Apple-UDID;
-- timeout och trasig pairing record för en av flera telefoner;
-- `netmuxd` socket försvinner och kommer tillbaka;
-- stabil intern ID-mappning efter omstart;
-- inga IP/UDID/PIN/nycklar i serialiserade API-fel eller loggar;
-- pairing state machine för success, reject, timeout, cancel och process-stop;
-- migrations- och rollbacktest med befintlig databas;
-- refresh mot online och offline targets.
-
-### Hårdvarumatris
-
-Minsta matris:
-
-- en äldre iPhone/iOS 26 eller äldre, USB-onboarding + auto-discovery;
-- minst två modeller med iOS 27 för trådlös pairing;
-- ett vanligt hemnät och ett nät med separat VLAN/mDNS-reflector;
-- IPv4, IPv6 och dual stack;
-- AP client isolation som negativt test;
-- telefon låst, upplåst, sovande och efter reboot;
-- host reboot, `netmuxd` restart och DHCP lease-byte;
-- två telefoner online samtidigt;
-- fel PIN, nekat trust, session timeout och explicit unpair.
-
-Varje testprotokoll ska ange exakt iOS-build, modell, Debian-version,
-`idevice`/`netmuxd`-version och vald transportväg, men redigera UDID och
-pairingmaterial.
-
-## Observability och felmodell
-
-Stabila diagnostikkoder:
+Stable diagnostic codes:
 
 - `discovery_mux_unavailable`
 - `discovery_no_network_devices`
@@ -644,83 +560,73 @@ Stabila diagnostikkoder:
 - `pairing_transport_unverified`
 - `install_transport_unavailable`
 
-Loggfält: request/job/session ID, internt device-ID, fas, varaktighet och kod.
-Logga inte råa upstream-fel förrän de passerat typad redigering.
+Log request/job/session ID, internal device ID, phase, duration, and code. Do not
+log raw upstream errors until typed redaction has processed them.
 
-Doctor ska separat kontrollera:
+Doctor checks mux socket and `netmuxd`, Avahi/mDNS, anonymous network-device
+count, targeted Lockdown query by internal ID, feature flag and pairing port,
+secret-store permissions, and that no pairing advertisement exists without an
+active session.
 
-- mux-socket och `netmuxd`;
-- Avahi/mDNS;
-- antal network-enheter utan identifierare;
-- Lockdown-fråga för uttryckligen valt internt device-ID;
-- feature flag och pairing-portens konfiguration;
-- secret-store-rättigheter;
-- att ingen pairingannons finns när ingen session är aktiv.
+## Migration and rollback
 
-## Migrering och rollback
+1. Ship database and adapter refactoring without removing legacy variables.
+2. Prefer new discovery when healthy; allow an explicit legacy flag for one
+   transition release.
+3. Import the configured phone on its first successful network discovery.
+4. Remove IP/UDID/pairing-file inputs from the default installer only after the
+   phase 1 hardware gate.
+5. Preserve pairing records during rollback and keep initial migrations additive.
+6. Keep iOS 27 wireless pairing off by default and independently disableable.
 
-1. Leverera databas- och adapterrefaktoreringen utan att ta bort gamla env-vars.
-2. Om nya discovery fungerar används den primärt; gammal konfiguration kan
-   aktiveras med en explicit legacy-flag under en övergångsrelease.
-3. Importera den konfigurerade telefonen till `devices` vid första lyckade
-   nätverksupptäckt.
-4. Ta bort IP/UDID/pairing-file från standardinstallern först efter fas 1:s
-   hårdvarugrind.
-5. Behåll pairing records vid rollback. Databasmigrationer ska vara additiva i
-   första releasen.
-6. Trådlös iOS 27-pairing är av som standard och kan stängas av utan att påverka
-   redan USB-parade telefoner.
+## Main risks
 
-## Viktigaste riskerna
-
-| Risk | Konsekvens | Motåtgärd |
+| Risk | Impact | Mitigation |
 |---|---|---|
-| RemotePairing ger inte en transport som nuvarande installer kan använda | Pairing lyckas men IPA kan inte installeras | Fas 4 kräver verklig installation; separat RSD-adapter vid behov |
-| Privat Apple-protokoll ändras mellan iOS-builds | Onboarding eller reconnect slutar fungera | Exakt pinning, adaptergräns, hårdvarumatris och feature flag |
-| mDNS blockeras av VLAN/AP | Telefoner hittas inte | Tydlig doctor, dokumenterad reflector/brandvägg, ingen subnätsskanning |
-| Sovande telefon ger långsamma API-anrop | Dashboard och refresh hänger | Cache, kort timeout, bounded concurrency och offline-status |
-| Fel telefon väljs efter nätverksbyte | Installation på fel mål | Kryptografisk/UDID-baserad identitet och resolve precis före jobb |
-| Pairing endpoint exponeras på LAN | Angreppsyta och DoS | Explicit femminuterssession, rate limit, en klient och fail-safe cleanup |
-| Pairing state eller UDID läcker | Bestående enhetsåtkomst exponeras | AEAD, 0600, typad redigering och inga generiska debug-dumpar |
-| Upstream `idevice` bryter API före 0.2 | Bygg- eller runtimefel | Exakt version/commit och intern adapter med kontraktstester |
+| RemotePairing does not provide a transport usable by the installer | Pairing succeeds but IPA installation fails | Phase 4 requires a real installation; add a separate RSD adapter if needed |
+| Private Apple protocol changes between iOS builds | Onboarding or reconnect breaks | Exact pinning, adapter boundary, hardware matrix, and feature flag |
+| VLAN/AP blocks mDNS | Phones are not found | Clear doctor output, documented reflector/firewall, no subnet scan |
+| Sleeping phone causes slow API calls | Dashboard and refresh stall | Cache, short timeout, bounded concurrency, and offline status |
+| Wrong phone selected after a network change | Installation targets the wrong device | Cryptographic/UDID identity and resolution immediately before jobs |
+| Pairing endpoint exposed on LAN | Attack surface and denial of service | Explicit five-minute session, rate limit, one client, fail-safe cleanup |
+| Pairing state or UDID leaks | Persistent device access is exposed | AEAD, mode `0600`, typed redaction, no generic debug dumps |
+| Pre-0.2 upstream `idevice` API breaks | Build or runtime failure | Exact version/commit and contract-tested internal adapter |
 
 ## Definition of done
 
-### Automatisk upptäckt
+### Automatic discovery
 
-- Ingen produktionskonfiguration innehåller fast iPhone-IP.
-- Ingen användare behöver kopiera UDID.
-- Alla betrodda Wi-Fi-enheter visas och uppdateras automatiskt.
-- Flera telefoner, DHCP-byte, sleep/wake och daemon/host-restart är testade.
-- Install och refresh verifierar `Network` vid jobbstart.
-- Råa identifierare och pairing records exponeras inte.
+- Production configuration has no fixed iPhone IP.
+- Users never copy UDIDs.
+- Every trusted Wi-Fi device appears and updates automatically.
+- Multiple phones, DHCP changes, sleep/wake, and daemon/host restarts are tested.
+- Installation and refresh verify `Network` at job start.
+- Raw identifiers and pairing records are never exposed.
 
-### Trådlös iOS 27-parkoppling
+### Wireless iOS 27 pairing
 
-- Pairing initieras och godkänns helt utan USB.
-- Pairing state överlever kontrollerad omstart och kan tas bort med unpair.
-- Enheten återupptäcks och autentiseras utan ny PIN.
-- En riktig, säker test-IPA kan signeras och installeras över Wi-Fi.
-- Negativa tester lämnar ingen lyssnande port eller halv pairing state.
-- Funktionen kan stängas av omedelbart utan att påverka den stabila USB-
-  fallbacken.
+- Pairing starts and completes without USB.
+- Pairing state survives controlled restart and supports unpair.
+- The device is rediscovered and authenticated without a new PIN.
+- A real safe test IPA is signed and installed over Wi-Fi.
+- Negative tests leave no listener or partial pairing state.
+- The feature can be disabled immediately without affecting USB fallback.
 
-## Rekommenderad första leverans
+## Recommended first delivery
 
-Börja med fas 0–3 som en sammanhängande release: dynamisk `netmuxd`-upptäckt,
-flera telefoner och USB-onboarding utan manuell IP/UDID. Det ger den största
-användarvinsten med lägst protokollrisk.
+Deliver phases 0–3 together: dynamic `netmuxd` discovery, multiple phones, and
+USB onboarding without manual IP/UDID. This provides the largest user benefit
+with the lowest protocol risk.
 
-Kör därefter fas 4 som en isolerad iOS 27-spike. Ta inte in trådlös pairing i
-dashboarden förrän samma pairing record har lett till en verklig IPA-
-installation med USB fysiskt frånkopplad.
+Then run phase 4 as an isolated iOS 27 spike. Do not expose wireless pairing in
+the dashboard until the same pairing record has produced a real IPA installation
+with USB physically disconnected.
 
-## Referenser
+## References
 
 - Apple: [Managing your simulated and physical devices in Device Hub](https://developer.apple.com/documentation/xcode/pairing-your-devices-with-your-mac)
 - `pymobiledevice3`: [iOS 17+ tunnels](https://github.com/doronz88/pymobiledevice3/blob/master/docs/guides/ios17-tunnels.md)
-- `idevice` 0.1.65 i lokal Cargo-cache: `remote_pairing::PairableHost`,
-  `PairableHostInfo`, `RpPairingFile`, `mdns` och `usbmuxd`.
-- Befintlig hostdesign: [architecture-assessment.md](architecture-assessment.md)
-- Befintlig leveransplan: [mvp-v0.1-plan.md](mvp-v0.1-plan.md)
-
+- Pinned `idevice` 0.1.65: `remote_pairing::PairableHost`,
+  `PairableHostInfo`, `RpPairingFile`, `mdns`, and `usbmuxd`
+- Existing host design: [architecture-assessment.md](architecture-assessment.md)
+- Existing delivery plan: [mvp-v0.1-plan.md](mvp-v0.1-plan.md)

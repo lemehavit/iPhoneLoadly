@@ -13,7 +13,7 @@ Semantic Versioning while remaining experimental alpha software.
   active LAN address.
 - Optional helper for creating an iOS configuration profile containing only
   Caddy's public local root certificate.
-- Illustrated dashboard user guide with Swedish/English label references.
+- Illustrated English dashboard user guide with English UI screenshots.
 
 ### Changed
 
