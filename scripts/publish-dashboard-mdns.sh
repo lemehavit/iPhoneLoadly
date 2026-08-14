@@ -15,4 +15,7 @@ interface="$(ip -4 route show default | awk '$1 == "default" { for (i = 1; i <= 
 address="$(ip -o -4 addr show dev "${interface}" scope global up | awk 'NR == 1 { split($4, cidr, "/"); print cidr[1] }')"
 [[ -n "${address}" ]] || { echo "No global IPv4 address was found on ${interface} for dashboard mDNS." >&2; exit 1; }
 
-exec avahi-publish --address --no-fail "${dashboard_name}" "${address}"
+# Avahi already publishes the host's primary reverse record. This dashboard
+# name is an alias, so adding another reverse record for the same address would
+# fail with "Local name collision".
+exec avahi-publish --address --no-reverse --no-fail "${dashboard_name}" "${address}"
