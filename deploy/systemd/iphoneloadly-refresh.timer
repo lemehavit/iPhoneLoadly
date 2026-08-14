@@ -2,8 +2,9 @@
 Description=Retry due iPhoneLoadly IPA refreshes hourly
 
 [Timer]
-# A due app is at least six days old. Running hourly provides many bounded
-# opportunities to catch an iPhone that was asleep or temporarily off Wi-Fi.
+# A due app has reached the dashboard's configured refresh day (day 6 by
+# default). Running hourly provides bounded opportunities to catch an iPhone
+# that was asleep or temporarily off Wi-Fi.
 OnCalendar=hourly
 Persistent=true
 RandomizedDelaySec=10m

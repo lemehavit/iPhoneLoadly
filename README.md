@@ -23,7 +23,7 @@ iPhone from a Debian server.
 - Responsive Swedish/English browser dashboard with installation progress,
   history, signing validity and managed-app/device overview
 - IPA upload validation, SHA-256 inspection, and signing/install job tracking
-- Hourly retry check for apps whose last successful install is about six days old
+- Configurable automatic refresh on day 1–6 after the latest successful install, checked hourly
 - Optional encrypted Apple credential storage for sign-in restoration
 - Systemd deployment, host diagnostics, backup, and recovery tools
 
@@ -36,8 +36,9 @@ iPhone from a Debian server.
 5. You sign into Apple through the local dashboard and complete 2FA when asked.
 6. iPhoneLoadly discovers trusted iPhones on Wi-Fi, then signs and installs an
    uploaded IPA for the selected phone.
-7. Its systemd timer checks whether a successful installation is about six days old
-   and queues a refresh when the Apple signing session and phone are available.
+7. Its systemd timer checks hourly whether an installation has reached the
+   dashboard's configured refresh day (day 6 by default) and queues a refresh
+   when the Apple signing session and phone are available.
 
 An Apple ID is required because Apple provisioning, certificates, and device
 registration are part of signing. Passwords stay in memory unless the user

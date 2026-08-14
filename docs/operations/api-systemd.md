@@ -39,17 +39,19 @@ sudo journalctl -u iphoneloadly-api -f
 ## Automatic refresh retry timer
 
 The timer runs hourly with a random delay of up to ten minutes. It does not queue
-anything until an IPA/device pair is at least six days past its last successful
-installation. If the phone is asleep or unavailable, a later hourly run retries
-when it is reachable; the dashboard history records the outcome. After a restart,
-this requires Apple signing to be ready. A deliberately saved encrypted sign-in
-can restore it automatically, although Apple may still request 2FA.
+anything until an IPA/device pair reaches the automatic-refresh day configured
+in the dashboard. The supported range is day 1–6 and the default is day 6. If
+the phone is asleep or unavailable, a later hourly run retries when it is
+reachable; the dashboard history records the outcome. After a restart, this
+requires Apple signing to be ready. A deliberately saved encrypted sign-in can
+restore it automatically, although Apple may still request 2FA.
 
 The timer runs hourly, but only queues an IPA/device pair once its latest
-successful installation is at least six days old—about one day before the free
-Apple signing period expires. It skips a target that already has a queued or
-active job. Without encrypted credential storage, sign in again after restart;
-with it enabled, restoration is attempted automatically and may still need 2FA.
+successful installation reaches the configured day. Day 6 is about one day
+before the free Apple signing period normally expires. It skips a target that
+already has a queued or active job. Without encrypted credential storage, sign
+in again after restart; with it enabled, restoration is attempted automatically
+and may still need 2FA.
 
 ```bash
 sudo install -o root -g root -m 0644 deploy/systemd/iphoneloadly-refresh.service /etc/systemd/system/iphoneloadly-refresh.service

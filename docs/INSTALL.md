@@ -108,10 +108,11 @@ The job view shows signing progress and then the device-transfer phase. Use
 is no longer needed; it is unavailable while that IPA has an active installation
 or refresh job, and a removed IPA cannot be refreshed later.
 
-The refresh timer runs hourly with up to a 10-minute delay. It only queues a
-refresh for an app whose last successful install is at least six days old. If the
-phone is unavailable, a later hourly run retries automatically; use the History
-and diagnostics view to see each result.
+The refresh timer runs hourly with up to a 10-minute delay. The dashboard lets
+you choose automatic refresh on day 1–6 after the latest successful install;
+day 6 is the default and is recommended for refreshing about one day before a
+free signing normally expires. If the phone is unavailable, a later hourly run
+retries automatically; use the History and diagnostics view to see each result.
 
 The Overview shows remaining free-signing days for successful installations and
 lists only apps that iPhoneLoadly installed on the selected trusted iPhone.
@@ -214,9 +215,9 @@ curl --fail -X POST http://127.0.0.1:8080/api/refresh
 ```
 
 Refresh is not a guarantee: it needs Apple signing to be ready, a reachable
-phone, and an app whose last successful installation is six days old. A saved
-encrypted sign-in can restore the Apple login after restart, though Apple may
-still require 2FA.
+phone, and an app that has reached the configured automatic-refresh day. The
+setting is stored on the server and defaults to day 6. A saved encrypted sign-in
+can restore the Apple login after restart, though Apple may still require 2FA.
 
 ## Advanced paths
 
