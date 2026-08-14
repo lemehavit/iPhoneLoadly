@@ -5,7 +5,7 @@ iPhone from a Debian server.
 
 > Self-host IPA signing and installation for your iPhone, then check for refreshes over Wi-Fi before the typical 7-day free-signing period expires.
 
-[![Version](https://img.shields.io/badge/version-0.2.0--alpha.1-blue)](VERSION)
+[![Version](https://img.shields.io/badge/version-0.2.0--alpha.2-blue)](VERSION)
 [![Rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/lemehavit/iPhoneLoadly/actions/workflows/ci.yml/badge.svg)](https://github.com/lemehavit/iPhoneLoadly/actions/workflows/ci.yml)
@@ -47,6 +47,9 @@ persisted, and Apple may still request 2FA after a restart. Pairing records,
 uploaded IPAs, encrypted credentials, local keys and backups are sensitive data.
 
 ## Install iPhoneLoadly
+
+- [Illustrerad användarguide](docs/USER_GUIDE.md)
+- [Installationsguide](docs/INSTALL.md)
 
 Follow the single beginner path in [docs/INSTALL.md](docs/INSTALL.md). It starts
 with an empty Debian 13 host, uses a GitHub Release archive when one is available,

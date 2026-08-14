@@ -31,3 +31,12 @@ jobs:
       - run: find deploy/host deploy/release scripts -type f -name '*.sh' -exec bash -n {} +
       - run: bash deploy/release/build-release.sh
       - run: bash deploy/release/verify-release-package.sh
+      - name: Upload verified Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: iphoneloadly-linux-amd64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14

@@ -29,7 +29,7 @@ Expected checksum result:
 iphoneloadly-v<VERSION>-linux-amd64.tar.gz: OK
 ```
 
-The current alpha release is `v0.2.0-alpha.1`. If that release is unavailable,
+The current alpha package version is `v0.2.0-alpha.2`. If that release is unavailable,
 use the advanced source-build instructions in
 [from-scratch.md](operations/from-scratch.md); never substitute an unverified
 archive from another site.
@@ -221,6 +221,7 @@ can restore the Apple login after restart, though Apple may still require 2FA.
 
 ## Advanced paths
 
+- [Illustrated dashboard user guide](USER_GUIDE.md)
 - [Host and pairing details](operations/debian13-host-preparation.md)
 - [Systemd, backup, and recovery operations](operations/api-systemd.md)
 - [Secure Caddy LAN proxy](operations/caddy-lan.md)

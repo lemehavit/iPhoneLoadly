@@ -7,6 +7,15 @@ repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
 version="$(tr -d '[:space:]' < "${repo_root}/VERSION")"
 [[ -n "${version}" ]] || { echo "VERSION is empty." >&2; exit 1; }
 command -v cargo >/dev/null || { echo "Cargo is required." >&2; exit 1; }
+[[ "$(uname -s)" == "Linux" ]] || {
+  echo "Release packages must be built on Linux; use the CI artifact from the pull request." >&2
+  exit 1
+}
+[[ "$(uname -m)" == "x86_64" ]] || {
+  echo "Release packages currently support Linux x86_64/amd64 only." >&2
+  exit 1
+}
+cargo_target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 
 (cd "${repo_root}" && cargo build --locked --release -p iphoneloadly-api)
 
@@ -17,7 +26,7 @@ case "${release_dir}" in "${dist_root}"/*) ;; *) echo "Unsafe release directory.
 rm -rf -- "${release_dir}"
 mkdir -p "${release_dir}/bin" "${release_dir}/deploy/host" "${release_dir}/deploy/systemd" "${release_dir}/deploy/caddy" "${release_dir}/scripts" "${release_dir}/docs"
 
-install -m 0755 "${repo_root}/target/release/iphoneloadly-api" "${release_dir}/bin/iphoneloadly-api"
+install -m 0755 "${cargo_target_dir}/release/iphoneloadly-api" "${release_dir}/bin/iphoneloadly-api"
 install -m 0644 "${repo_root}/VERSION" "${release_dir}/VERSION"
 install -m 0644 "${repo_root}/README.md" "${release_dir}/README.md"
 install -m 0644 "${repo_root}/CHANGELOG.md" "${release_dir}/CHANGELOG.md"

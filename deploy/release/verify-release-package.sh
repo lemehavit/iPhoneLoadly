@@ -37,11 +37,27 @@ for required in \
   scripts/preflight-wifi.sh \
   scripts/backup-state.sh \
   scripts/restore-state.sh \
+  docs/USER_GUIDE.md \
+  docs/images/dashboard-overview.png \
+  docs/images/dashboard-workflow.png \
+  docs/images/dashboard-refresh-settings.png \
+  docs/images/dashboard-installation.png \
   docs/INSTALL.md \
   docs/operations/caddy-lan.md \
   docs/operations/api-systemd.md; do
   [[ -f "${package_dir}/${required}" ]] || { echo "Release archive is missing: ${required}" >&2; exit 1; }
 done
+
+if find "${package_dir}" -type f -name '*.exe' -print -quit | grep -q .; then
+  echo 'Release archive contains a Windows executable.' >&2
+  exit 1
+fi
+
+binary_magic="$(od -An -tx1 -N4 "${package_dir}/bin/iphoneloadly-api" | tr -d '[:space:]')"
+[[ "${binary_magic}" == "7f454c46" ]] || {
+  echo 'Release archive does not contain a Linux ELF executable.' >&2
+  exit 1
+}
 
 [[ "$(tr -d '[:space:]' < "${package_dir}/VERSION")" == "${version}" ]] \
   || { echo 'Release archive contains the wrong VERSION.' >&2; exit 1; }
