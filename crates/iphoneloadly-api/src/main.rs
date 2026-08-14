@@ -805,12 +805,10 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     };
-    let targets = match state
-        .database
-        .lock()
-        .map_err(|_| ())
-        .and_then(|database| store::refresh_due_targets(&database).map_err(|_| ()))
-    {
+    let targets = match state.database.lock().map_err(|_| ()).and_then(|database| {
+        let after_days = store::refresh_after_days(&database).map_err(|_| ())?;
+        store::refresh_due_targets(&database, after_days).map_err(|_| ())
+    }) {
         Ok(targets) => targets,
         Err(_) => {
             return (
@@ -983,14 +981,14 @@ async fn list_install_jobs(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn refresh_attention(State(state): State<AppState>) -> impl IntoResponse {
-    match state
-        .database
-        .lock()
-        .map_err(|_| ())
-        .and_then(|database| store::refresh_attention(&database).map_err(|_| ()))
-    {
-        Ok(items) => Json(serde_json::json!(
-            items
+    match state.database.lock().map_err(|_| ()).and_then(|database| {
+        let after_days = store::refresh_after_days(&database).map_err(|_| ())?;
+        let items = store::refresh_attention(&database, after_days).map_err(|_| ())?;
+        Ok((after_days, items))
+    }) {
+        Ok((after_days, items)) => Json(serde_json::json!({
+            "afterDays": after_days,
+            "items": items
                 .into_iter()
                 .map(|item| serde_json::json!({
                     "appId": item.app_id,
@@ -999,8 +997,57 @@ async fn refresh_attention(State(state): State<AppState>) -> impl IntoResponse {
                     "retryFailed": item.retry_failed,
                 }))
                 .collect::<Vec<_>>()
-        )),
+        })),
         Err(_) => Json(serde_json::json!({"message":"Unable to read refresh warnings."})),
+    }
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshSettings {
+    after_days: u8,
+}
+
+async fn get_refresh_settings(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::refresh_after_days(&database).map_err(|_| ()))
+    {
+        Ok(after_days) => (StatusCode::OK, Json(RefreshSettings { after_days })).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to read refresh settings."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_refresh_settings(
+    State(state): State<AppState>,
+    Json(settings): Json<RefreshSettings>,
+) -> impl IntoResponse {
+    if !(store::MIN_REFRESH_AFTER_DAYS..=store::MAX_REFRESH_AFTER_DAYS)
+        .contains(&settings.after_days)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"message":"Automatic refresh must be between day 1 and day 6."}),
+            ),
+        )
+            .into_response();
+    }
+    match state.database.lock().map_err(|_| ()).and_then(|database| {
+        store::set_refresh_after_days(&database, settings.after_days).map_err(|_| ())
+    }) {
+        Ok(()) => (StatusCode::OK, Json(settings)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to save refresh settings."})),
+        )
+            .into_response(),
     }
 }
 
@@ -1243,6 +1290,10 @@ async fn main() {
         .route("/api/install-jobs/{id}", get(get_install_job))
         .route("/api/refresh", post(trigger_refresh))
         .route("/api/refresh-attention", get(refresh_attention))
+        .route(
+            "/api/settings/refresh",
+            get(get_refresh_settings).put(update_refresh_settings),
+        )
         .route("/api/installation-validity", get(installation_validity))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
         .with_state(state);

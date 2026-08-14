@@ -1,0 +1,33 @@
+[Unit]
+Description=Publish iPhoneLoadly dashboard hostname over mDNS
+Documentation=https://github.com/lemehavit/iPhoneLoadly
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+Environment=IPHONELOADLY_DASHBOARD_NAME=iphoneloadly.local
+ExecStart=/usr/local/libexec/iphoneloadly/publish-dashboard-mdns.sh
+Restart=always
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,30 @@
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
 
+## [0.2.0-alpha.2] - 2026-08-14
+
+### Added
+
+- Configurable automatic refresh on day 1–6 after the latest successful
+  installation, stored persistently on the server with day 6 as the default.
+- Bonjour/mDNS publication of `iphoneloadly.local` using the Debian host's
+  active LAN address.
+- Optional helper for creating an iOS configuration profile containing only
+  Caddy's public local root certificate.
+- Illustrated English dashboard user guide with English UI screenshots.
+
+### Changed
+
+- Refresh warnings now follow the configured automatic-refresh day.
+- LAN access guidance now covers iPhone/iPad name resolution, certificate
+  warnings and trusted-certificate installation.
+
+### Fixed
+
+- Avoided Avahi reverse-record collisions when publishing the dashboard alias.
+- Direct LAN access no longer depends on manually configured client host files
+  when Bonjour/mDNS is available on the network.
+
 ## [0.2.0-alpha.1] - 2026-08-13
 
 ### Added

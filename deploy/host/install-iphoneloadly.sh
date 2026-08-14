@@ -48,7 +48,10 @@ if [[ "${check_package_layout}" == true ]]; then
     "${repo_root}/deploy/systemd/iphoneloadly-api.service" \
     "${repo_root}/deploy/systemd/iphoneloadly-refresh.service" \
     "${repo_root}/deploy/systemd/iphoneloadly-refresh.timer" \
+    "${repo_root}/deploy/systemd/iphoneloadly-dashboard-mdns.service" \
     "${repo_root}/deploy/caddy/Caddyfile.example" \
+    "${repo_root}/scripts/create-caddy-ios-profile.sh" \
+    "${repo_root}/scripts/publish-dashboard-mdns.sh" \
     "${repo_root}/scripts/iphoneloadly-doctor.sh" \
     "${repo_root}/scripts/preflight-wifi.sh" \
     "${repo_root}/scripts/backup-state.sh"; do
@@ -88,15 +91,18 @@ sudo install -o root -g root -m 0755 "${api_binary}" /opt/iphoneloadly/bin/iphon
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-api.service" /etc/systemd/system/iphoneloadly-api.service
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.service" /etc/systemd/system/iphoneloadly-refresh.service
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-refresh.timer" /etc/systemd/system/iphoneloadly-refresh.timer
+sudo install -o root -g root -m 0644 "${repo_root}/deploy/systemd/iphoneloadly-dashboard-mdns.service" /etc/systemd/system/iphoneloadly-dashboard-mdns.service
 sudo install -o root -g root -m 0644 "${repo_root}/deploy/caddy/Caddyfile.example" /usr/share/iphoneloadly/Caddyfile.example
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/backup-state.sh" /usr/local/sbin/iphoneloadly-backup
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/restore-state.sh" /usr/local/sbin/iphoneloadly-restore
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/iphoneloadly-doctor.sh" /usr/local/sbin/iphoneloadly-doctor
 sudo install -o root -g root -m 0755 "${repo_root}/scripts/preflight-wifi.sh" /usr/share/iphoneloadly/scripts/preflight-wifi.sh
+sudo install -o root -g root -m 0755 "${repo_root}/scripts/create-caddy-ios-profile.sh" /usr/local/libexec/iphoneloadly/create-caddy-ios-profile.sh
+sudo install -o root -g root -m 0755 "${repo_root}/scripts/publish-dashboard-mdns.sh" /usr/local/libexec/iphoneloadly/publish-dashboard-mdns.sh
 sudo install -o root -g root -m 0600 "${temporary_env}" /etc/iphoneloadly/api.env
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now iphoneloadly-api.service iphoneloadly-refresh.timer
+sudo systemctl enable --now iphoneloadly-api.service iphoneloadly-refresh.timer iphoneloadly-dashboard-mdns.service
 sudo systemctl restart iphoneloadly-api.service
 curl --fail --silent http://127.0.0.1:8080/healthz
 printf '\nInstalled iPhoneLoadly. Sign in with Apple before creating installation jobs.\n'

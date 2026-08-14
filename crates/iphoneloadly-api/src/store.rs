@@ -3,6 +3,10 @@ use std::path::Path;
 use rusqlite::Connection;
 use uuid::Uuid;
 
+pub const DEFAULT_REFRESH_AFTER_DAYS: u8 = 6;
+pub const MIN_REFRESH_AFTER_DAYS: u8 = 1;
+pub const MAX_REFRESH_AFTER_DAYS: u8 = 6;
+
 pub struct StoredJob {
     pub id: Uuid,
     pub app_id: Uuid,
@@ -65,6 +69,10 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
             device_label TEXT NOT NULL DEFAULT 'Trusted iPhone',
             failure_code TEXT,
             installed_bundle_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
         ",
     )?;
@@ -206,7 +214,37 @@ pub fn list_apps(connection: &Connection) -> rusqlite::Result<Vec<StoredApp>> {
         .collect()
 }
 
-pub fn refresh_due_targets(connection: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, String)>> {
+pub fn refresh_after_days(connection: &Connection) -> rusqlite::Result<u8> {
+    let mut statement =
+        connection.prepare("SELECT value FROM settings WHERE key = 'refresh_after_days'")?;
+    let mut rows = statement.query([])?;
+    let Some(row) = rows.next()? else {
+        return Ok(DEFAULT_REFRESH_AFTER_DAYS);
+    };
+    let value: String = row.get(0)?;
+    Ok(value
+        .parse::<u8>()
+        .ok()
+        .filter(|days| (MIN_REFRESH_AFTER_DAYS..=MAX_REFRESH_AFTER_DAYS).contains(days))
+        .unwrap_or(DEFAULT_REFRESH_AFTER_DAYS))
+}
+
+pub fn set_refresh_after_days(connection: &Connection, after_days: u8) -> rusqlite::Result<()> {
+    if !(MIN_REFRESH_AFTER_DAYS..=MAX_REFRESH_AFTER_DAYS).contains(&after_days) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    connection.execute(
+        "INSERT INTO settings (key, value) VALUES ('refresh_after_days', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [after_days.to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn refresh_due_targets(
+    connection: &Connection,
+    after_days: u8,
+) -> rusqlite::Result<Vec<(Uuid, Uuid, String)>> {
     let mut statement = connection.prepare(
         "SELECT jobs.app_id, jobs.device_id, apps.storage_path
          FROM jobs JOIN apps ON apps.id = jobs.app_id
@@ -217,10 +255,10 @@ pub fn refresh_due_targets(connection: &Connection) -> rusqlite::Result<Vec<(Uui
                   AND latest.device_id = jobs.device_id
                   AND latest.phase = 'succeeded'
            )
-           AND jobs.completed_at <= datetime('now', '-6 days')",
+           AND (julianday('now') - julianday(jobs.completed_at)) >= ?1",
     )?;
     statement
-        .query_map([], |row| {
+        .query_map([i64::from(after_days)], |row| {
             let app_id: String = row.get(0)?;
             let device_id: String = row.get(1)?;
             Ok((
@@ -232,7 +270,11 @@ pub fn refresh_due_targets(connection: &Connection) -> rusqlite::Result<Vec<(Uui
         .collect()
 }
 
-pub fn refresh_attention(connection: &Connection) -> rusqlite::Result<Vec<RefreshAttention>> {
+pub fn refresh_attention(
+    connection: &Connection,
+    after_days: u8,
+) -> rusqlite::Result<Vec<RefreshAttention>> {
+    let attention_after_hours = i64::from(after_days.saturating_sub(1)) * 24;
     let mut statement = connection.prepare(
         "SELECT jobs.app_id, jobs.device_label,
                 CAST((julianday('now') - julianday(jobs.completed_at)) * 24 AS INTEGER),
@@ -249,10 +291,10 @@ pub fn refresh_attention(connection: &Connection) -> rusqlite::Result<Vec<Refres
                 WHERE latest.app_id = jobs.app_id AND latest.device_id = jobs.device_id
                   AND latest.phase = 'succeeded'
            )
-           AND (julianday('now') - julianday(jobs.completed_at)) * 24 >= 120",
+           AND (julianday('now') - julianday(jobs.completed_at)) * 24 >= ?1",
     )?;
     statement
-        .query_map([], |row| {
+        .query_map([attention_after_hours], |row| {
             let app_id: String = row.get(0)?;
             Ok(RefreshAttention {
                 app_id: Uuid::parse_str(&app_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -451,7 +493,10 @@ pub fn restore_app(connection: &Connection, id: Uuid) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize, managed_app_identities};
+    use super::{
+        DEFAULT_REFRESH_AFTER_DAYS, initialize, managed_app_identities, refresh_after_days,
+        refresh_due_targets, set_refresh_after_days,
+    };
     use rusqlite::Connection;
     use uuid::Uuid;
 
@@ -545,6 +590,62 @@ mod tests {
             Some("com.example.app.TEAM")
         );
         drop(migrated);
+        std::fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn refresh_day_setting_persists_and_controls_due_targets() {
+        let path =
+            std::env::temp_dir().join(format!("iphoneloadly-settings-{}.db", Uuid::now_v7()));
+        let connection = initialize(&path).expect("initialize database");
+        assert_eq!(
+            refresh_after_days(&connection).expect("read default refresh day"),
+            DEFAULT_REFRESH_AFTER_DAYS
+        );
+
+        set_refresh_after_days(&connection, 4).expect("save refresh day");
+        assert_eq!(
+            refresh_after_days(&connection).expect("read saved refresh day"),
+            4
+        );
+        assert!(set_refresh_after_days(&connection, 7).is_err());
+
+        let app_id = Uuid::now_v7();
+        let device_id = Uuid::now_v7();
+        connection
+            .execute(
+                "INSERT INTO apps (id, sha256, storage_path, size_bytes, uploaded_at, bundle_id)
+                 VALUES (?1, 'settings-hash', 'settings.ipa', 1, datetime('now'), 'com.example.settings')",
+                [app_id.to_string()],
+            )
+            .expect("insert app");
+        connection
+            .execute(
+                "INSERT INTO jobs (
+                    id, app_id, device_id, phase, created_at, completed_at, device_label
+                 ) VALUES (?1, ?2, ?3, 'succeeded', datetime('now', '-5 days'),
+                           datetime('now', '-5 days'), 'iPhone')",
+                (
+                    Uuid::now_v7().to_string(),
+                    app_id.to_string(),
+                    device_id.to_string(),
+                ),
+            )
+            .expect("insert successful installation");
+
+        assert_eq!(
+            refresh_due_targets(&connection, 4)
+                .expect("read day-four targets")
+                .len(),
+            1
+        );
+        assert!(
+            refresh_due_targets(&connection, 6)
+                .expect("read day-six targets")
+                .is_empty()
+        );
+
+        drop(connection);
         std::fs::remove_file(path).expect("remove test database");
     }
 }

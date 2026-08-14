@@ -29,7 +29,7 @@ Expected checksum result:
 iphoneloadly-v<VERSION>-linux-amd64.tar.gz: OK
 ```
 
-The current alpha release is `v0.2.0-alpha.1`. If that release is unavailable,
+The current alpha package version is `v0.2.0-alpha.2`. If that release is unavailable,
 use the advanced source-build instructions in
 [from-scratch.md](operations/from-scratch.md); never substitute an unverified
 archive from another site.
@@ -104,19 +104,26 @@ select the discovered phone, and create an installation job. The password stays
 in memory unless you explicitly select encrypted credential storage; 2FA is never
 saved. Apple may still require 2FA after an API or server restart.
 The job view shows signing progress and then the device-transfer phase. Use
-**Ta bort vald IPA från servern** to permanently remove an uploaded IPA when it
+**Delete selected IPA from server** to permanently remove an uploaded IPA when it
 is no longer needed; it is unavailable while that IPA has an active installation
 or refresh job, and a removed IPA cannot be refreshed later.
 
-The refresh timer runs hourly with up to a 10-minute delay. It only queues a
-refresh for an app whose last successful install is at least six days old. If the
-phone is unavailable, a later hourly run retries automatically; use the History
-and diagnostics view to see each result.
+The refresh timer runs hourly with up to a 10-minute delay. The dashboard lets
+you choose automatic refresh on day 1–6 after the latest successful install;
+day 6 is the default and is recommended for refreshing about one day before a
+free signing normally expires. If the phone is unavailable, a later hourly run
+retries automatically; use the History and diagnostics view to see each result.
 
 The Overview shows remaining free-signing days for successful installations and
 lists only apps that iPhoneLoadly installed on the selected trusted iPhone.
 
 Use Caddy only on a trusted LAN with authentication; never expose it to the Internet.
+
+On an iPhone or iPad, open `https://iphoneloadly.local` only after completing
+the Bonjour name-resolution and Caddy certificate-trust steps in
+[caddy-lan.md](operations/caddy-lan.md). A raw IP address is not a supported
+dashboard URL because Caddy's HTTPS certificate is issued to
+`iphoneloadly.local`.
 
 ## Troubleshooting
 
@@ -129,9 +136,17 @@ sudo systemctl status iphoneloadly-api --no-pager
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-If the service is inactive, inspect `sudo journalctl -u iphoneloadly-api -n 100
---no-pager`, correct the reported configuration error, then run `sudo systemctl
-restart iphoneloadly-api`. Confirm your SSH tunnel uses the same server.
+If the API is healthy but an iPhone cannot open `https://iphoneloadly.local`,
+verify the dashboard mDNS record and that the iPhone has trusted Caddy's root
+certificate:
+
+```bash
+sudo systemctl status iphoneloadly-dashboard-mdns.service --no-pager
+avahi-resolve --name iphoneloadly.local
+```
+
+The address must be the Debian LAN address. Do not use a Docker address or a raw
+IP URL. See [caddy-lan.md](operations/caddy-lan.md) for the iPhone trust steps.
 
 ### iPhone is not detected or reachable
 
@@ -169,8 +184,8 @@ can access the encryption key, so enable this only on a server you administer.
 
 For a free Apple developer account, iPhoneLoadly saves its signing key in its
 root-only service data directory and reuses the matching Apple certificate
-after a new login. You should therefore only select **Frigör gammalt
-utvecklingscertifikat** if Apple explicitly reports that the certificate limit
+after a new login. You should therefore only select **Release an old
+development certificate** if Apple explicitly reports that the certificate limit
 has been reached. The next signing session then revokes one older development
 certificate only if Apple rejects new-certificate creation for reaching the
 limit. Revoking a certificate can invalidate apps signed with it; do not use
@@ -200,12 +215,13 @@ curl --fail -X POST http://127.0.0.1:8080/api/refresh
 ```
 
 Refresh is not a guarantee: it needs Apple signing to be ready, a reachable
-phone, and an app whose last successful installation is six days old. A saved
-encrypted sign-in can restore the Apple login after restart, though Apple may
-still require 2FA.
+phone, and an app that has reached the configured automatic-refresh day. The
+setting is stored on the server and defaults to day 6. A saved encrypted sign-in
+can restore the Apple login after restart, though Apple may still require 2FA.
 
 ## Advanced paths
 
+- [Illustrated dashboard user guide](USER_GUIDE.md)
 - [Host and pairing details](operations/debian13-host-preparation.md)
 - [Systemd, backup, and recovery operations](operations/api-systemd.md)
 - [Secure Caddy LAN proxy](operations/caddy-lan.md)
