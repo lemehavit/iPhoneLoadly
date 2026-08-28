@@ -208,7 +208,6 @@ jobs:
                 fi
               fi
               rm -f -- "${active_file}"
-              exit 0
               ;;
             "is-active --quiet iphoneloadly-api.service")
               [[ -f "${active_file}" ]]
@@ -230,6 +229,7 @@ jobs:
           chmod 0755 /usr/local/bin/systemctl
           test "$(sudo sh -c 'command -v systemctl')" = /usr/local/bin/systemctl
           echo "::endgroup::"
+          mkdir -p /opt/iphoneloadly/bin
           echo "::group::Seed running old API and replacement guard"
           install -m 0755 /usr/bin/sleep /opt/iphoneloadly/bin/iphoneloadly-api
           nohup /opt/iphoneloadly/bin/iphoneloadly-api 300 \
