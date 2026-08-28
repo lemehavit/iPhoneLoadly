@@ -50,15 +50,26 @@ jobs:
           set -Eeuo pipefail
           (cd dist && sha256sum -c "$(basename "${RELEASE_CHECKSUM}")")
           container="iphoneloadly-upgrade-${GITHUB_RUN_ID}"
-          cleanup() {
-            docker rm --force "${container}" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
+          container_image="iphoneloadly-upgrade-image-${GITHUB_RUN_ID}"
+          cat >"${RUNNER_TEMP}/Dockerfile.iphoneloadly" <<'EOF'
+          FROM debian:13-slim
+          RUN apt-get update \
+              && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+                   ca-certificates curl sudo systemd systemd-sysv socat sqlite3 \
+              && rm -rf /var/lib/apt/lists/*
+          STOPSIGNAL SIGRTMIN+3
+          CMD ["/lib/systemd/systemd"]
+          EOF
+          docker build --platform linux/amd64 \
+            --tag "${container_image}" \
+            --file "${RUNNER_TEMP}/Dockerfile.iphoneloadly" \
+            "${RUNNER_TEMP}"
           docker run --platform linux/amd64 --detach --privileged --cgroupns=host \
+            --env container=docker \
             --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
             --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
             --volume "${GITHUB_WORKSPACE}/dist:/release:ro" \
-            --name "${container}" debian:13-slim /sbin/init
+            --name "${container}" "${container_image}"
           for attempt in $(seq 1 30); do
             if docker exec "${container}" test -d /run/systemd/system; then
               break
@@ -69,8 +80,6 @@ jobs:
             }
             sleep 2
           done
-          docker exec "${container}" bash -c \
-            'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates curl sudo systemd systemd-sysv socat sqlite3'
           docker exec "${container}" mkdir -p /tmp/package
           docker exec "${container}" tar -xzf \
             /release/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz \
@@ -119,7 +128,7 @@ jobs:
               >>"${RUNNER_TEMP}/iphoneloadly-pre-modes"
           done
           docker exec "${container}" bash -c \
-            'mkdir -p /run/iphoneloadly && socat UNIX-LISTEN:/run/iphoneloadly/mux.sock,fork SYSTEM:"cat" >/tmp/mux.log 2>&1 &'
+            'mkdir -p /run/iphoneloadly && nohup socat UNIX-LISTEN:/run/iphoneloadly/mux.sock,fork SYSTEM:"cat" </dev/null >/tmp/mux.log 2>&1 &'
           echo "Using seeded alpha.2 preservation fixture; no Apple credentials or real pairing are used."
           docker exec "${container}" bash /tmp/package/install-iphoneloadly.sh \
             --upgrade \
