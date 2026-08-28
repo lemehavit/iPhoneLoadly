@@ -361,6 +361,7 @@ jobs:
           cat >"${rollback_dir}/install-iphoneloadly.sh" <<'ROLLBACK_INSTALLER'
           #!/usr/bin/env bash
           set -Eeuo pipefail
+          printf '%s\n' invoked >/tmp/rollback-installer-invoked
           replacement="$(mktemp /opt/iphoneloadly/bin/.rollback-failure.XXXXXX)"
           : >/tmp/update-path-enabled
           : >/tmp/source-sync-timer-enabled
@@ -435,6 +436,9 @@ jobs:
           else
             updater_status=$?
           fi
+          printf 'updater_status=%s\n' "${updater_status}"
+          cat /var/lib/iphoneloadly/data/update-status.json
+          test -e /tmp/rollback-installer-invoked
           test "${updater_status}" -ne 0
           test ! -e /run/iphoneloadly/update-request.json
           grep -Fq '"status":"failed"' /var/lib/iphoneloadly/data/update-status.json
