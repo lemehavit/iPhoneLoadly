@@ -110,11 +110,14 @@ backup_runtime() {
     key="${target#/}"
     key="${key//\//__}"
     if [[ -e "${target}" ]]; then
-      cp -a -- "${target}" "${backup_root}/${key}"
-    else
-      : >"${backup_root}/${key}.missing"
+      if ! cp -a -- "${target}" "${backup_root}/${key}"; then
+        return 1
+      fi
+    elif ! : >"${backup_root}/${key}.missing"; then
+      return 1
     fi
   done
+  return 0
 }
 restore_runtime() {
   local target key source temporary
