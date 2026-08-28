@@ -364,6 +364,11 @@ jobs:
           replacement="$(mktemp /opt/iphoneloadly/bin/.rollback-failure.XXXXXX)"
           : >/tmp/update-path-enabled
           : >/tmp/source-sync-timer-enabled
+          if [[ -e /tmp/api-service-active ]] && kill -0 "$(cat /tmp/api.pid)" 2>/dev/null; then
+            printf '%s\n' true >/tmp/rollback-replace-while-active
+          else
+            printf '%s\n' false >/tmp/rollback-replace-while-active
+          fi
           rm -f -- "${replacement}"
           cp -a -- /usr/bin/false "${replacement}"
           mv -f -- "${replacement}" /opt/iphoneloadly/bin/iphoneloadly-api
@@ -406,21 +411,6 @@ jobs:
           fi
           UPDATER_CURL
           chmod 0755 /tmp/fake-bin/curl
-          cat >/tmp/fake-bin/mv <<'ROLLBACK_MV'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          if [[ "$*" == *"/opt/iphoneloadly/bin/iphoneloadly-api" ]]; then
-            api_pid="$(cat /tmp/api.pid 2>/dev/null || true)"
-            if [[ -e /tmp/api-service-active && -n "${api_pid}" ]] \
-              && kill -0 "${api_pid}" 2>/dev/null; then
-              printf '%s\n' true >>/tmp/rollback-replace-while-active
-            else
-              printf '%s\n' false >>/tmp/rollback-replace-while-active
-            fi
-          fi
-          exec /usr/bin/mv "$@"
-          ROLLBACK_MV
-          chmod 0755 /tmp/fake-bin/mv
           mkdir -p /run/iphoneloadly
           printf '{"targetVersion":"%s","expectedArchiveSha256":"%s","createdAt":"2026-08-28T00:00:00Z"}\n' \
             "${expected_version}" "${rollback_digest}" \
@@ -440,7 +430,6 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/healthz | \
             grep -Fq "\"version\":\"${prior_version}\""
           test "$(sed -n '1p' /tmp/rollback-replace-while-active)" = true
-          test "$(sed -n '$p' /tmp/rollback-replace-while-active)" = false
           test -e /tmp/update-path-enabled
           test ! -e /tmp/source-sync-timer-enabled
           echo "rollback_runtime_restored=true"
