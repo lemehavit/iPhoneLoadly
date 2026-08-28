@@ -426,11 +426,12 @@ jobs:
             "${expected_version}" "${rollback_digest}" \
             >/run/iphoneloadly/update-request.json
           chmod 0600 /run/iphoneloadly/update-request.json
-          set +e
-          PATH="/tmp/fake-bin:${PATH}" \
-            bash /tmp/package/deploy/host/update-iphoneloadly.sh
-          updater_status=$?
-          set -e
+          if PATH="/tmp/fake-bin:${PATH}" \
+            bash /tmp/package/deploy/host/update-iphoneloadly.sh; then
+            updater_status=0
+          else
+            updater_status=$?
+          fi
           test "${updater_status}" -ne 0
           test ! -e /run/iphoneloadly/update-request.json
           grep -Fq '"status":"failed"' /var/lib/iphoneloadly/data/update-status.json
