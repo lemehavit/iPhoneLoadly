@@ -162,8 +162,18 @@ pub enum SigningError {
     MissingAnisetteUrl,
     #[error("Apple signing session is not ready")]
     NotReady,
-    #[error("IPA installation failed")]
-    InstallFailed,
+    #[error("device information lookup failed")]
+    DeviceInfoFailed,
+    #[error("developer team lookup failed")]
+    DeveloperTeamFailed,
+    #[error("device registration failed")]
+    DeviceRegistrationFailed,
+    #[error("IPA signing failed")]
+    IpaSigningFailed,
+    #[error("signed IPA metadata validation failed")]
+    SignedMetadataFailed,
+    #[error("device installation failed")]
+    DeviceInstallFailed,
     #[error("encrypted credential storage failed")]
     CredentialStorage,
 }
@@ -403,7 +413,6 @@ impl AppleSigningProvider {
         let attempt = attempt.ok_or(SigningError::UnknownSession)?;
         Ok(attempt.status().await)
     }
-
     pub async fn install_ipa(
         &self,
         provider: &TcpProvider,
@@ -415,17 +424,16 @@ impl AppleSigningProvider {
         let progress = Arc::new(progress);
         let device = IdeviceInfo::from_device(provider)
             .await
-            .map_err(|_| SigningError::InstallFailed)?;
+            .map_err(|_| SigningError::DeviceInfoFailed)?;
         let team = sideloader
             .get_team()
             .await
-            .map_err(|_| SigningError::InstallFailed)?;
+            .map_err(|_| SigningError::DeveloperTeamFailed)?;
         sideloader
             .get_dev_session()
             .ensure_device_registered(&team, &device.name, &device.udid, None)
             .await
-            .map_err(|_| SigningError::InstallFailed)?;
-
+            .map_err(|_| SigningError::DeviceRegistrationFailed)?;
         let signing_progress = progress.clone();
         let (signed_app_path, _) = sideloader
             .sign_app(
@@ -438,19 +446,16 @@ impl AppleSigningProvider {
                 }),
             )
             .await
-            .map_err(|_| SigningError::InstallFailed)?;
+            .map_err(|_| SigningError::IpaSigningFailed)?;
         let signed_info = plist::Value::from_file(signed_app_path.join("Info.plist"))
-            .map_err(|_| SigningError::InstallFailed)?;
+            .map_err(|_| SigningError::SignedMetadataFailed)?;
         let installed_bundle_id = signed_info
             .as_dictionary()
             .and_then(|info| info.get("CFBundleIdentifier"))
             .and_then(plist::Value::as_string)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .ok_or(SigningError::InstallFailed)?;
-
-        // The upstream installer reports actual AFC-upload and installation
-        // percentages. Reserve the final 60% of the job for those values.
+            .ok_or(SigningError::SignedMetadataFailed)?;
         progress(40);
         let install_progress = progress.clone();
         install_signed_app(provider, &signed_app_path, move |value| {
@@ -458,7 +463,7 @@ impl AppleSigningProvider {
             install_progress(percent);
         })
         .await
-        .map_err(|_| SigningError::InstallFailed)?;
+        .map_err(|_| SigningError::DeviceInstallFailed)?;
         Ok(installed_bundle_id)
     }
 

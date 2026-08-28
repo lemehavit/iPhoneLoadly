@@ -101,3 +101,37 @@ or complete phone identifiers.
 - [Caddy and LAN access](operations/caddy-lan.md)
 - [Debian, Bonjour, and Wi-Fi](operations/debian13-host-preparation.md)
 - [Systemd, refresh, backup, and recovery](operations/api-systemd.md)
+
+## GitHub IPA sources
+
+The **GitHub IPA sources** section accepts only a public `owner/repo` or
+canonical `https://github.com/owner/repo` repository. Preview the latest
+eligible release, choose a filename pattern such as `*.ipa`, and save the
+source. The pattern must match exactly one IPA asset; ambiguous releases are
+never guessed.
+
+Use **Check latest** and **Download latest** for manual updates. A downloaded
+IPA is validated like a browser upload. When linked to an existing app, its
+bundle identifier must match and the logical app ID and history remain stable.
+Downloading does not install the IPA on the phone.
+
+Automatic downloads are off by default. Read the security information before
+acknowledging the risk. Repository, pattern, or prerelease changes disable the
+acknowledgement. Automatic sync updates the server copy only; an enabled
+automatic refresh may use that copy later.
+
+## Removing stale management entries
+
+Under **Managed installations**, choose **Remove from management** to stop
+tracking and refreshing an app/device pair that was deleted manually from the
+iPhone. This action does not uninstall anything from the phone, delete the
+server IPA, or delete history. A later successful installation restores
+management automatically.
+
+## Official updates
+
+Alpha.3 is the bootstrap release for in-dashboard official updates. After
+installing alpha.3 once using the verified package method, the dashboard can
+check the official `lemehavit/iPhoneLoadly` release and request a verified
+update. Configuration, pairing, signing state, uploaded IPAs and Caddy state
+are preserved.

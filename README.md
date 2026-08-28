@@ -5,7 +5,7 @@ iPhone from a Debian server.
 
 > Self-host IPA signing and installation for your iPhone, then check for refreshes over Wi-Fi before the typical 7-day free-signing period expires.
 
-[![Version](https://img.shields.io/badge/version-0.2.0--alpha.2-blue)](VERSION)
+[![Version](https://img.shields.io/badge/version-0.2.0--alpha.3-blue)](VERSION)
 [![Rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/lemehavit/iPhoneLoadly/actions/workflows/ci.yml/badge.svg)](https://github.com/lemehavit/iPhoneLoadly/actions/workflows/ci.yml)

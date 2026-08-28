@@ -2,6 +2,28 @@
 
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
+## [0.2.0-alpha.3] - 2026-08-27
+
+### Added
+
+- Official GitHub release update discovery and a constrained systemd updater.
+- IPA upload progress, readable names, parsed versions and rename support.
+- Stale managed app/device removal without deleting history or uninstalling apps.
+- Stage-specific safe installation diagnostics with app name/version history snapshots.
+- Public GitHub IPA sources with deterministic asset selection and manual download.
+- Opt-in automatic source synchronization with an explicit supply-chain warning.
+
+### Changed
+
+- Source-linked IPA replacement preserves logical app identity and installation history.
+- Deleting a server IPA disables its linked source automation.
+
+### Security
+
+- Self-update accepts only verified artifacts from `lemehavit/iPhoneLoadly`.
+- Third-party downloads are bounded, structurally validated and bundle-ID checked.
+- Automatic third-party downloads are disabled by default and never immediately install.
+
 
 ## [0.2.0-alpha.2] - 2026-08-14
 

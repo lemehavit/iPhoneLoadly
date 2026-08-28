@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 pub const DEFAULT_REFRESH_AFTER_DAYS: u8 = 6;
@@ -17,14 +17,50 @@ pub struct StoredJob {
     pub created_at: String,
     pub completed_at: Option<String>,
     pub failure_code: Option<String>,
+    pub app_display_name: String,
+    pub app_version: Option<String>,
 }
 
 pub struct StoredApp {
     pub id: Uuid,
     pub sha256: String,
     pub size_bytes: u64,
+    pub display_name: String,
+    pub app_version: Option<String>,
+    pub bundle_id: Option<String>,
+    pub storage_path: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManagedInstallation {
+    pub app_id: Uuid,
+    pub device_id: Uuid,
+    pub app_display_name: String,
+    pub app_version: Option<String>,
+    pub device_label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitHubSource {
+    pub id: Uuid,
+    pub app_id: Option<Uuid>,
+    pub owner: String,
+    pub repo: String,
+    pub asset_pattern: String,
+    pub include_prereleases: bool,
+    pub auto_download: bool,
+    pub auto_acknowledged_at: Option<String>,
+    pub last_checked_at: Option<String>,
+    pub last_release_id: Option<i64>,
+    pub last_release_tag: Option<String>,
+    pub last_asset_id: Option<i64>,
+    pub last_asset_name: Option<String>,
+    pub last_download_sha256: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
 pub struct ManagedAppIdentity {
     pub installed_bundle_id: Option<String>,
     pub source_bundle_id: Option<String>,
@@ -43,7 +79,6 @@ pub struct InstallationValidity {
     pub remaining_days: i64,
     pub completed_at: String,
 }
-
 pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
@@ -56,7 +91,9 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
             size_bytes INTEGER NOT NULL,
             uploaded_at TEXT NOT NULL,
             deleted_at TEXT,
-            bundle_id TEXT
+            bundle_id TEXT,
+            display_name TEXT,
+            app_version TEXT
         );
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
@@ -68,20 +105,59 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
             progress_percent INTEGER,
             device_label TEXT NOT NULL DEFAULT 'Trusted iPhone',
             failure_code TEXT,
-            installed_bundle_id TEXT
+            installed_bundle_id TEXT,
+            app_display_name TEXT,
+            app_version TEXT
         );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS unmanaged_installations (
+            app_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            removed_at TEXT NOT NULL,
+            PRIMARY KEY (app_id, device_id)
+        );
+        CREATE TABLE IF NOT EXISTS github_sources (
+            id TEXT PRIMARY KEY,
+            app_id TEXT UNIQUE,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            asset_pattern TEXT NOT NULL,
+            include_prereleases INTEGER NOT NULL DEFAULT 0,
+            auto_download INTEGER NOT NULL DEFAULT 0,
+            auto_acknowledged_at TEXT,
+            last_checked_at TEXT,
+            last_release_id INTEGER,
+            last_release_tag TEXT,
+            last_asset_id INTEGER,
+            last_asset_name TEXT,
+            last_download_sha256 TEXT,
+            last_status TEXT,
+            last_error_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (app_id) REFERENCES apps(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS github_sources_identity
+            ON github_sources(owner, repo, asset_pattern);
         ",
     )?;
-    let job_columns = {
-        let mut columns = connection.prepare("PRAGMA table_info(jobs)")?;
-        columns
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
+    let app_columns = table_columns(&connection, "apps")?;
+    if !app_columns.iter().any(|name| name == "deleted_at") {
+        connection.execute_batch("ALTER TABLE apps ADD COLUMN deleted_at TEXT;")?;
+    }
+    if !app_columns.iter().any(|name| name == "bundle_id") {
+        connection.execute_batch("ALTER TABLE apps ADD COLUMN bundle_id TEXT;")?;
+    }
+    if !app_columns.iter().any(|name| name == "display_name") {
+        connection.execute_batch("ALTER TABLE apps ADD COLUMN display_name TEXT;")?;
+    }
+    if !app_columns.iter().any(|name| name == "app_version") {
+        connection.execute_batch("ALTER TABLE apps ADD COLUMN app_version TEXT;")?;
+    }
+    let job_columns = table_columns(&connection, "jobs")?;
     if !job_columns.iter().any(|name| name == "completed_at") {
         connection.execute_batch("ALTER TABLE jobs ADD COLUMN completed_at TEXT;")?;
     }
@@ -99,25 +175,35 @@ pub fn initialize(path: &Path) -> rusqlite::Result<Connection> {
     if !job_columns.iter().any(|name| name == "installed_bundle_id") {
         connection.execute_batch("ALTER TABLE jobs ADD COLUMN installed_bundle_id TEXT;")?;
     }
-    let app_columns = {
-        let mut columns = connection.prepare("PRAGMA table_info(apps)")?;
-        columns
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if !app_columns.iter().any(|name| name == "deleted_at") {
-        connection.execute_batch("ALTER TABLE apps ADD COLUMN deleted_at TEXT;")?;
+    if !job_columns.iter().any(|name| name == "app_display_name") {
+        connection.execute_batch("ALTER TABLE jobs ADD COLUMN app_display_name TEXT;")?;
     }
-    if !app_columns.iter().any(|name| name == "bundle_id") {
-        connection.execute_batch("ALTER TABLE apps ADD COLUMN bundle_id TEXT;")?;
+    if !job_columns.iter().any(|name| name == "app_version") {
+        connection.execute_batch("ALTER TABLE jobs ADD COLUMN app_version TEXT;")?;
     }
     connection.execute_batch(
-        "UPDATE jobs SET completed_at = created_at
-         WHERE phase = 'succeeded' AND completed_at IS NULL;",
+        "UPDATE apps SET display_name = COALESCE(NULLIF(display_name, ''), bundle_id, substr(id, 1, 8))
+         WHERE display_name IS NULL OR display_name = '';
+         UPDATE jobs SET completed_at = created_at
+         WHERE phase = 'succeeded' AND completed_at IS NULL;
+         UPDATE jobs SET app_display_name = (
+             SELECT display_name FROM apps WHERE apps.id = jobs.app_id
+         ) WHERE app_display_name IS NULL OR app_display_name = '';
+         UPDATE jobs SET app_version = (
+             SELECT app_version FROM apps WHERE apps.id = jobs.app_id
+         ) WHERE app_version IS NULL;",
     )?;
     Ok(connection)
 }
 
+fn table_columns(connection: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let mut columns = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    columns
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn insert_app(
     connection: &Connection,
     id: Uuid,
@@ -125,14 +211,24 @@ pub fn insert_app(
     storage_path: &str,
     size_bytes: u64,
     bundle_id: &str,
+    display_name: &str,
+    app_version: Option<&str>,
 ) -> rusqlite::Result<()> {
     connection.execute(
-        "INSERT INTO apps (id, sha256, storage_path, size_bytes, uploaded_at, bundle_id) VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
-        (id.to_string(), sha256, storage_path, size_bytes as i64, bundle_id),
+        "INSERT INTO apps (id, sha256, storage_path, size_bytes, uploaded_at, bundle_id, display_name, app_version)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, ?7)",
+        rusqlite::params![
+            id.to_string(),
+            sha256,
+            storage_path,
+            size_bytes as i64,
+            bundle_id,
+            display_name,
+            app_version
+        ],
     )?;
     Ok(())
 }
-
 pub fn apps_missing_bundle_id(connection: &Connection) -> rusqlite::Result<Vec<(Uuid, String)>> {
     let mut statement = connection.prepare(
         "SELECT id, storage_path FROM apps WHERE bundle_id IS NULL AND deleted_at IS NULL",
@@ -146,6 +242,16 @@ pub fn apps_missing_bundle_id(connection: &Connection) -> rusqlite::Result<Vec<(
             ))
         })?
         .collect()
+}
+
+pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT storage_path FROM apps WHERE id = ?1 AND deleted_at IS NULL",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
 }
 
 pub fn set_app_bundle_id(
@@ -168,6 +274,10 @@ pub fn managed_app_identities(
         "SELECT DISTINCT jobs.installed_bundle_id, apps.bundle_id
          FROM jobs JOIN apps ON apps.id = jobs.app_id
          WHERE jobs.device_id = ?1 AND jobs.phase = 'succeeded'
+           AND NOT EXISTS (
+               SELECT 1 FROM unmanaged_installations u
+               WHERE u.app_id = jobs.app_id AND u.device_id = jobs.device_id
+           )
            AND (
                 jobs.installed_bundle_id IS NOT NULL
                 OR NOT EXISTS (
@@ -189,19 +299,11 @@ pub fn managed_app_identities(
         .collect()
 }
 
-pub fn app_path(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<String>> {
-    let mut statement =
-        connection.prepare("SELECT storage_path FROM apps WHERE id = ?1 AND deleted_at IS NULL")?;
-    let mut rows = statement.query([id.to_string()])?;
-    match rows.next()? {
-        Some(row) => Ok(Some(row.get(0)?)),
-        None => Ok(None),
-    }
-}
-
 pub fn list_apps(connection: &Connection) -> rusqlite::Result<Vec<StoredApp>> {
-    let mut statement =
-        connection.prepare("SELECT id, sha256, size_bytes FROM apps WHERE deleted_at IS NULL ORDER BY uploaded_at DESC")?;
+    let mut statement = connection.prepare(
+        "SELECT id, sha256, size_bytes, display_name, app_version, bundle_id, storage_path
+         FROM apps WHERE deleted_at IS NULL ORDER BY uploaded_at DESC",
+    )?;
     statement
         .query_map([], |row| {
             let id: String = row.get(0)?;
@@ -209,6 +311,12 @@ pub fn list_apps(connection: &Connection) -> rusqlite::Result<Vec<StoredApp>> {
                 id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
                 sha256: row.get(1)?,
                 size_bytes: row.get::<_, i64>(2)? as u64,
+                display_name: row
+                    .get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| id.clone()),
+                app_version: row.get(4)?,
+                bundle_id: row.get(5)?,
+                storage_path: row.get(6)?,
             })
         })?
         .collect()
@@ -249,6 +357,10 @@ pub fn refresh_due_targets(
         "SELECT jobs.app_id, jobs.device_id, apps.storage_path
          FROM jobs JOIN apps ON apps.id = jobs.app_id
          WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM unmanaged_installations u
+               WHERE u.app_id = jobs.app_id AND u.device_id = jobs.device_id
+           )
            AND jobs.completed_at = (
                 SELECT MAX(latest.completed_at) FROM jobs AS latest
                 WHERE latest.app_id = jobs.app_id
@@ -286,6 +398,10 @@ pub fn refresh_attention(
          FROM jobs
          JOIN apps ON apps.id = jobs.app_id
          WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM unmanaged_installations u
+               WHERE u.app_id = jobs.app_id AND u.device_id = jobs.device_id
+           )
            AND jobs.completed_at = (
                 SELECT MAX(latest.completed_at) FROM jobs AS latest
                 WHERE latest.app_id = jobs.app_id AND latest.device_id = jobs.device_id
@@ -315,6 +431,10 @@ pub fn installation_validity(
                 jobs.completed_at
          FROM jobs JOIN apps ON apps.id = jobs.app_id
          WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM unmanaged_installations u
+               WHERE u.app_id = jobs.app_id AND u.device_id = jobs.device_id
+           )
            AND jobs.completed_at = (
                 SELECT MAX(latest.completed_at) FROM jobs AS latest
                 WHERE latest.app_id = jobs.app_id AND latest.device_id = jobs.device_id
@@ -359,20 +479,32 @@ pub fn insert_job(
     device_label: &str,
 ) -> rusqlite::Result<()> {
     connection.execute(
-        "INSERT INTO jobs (id, app_id, device_id, device_label, phase, created_at) VALUES (?1, ?2, ?3, ?4, 'queued', datetime('now'))",
-        (id.to_string(), app_id.to_string(), device_id.to_string(), device_label),
+        "INSERT INTO jobs (
+             id, app_id, device_id, device_label, phase, created_at,
+             app_display_name, app_version
+         )
+         SELECT ?1, id, ?3, ?4, 'queued', datetime('now'), display_name, app_version
+         FROM apps WHERE id = ?2 AND deleted_at IS NULL",
+        rusqlite::params![
+            id.to_string(),
+            app_id.to_string(),
+            device_id.to_string(),
+            device_label
+        ],
     )?;
     Ok(())
 }
 
 pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<StoredJob>> {
-    let mut statement = connection
-        .prepare("SELECT id, app_id, device_id, phase, progress_percent, device_label, created_at, completed_at, failure_code FROM jobs WHERE id = ?1")?;
+    let mut statement = connection.prepare(
+        "SELECT id, app_id, device_id, phase, progress_percent, device_label,
+                created_at, completed_at, failure_code, app_display_name, app_version
+         FROM jobs WHERE id = ?1",
+    )?;
     let mut rows = statement.query([id.to_string()])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-
     let id: String = row.get(0)?;
     let app_id: String = row.get(1)?;
     let device_id: String = row.get(2)?;
@@ -386,12 +518,17 @@ pub fn find_job(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<St
         created_at: row.get(6)?,
         completed_at: row.get(7)?,
         failure_code: row.get(8)?,
+        app_display_name: row
+            .get::<_, Option<String>>(9)?
+            .unwrap_or_else(|| app_id.clone()),
+        app_version: row.get(10)?,
     }))
 }
 
 pub fn list_recent_jobs(connection: &Connection, limit: usize) -> rusqlite::Result<Vec<StoredJob>> {
     let mut statement = connection.prepare(
-        "SELECT id, app_id, device_id, phase, progress_percent, device_label, created_at, completed_at, failure_code
+        "SELECT id, app_id, device_id, phase, progress_percent, device_label,
+                created_at, completed_at, failure_code, app_display_name, app_version
          FROM jobs ORDER BY created_at DESC LIMIT ?1",
     )?;
     statement
@@ -410,6 +547,10 @@ pub fn list_recent_jobs(connection: &Connection, limit: usize) -> rusqlite::Resu
                 created_at: row.get(6)?,
                 completed_at: row.get(7)?,
                 failure_code: row.get(8)?,
+                app_display_name: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| app_id.clone()),
+                app_version: row.get(10)?,
             })
         })?
         .collect()
@@ -480,6 +621,12 @@ pub fn mark_app_deleted(connection: &Connection, id: Uuid) -> rusqlite::Result<A
         "UPDATE apps SET deleted_at = datetime('now') WHERE id = ?1 AND deleted_at IS NULL",
         [id.to_string()],
     )?;
+    connection.execute(
+        "UPDATE github_sources
+         SET auto_download = 0, auto_acknowledged_at = NULL, updated_at = datetime('now')
+         WHERE app_id = ?1",
+        [id.to_string()],
+    )?;
     Ok(AppDeletion::Ready { storage_path: path })
 }
 
@@ -491,11 +638,322 @@ pub fn restore_app(connection: &Connection, id: Uuid) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub fn rename_app(connection: &Connection, id: Uuid, display_name: &str) -> rusqlite::Result<bool> {
+    Ok(connection.execute(
+        "UPDATE apps SET display_name = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+        (display_name, id.to_string()),
+    )? == 1)
+}
+
+pub fn find_app(connection: &Connection, id: Uuid) -> rusqlite::Result<Option<StoredApp>> {
+    let mut statement = connection.prepare(
+        "SELECT id, sha256, size_bytes, display_name, app_version, bundle_id, storage_path
+         FROM apps WHERE id = ?1",
+    )?;
+    let mut rows = statement.query([id.to_string()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let id_text: String = row.get(0)?;
+    Ok(Some(StoredApp {
+        id: Uuid::parse_str(&id_text).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        sha256: row.get(1)?,
+        size_bytes: row.get::<_, i64>(2)? as u64,
+        display_name: row
+            .get::<_, Option<String>>(3)?
+            .unwrap_or_else(|| id_text.clone()),
+        app_version: row.get(4)?,
+        bundle_id: row.get(5)?,
+        storage_path: row.get(6)?,
+    }))
+}
+
+pub fn forget_managed_installation(
+    connection: &Connection,
+    app_id: Uuid,
+    device_id: Uuid,
+) -> rusqlite::Result<bool> {
+    if active_job_exists(connection, app_id, device_id)? {
+        return Ok(false);
+    }
+    connection.execute(
+        "INSERT INTO unmanaged_installations (app_id, device_id, removed_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(app_id, device_id) DO UPDATE SET removed_at = excluded.removed_at",
+        (app_id.to_string(), device_id.to_string()),
+    )?;
+    Ok(true)
+}
+
+pub fn restore_managed_installation(
+    connection: &Connection,
+    app_id: Uuid,
+    device_id: Uuid,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "DELETE FROM unmanaged_installations WHERE app_id = ?1 AND device_id = ?2",
+        (app_id.to_string(), device_id.to_string()),
+    )?;
+    Ok(())
+}
+
+pub fn list_managed_installations(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<ManagedInstallation>> {
+    let mut statement = connection.prepare(
+        "SELECT jobs.app_id, jobs.device_id, COALESCE(apps.display_name, apps.bundle_id, apps.id),
+                apps.app_version, jobs.device_label
+         FROM jobs JOIN apps ON apps.id = jobs.app_id
+         WHERE jobs.phase = 'succeeded' AND apps.deleted_at IS NULL
+           AND jobs.completed_at = (
+               SELECT MAX(latest.completed_at) FROM jobs AS latest
+               WHERE latest.app_id = jobs.app_id AND latest.device_id = jobs.device_id
+                 AND latest.phase = 'succeeded'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM unmanaged_installations u
+               WHERE u.app_id = jobs.app_id AND u.device_id = jobs.device_id
+           )
+         ORDER BY jobs.device_label, apps.display_name",
+    )?;
+    statement
+        .query_map([], |row| {
+            let app_id: String = row.get(0)?;
+            let device_id: String = row.get(1)?;
+            Ok(ManagedInstallation {
+                app_id: Uuid::parse_str(&app_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                device_id: Uuid::parse_str(&device_id)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                app_display_name: row.get(2)?,
+                app_version: row.get(3)?,
+                device_label: row.get(4)?,
+            })
+        })?
+        .collect()
+}
+
+pub fn active_job_exists_for_app(connection: &Connection, app_id: Uuid) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM jobs
+            WHERE app_id = ?1
+              AND phase IN ('queued', 'connecting', 'signing', 'transferring', 'installing')
+        )",
+        [app_id.to_string()],
+        |row| row.get(0),
+    )
+}
+
+const SOURCE_SELECT: &str = "SELECT id, app_id, owner, repo, asset_pattern, include_prereleases,
+    auto_download, auto_acknowledged_at, last_checked_at, last_release_id, last_release_tag,
+    last_asset_id, last_asset_name, last_download_sha256, last_status, last_error_code,
+    created_at, updated_at FROM github_sources";
+
+fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubSource> {
+    let id: String = row.get(0)?;
+    let app_id: Option<String> = row.get(1)?;
+    Ok(GitHubSource {
+        id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        app_id: app_id
+            .map(|value| Uuid::parse_str(&value).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()?,
+        owner: row.get(2)?,
+        repo: row.get(3)?,
+        asset_pattern: row.get(4)?,
+        include_prereleases: row.get::<_, i64>(5)? != 0,
+        auto_download: row.get::<_, i64>(6)? != 0,
+        auto_acknowledged_at: row.get(7)?,
+        last_checked_at: row.get(8)?,
+        last_release_id: row.get(9)?,
+        last_release_tag: row.get(10)?,
+        last_asset_id: row.get(11)?,
+        last_asset_name: row.get(12)?,
+        last_download_sha256: row.get(13)?,
+        last_status: row.get(14)?,
+        last_error_code: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
+}
+
+pub fn insert_github_source(
+    connection: &Connection,
+    id: Uuid,
+    app_id: Option<Uuid>,
+    owner: &str,
+    repo: &str,
+    asset_pattern: &str,
+    include_prereleases: bool,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO github_sources
+         (id, app_id, owner, repo, asset_pattern, include_prereleases, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+        rusqlite::params![
+            id.to_string(),
+            app_id.map(|value| value.to_string()),
+            owner,
+            repo,
+            asset_pattern,
+            i64::from(include_prereleases)
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update_github_source(
+    connection: &Connection,
+    id: Uuid,
+    app_id: Option<Uuid>,
+    owner: &str,
+    repo: &str,
+    asset_pattern: &str,
+    include_prereleases: bool,
+) -> rusqlite::Result<bool> {
+    Ok(connection.execute(
+        "UPDATE github_sources SET app_id = ?1, owner = ?2, repo = ?3, asset_pattern = ?4,
+             include_prereleases = ?5, auto_download = 0, auto_acknowledged_at = NULL,
+             updated_at = datetime('now') WHERE id = ?6",
+        rusqlite::params![
+            app_id.map(|value| value.to_string()),
+            owner,
+            repo,
+            asset_pattern,
+            i64::from(include_prereleases),
+            id.to_string()
+        ],
+    )? == 1)
+}
+
+pub fn delete_github_source(connection: &Connection, id: Uuid) -> rusqlite::Result<bool> {
+    Ok(connection.execute("DELETE FROM github_sources WHERE id = ?1", [id.to_string()])? == 1)
+}
+
+pub fn link_github_source_app(
+    connection: &Connection,
+    source_id: Uuid,
+    app_id: Uuid,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE github_sources SET app_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+        (app_id.to_string(), source_id.to_string()),
+    )?;
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+pub fn replace_app_from_source(
+    connection: &mut Connection,
+    app_id: Uuid,
+    source_id: Uuid,
+    sha256: &str,
+    storage_path: &str,
+    size_bytes: u64,
+    bundle_id: &str,
+    app_version: Option<&str>,
+    release_id: i64,
+    release_tag: &str,
+    asset_id: i64,
+    asset_name: &str,
+) -> rusqlite::Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE apps SET sha256 = ?1, storage_path = ?2, size_bytes = ?3,
+         bundle_id = ?4, app_version = ?5, deleted_at = NULL WHERE id = ?6",
+        rusqlite::params![
+            sha256,
+            storage_path,
+            size_bytes as i64,
+            bundle_id,
+            app_version,
+            app_id.to_string()
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE github_sources SET last_checked_at = datetime('now'), last_release_id = ?1,
+         last_release_tag = ?2, last_asset_id = ?3, last_asset_name = ?4,
+         last_download_sha256 = ?5, last_status = 'downloaded', last_error_code = NULL,
+         updated_at = datetime('now') WHERE id = ?6",
+        rusqlite::params![
+            release_id,
+            release_tag,
+            asset_id,
+            asset_name,
+            sha256,
+            source_id.to_string()
+        ],
+    )?;
+    transaction.commit()
+}
+
+pub fn list_github_sources(connection: &Connection) -> rusqlite::Result<Vec<GitHubSource>> {
+    let mut statement = connection.prepare(&format!("{SOURCE_SELECT} ORDER BY created_at DESC"))?;
+    statement.query_map([], source_from_row)?.collect()
+}
+
+pub fn find_github_source(
+    connection: &Connection,
+    id: Uuid,
+) -> rusqlite::Result<Option<GitHubSource>> {
+    let mut statement = connection.prepare(&format!("{SOURCE_SELECT} WHERE id = ?1"))?;
+    let mut rows = statement.query([id.to_string()])?;
+    rows.next()?.map(source_from_row).transpose()
+}
+
+pub fn set_source_automation(
+    connection: &Connection,
+    id: Uuid,
+    enabled: bool,
+    acknowledged: bool,
+) -> rusqlite::Result<bool> {
+    if enabled && !acknowledged {
+        return Ok(false);
+    }
+    Ok(connection.execute(
+        "UPDATE github_sources
+         SET auto_download = ?1,
+             auto_acknowledged_at = CASE WHEN ?1 = 1 THEN datetime('now') ELSE NULL END,
+             updated_at = datetime('now') WHERE id = ?2",
+        rusqlite::params![i64::from(enabled), id.to_string()],
+    )? == 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_source_check(
+    connection: &Connection,
+    id: Uuid,
+    release_id: Option<i64>,
+    release_tag: Option<&str>,
+    asset_id: Option<i64>,
+    asset_name: Option<&str>,
+    sha256: Option<&str>,
+    status: &str,
+    error_code: Option<&str>,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE github_sources SET last_checked_at = datetime('now'), last_release_id = ?1,
+         last_release_tag = ?2, last_asset_id = ?3, last_asset_name = ?4,
+         last_download_sha256 = ?5, last_status = ?6, last_error_code = ?7,
+         updated_at = datetime('now') WHERE id = ?8",
+        rusqlite::params![
+            release_id,
+            release_tag,
+            asset_id,
+            asset_name,
+            sha256,
+            status,
+            error_code,
+            id.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_REFRESH_AFTER_DAYS, initialize, managed_app_identities, refresh_after_days,
-        refresh_due_targets, set_refresh_after_days,
+        DEFAULT_REFRESH_AFTER_DAYS, forget_managed_installation, initialize,
+        list_managed_installations, managed_app_identities, refresh_after_days,
+        refresh_due_targets, restore_managed_installation, set_refresh_after_days,
     };
     use rusqlite::Connection;
     use uuid::Uuid;
@@ -645,6 +1103,49 @@ mod tests {
                 .is_empty()
         );
 
+        drop(connection);
+        std::fs::remove_file(path).expect("remove test database");
+    }
+    #[test]
+    fn forgotten_installation_is_hidden_and_restored_after_success() {
+        let path = std::env::temp_dir().join(format!("iphoneloadly-managed-{}.db", Uuid::now_v7()));
+        let connection = initialize(&path).expect("initialize database");
+        let app_id = Uuid::now_v7();
+        let device_id = Uuid::now_v7();
+        connection.execute(
+            "INSERT INTO apps (id, sha256, storage_path, size_bytes, uploaded_at, bundle_id, display_name)
+             VALUES (?1, 'managed-hash', 'managed.ipa', 1, datetime('now'), 'com.example.managed', 'Managed')",
+            [app_id.to_string()],
+        ).expect("insert app");
+        connection.execute(
+            "INSERT INTO jobs (id, app_id, device_id, phase, created_at, completed_at, device_label, app_display_name)
+             VALUES (?1, ?2, ?3, 'succeeded', datetime('now'), datetime('now'), 'Test iPhone', 'Managed')",
+            (Uuid::now_v7().to_string(), app_id.to_string(), device_id.to_string()),
+        ).expect("insert job");
+        assert_eq!(
+            list_managed_installations(&connection)
+                .expect("list managed")
+                .len(),
+            1
+        );
+        assert!(forget_managed_installation(&connection, app_id, device_id).expect("forget"));
+        assert!(
+            managed_app_identities(&connection, device_id)
+                .expect("identities")
+                .is_empty()
+        );
+        assert!(
+            list_managed_installations(&connection)
+                .expect("list forgotten")
+                .is_empty()
+        );
+        restore_managed_installation(&connection, app_id, device_id).expect("restore");
+        assert_eq!(
+            list_managed_installations(&connection)
+                .expect("list restored")
+                .len(),
+            1
+        );
         drop(connection);
         std::fs::remove_file(path).expect("remove test database");
     }
