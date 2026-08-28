@@ -465,8 +465,9 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartAppleLoginRequest, device_id_for_udid, managed_app};
-    use crate::store::ManagedAppIdentity;
+    use super::{StartAppleLoginRequest, device_id_for_udid, install_job_json, managed_app};
+    use crate::store::{ManagedAppIdentity, StoredJob};
+    use uuid::Uuid;
 
     #[test]
     fn device_id_is_stable_for_non_uuid_apple_udids() {
@@ -505,6 +506,37 @@ mod tests {
             &identities
         ));
         assert!(!managed_app("com.apple.Pages", &identities));
+    }
+
+    #[test]
+    fn install_job_json_preserves_live_progress_and_safe_fields() {
+        let id = Uuid::now_v7();
+        let app_id = Uuid::now_v7();
+        let device_id = Uuid::now_v7();
+        let value = install_job_json(StoredJob {
+            id,
+            app_id,
+            device_id,
+            phase: "signing".into(),
+            progress_percent: Some(18),
+            device_label: "Test iPhone".into(),
+            created_at: "2026-08-28T12:00:00Z".into(),
+            completed_at: None,
+            failure_code: None,
+            app_display_name: "Example".into(),
+            app_version: Some("1.2.3".into()),
+        });
+
+        assert_eq!(value["id"], id.to_string());
+        assert_eq!(value["appId"], app_id.to_string());
+        assert_eq!(value["deviceId"], device_id.to_string());
+        assert_eq!(value["deviceLabel"], "Test iPhone");
+        assert_eq!(value["progressPercent"], 18);
+        assert_eq!(value["appDisplayName"], "Example");
+        assert_eq!(value["appVersion"], "1.2.3");
+        assert_eq!(value["createdAt"], "2026-08-28T12:00:00Z");
+        assert!(value["completedAt"].is_null());
+        assert_eq!(value["publicMessage"], "Signing the IPA.");
     }
 }
 
@@ -1019,6 +1051,23 @@ fn job_message(phase: &str, failure_code: Option<&str>) -> &'static str {
         _ => "Installation job status is unavailable.",
     }
 }
+fn install_job_json(job: store::StoredJob) -> serde_json::Value {
+    let public_message = job_message(&job.phase, job.failure_code.as_deref());
+    serde_json::json!({
+        "id": job.id,
+        "appId": job.app_id,
+        "deviceId": job.device_id,
+        "deviceLabel": job.device_label,
+        "phase": job.phase,
+        "progressPercent": job.progress_percent,
+        "appDisplayName": job.app_display_name,
+        "appVersion": job.app_version,
+        "createdAt": job.created_at,
+        "completedAt": job.completed_at,
+        "failureCode": job.failure_code,
+        "publicMessage": public_message
+    })
+}
 
 async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
     let job = state
@@ -1027,20 +1076,7 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
         .map_err(|_| ())
         .and_then(|database| store::find_job(&database, id).map_err(|_| ()));
     match job {
-        Ok(Some(job)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": job.id,
-                "appId": job.app_id,
-                "deviceId": job.device_id,
-                "phase": job.phase,
-                "appDisplayName": job.app_display_name,
-                "appVersion": job.app_version,
-                "failureCode": job.failure_code,
-                "publicMessage": job_message(&job.phase, job.failure_code.as_deref())
-            })),
-        )
-            .into_response(),
+        Ok(Some(job)) => (StatusCode::OK, Json(install_job_json(job))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"message":"Installation job was not found."})),
@@ -1062,21 +1098,7 @@ async fn list_install_jobs(State(state): State<AppState>) -> impl IntoResponse {
         .and_then(|database| store::list_recent_jobs(&database, 20).map_err(|_| ()))
     {
         Ok(jobs) => Json(serde_json::json!(
-            jobs.into_iter()
-                .map(|job| serde_json::json!({
-                    "id": job.id,
-                    "appId": job.app_id,
-                    "deviceLabel": job.device_label,
-                    "phase": job.phase,
-                    "appDisplayName": job.app_display_name,
-                    "appVersion": job.app_version,
-                    "progressPercent": job.progress_percent,
-                    "createdAt": job.created_at,
-                    "completedAt": job.completed_at,
-                    "failureCode": job.failure_code,
-                    "publicMessage": job_message(&job.phase, job.failure_code.as_deref())
-                }))
-                .collect::<Vec<_>>()
+            jobs.into_iter().map(install_job_json).collect::<Vec<_>>()
         )),
         Err(_) => Json(serde_json::json!({"message":"Unable to read installation history."})),
     }
