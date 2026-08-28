@@ -2,6 +2,18 @@
 
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
+
+## [0.3.0-alpha.2] - 2026-08-28
+
+### Fixed
+
+- Debian self-updates stop the API before replacing its executable, avoiding
+  `ETXTBSY` failures during systemd restarts.
+- Upgrade startup now retries health checks within a bounded timeout and
+  requires the exact package version.
+- Failed upgrades safely restore the previous runtime and restart the API
+  without changing persistent application state.
+
 ## [0.3.0-alpha.1] - 2026-08-28
 
 ### Added

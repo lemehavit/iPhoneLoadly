@@ -47,6 +47,60 @@ find_package_root() {
 }
 repo_root="$(find_package_root)" || { echo 'Unable to locate iPhoneLoadly package files.' >&2; exit 1; }
 
+startup_timeout_seconds="${IPHONELOADLY_STARTUP_TIMEOUT_SECONDS:-30}"
+startup_poll_interval_seconds="${IPHONELOADLY_STARTUP_POLL_INTERVAL_SECONDS:-1}"
+replacement_temp=""
+cleanup_replacement() {
+  if [[ -n "${replacement_temp}" ]]; then
+    sudo rm -f -- "${replacement_temp}" || true
+  fi
+}
+stop_api_service() {
+  sudo systemctl stop iphoneloadly-api.service
+  local started_at="$SECONDS"
+  while sudo systemctl is-active --quiet iphoneloadly-api.service; do
+    (( SECONDS - started_at >= 20 )) && {
+      echo 'Timed out waiting for iPhoneLoadly API to stop.' >&2
+      return 1
+    }
+    sleep 1
+  done
+}
+health_version() {
+  local health="$1"
+  if [[ "${health}" =~ \"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+wait_for_api_version() {
+  local expected_version="$1"
+  local started_at="$SECONDS"
+  local deadline=$((started_at + startup_timeout_seconds))
+  local remaining curl_timeout health actual_version
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    curl_timeout=$((remaining < 2 ? remaining : 2))
+    if health="$(curl --fail --silent --show-error --max-time "${curl_timeout}" \
+      http://127.0.0.1:8080/healthz 2>/dev/null)"; then
+      actual_version="$(health_version "${health}")"
+      if [[ -n "${actual_version}" && "${actual_version}" == "${expected_version}" ]]; then
+        printf '%s\n' "${health}"
+        return 0
+      fi
+    fi
+    (( SECONDS < deadline )) && sleep "${startup_poll_interval_seconds}"
+  done
+  echo "Timed out waiting for API version ${expected_version}." >&2
+  return 1
+}
+replace_api_binary() {
+  local target=/opt/iphoneloadly/bin/iphoneloadly-api
+  replacement_temp="$(sudo mktemp "$(dirname -- "${target}")/.iphoneloadly-api.XXXXXX")"
+  sudo install -o root -g root -m 0755 "${api_binary}" "${replacement_temp}"
+  sudo mv -f -- "${replacement_temp}" "${target}"
+  replacement_temp=""
+}
+
 if [[ "${check_package_layout}" == true ]]; then
   for required in \
     "${repo_root}/deploy/systemd/iphoneloadly-api.service" \
@@ -71,7 +125,19 @@ fi
 
 if [[ "${upgrade}" == true ]]; then
   [[ -n "${package_root}" ]] || package_root="${repo_root}"
-  [[ -x "${api_binary}" ]] || { echo "Upgrade binary is not executable." >&2; exit 1; }
+  [[ -f "${api_binary}" && -x "${api_binary}" ]] || {
+    echo "Upgrade binary is missing or not executable." >&2
+    exit 1
+  }
+  [[ -f "${package_root}/VERSION" ]] || {
+    echo "Upgrade package is missing VERSION." >&2
+    exit 1
+  }
+  expected_version="$(tr -d '[:space:]' < "${package_root}/VERSION")"
+  [[ -n "${expected_version}" ]] || {
+    echo "Upgrade package VERSION is empty." >&2
+    exit 1
+  }
   command -v sudo >/dev/null || { echo "sudo is required." >&2; exit 1; }
   for required in \
     "${package_root}/deploy/systemd/iphoneloadly-api.service" \
@@ -81,8 +147,10 @@ if [[ "${upgrade}" == true ]]; then
     "${package_root}/deploy/systemd/iphoneloadly-source-sync.timer"; do
     [[ -f "${required}" ]] || { echo "Upgrade package is missing ${required#"${package_root}/"}" >&2; exit 1; }
   done
+  trap cleanup_replacement EXIT
   sudo install -d -o root -g root -m 0755 /opt/iphoneloadly/bin /usr/share/iphoneloadly/scripts
-  sudo install -o root -g root -m 0755 "${api_binary}" /opt/iphoneloadly/bin/iphoneloadly-api
+  stop_api_service
+  replace_api_binary
   sudo install -o root -g root -m 0644 "${package_root}/deploy/systemd/iphoneloadly-api.service" /etc/systemd/system/iphoneloadly-api.service
   sudo install -o root -g root -m 0644 "${package_root}/deploy/systemd/iphoneloadly-update.service" /etc/systemd/system/iphoneloadly-update.service
   sudo install -o root -g root -m 0644 "${package_root}/deploy/systemd/iphoneloadly-update.path" /etc/systemd/system/iphoneloadly-update.path
@@ -91,9 +159,9 @@ if [[ "${upgrade}" == true ]]; then
   sudo install -o root -g root -m 0755 "${package_root}/deploy/host/update-iphoneloadly.sh" /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
   sudo systemctl daemon-reload
   sudo systemctl enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer
-  sudo systemctl restart iphoneloadly-api.service
-  curl --fail --silent http://127.0.0.1:8080/healthz
-  printf '\nUpgraded iPhoneLoadly without changing configuration or state.\n'
+  sudo systemctl start iphoneloadly-api.service
+  wait_for_api_version "${expected_version}"
+  printf '\nUpgraded iPhoneLoadly to %s without changing configuration or state.\n' "${expected_version}"
   exit 0
 fi
 if [[ -z "${api_binary}" ]]; then
