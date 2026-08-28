@@ -36,6 +36,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends systemd
           getent group iphoneloadly-mux >/dev/null || sudo groupadd --system iphoneloadly-mux
+          sudo mkdir -p /opt/iphoneloadly/bin /usr/local/libexec/iphoneloadly /var/lib/lockdown
+          sudo install -m 0755 /usr/bin/true /opt/iphoneloadly/bin/iphoneloadly-api
+          sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/netmuxd
+          sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/publish-dashboard-mdns.sh
+          sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
           systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.path deploy/systemd/*.timer
       - name: Validate Debian 13 upgrade preservation
         env:
