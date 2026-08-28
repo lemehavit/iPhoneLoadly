@@ -101,6 +101,7 @@ jobs:
             /var/lib/iphoneloadly/data/apps \
             /var/lib/iphoneloadly/data/signing \
             /var/lib/lockdown
+          install -d -o root -g root -m 0755 /usr/local/libexec/iphoneloadly
           printf '%s\n' \
             'RUST_LOG=warn' \
             'IPHONELOADLY_ANISETTE_URL=http://127.0.0.1:6970' \
