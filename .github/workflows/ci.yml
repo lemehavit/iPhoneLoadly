@@ -388,6 +388,8 @@ jobs:
           )
           rollback_digest="$(sha256sum "${rollback_archive_dir}/${rollback_archive_name}" | cut -d' ' -f1)"
           runtime_before="$(sha256sum /opt/iphoneloadly/bin/iphoneloadly-api | cut -d' ' -f1)"
+          export ROLLBACK_ARCHIVE_DIR="${rollback_archive_dir}"
+          export ROLLBACK_ARCHIVE_NAME="${rollback_archive_name}"
           cat >/tmp/fake-bin/curl <<'UPDATER_CURL'
           #!/usr/bin/env bash
           set -Eeuo pipefail
@@ -407,9 +409,9 @@ jobs:
           done
           [[ -n "${output}" && -n "${url}" ]]
           if [[ "${url}" == *.sha256 ]]; then
-            cp "${rollback_archive_dir}/${rollback_archive_name}.sha256" "${output}"
+            cp "${ROLLBACK_ARCHIVE_DIR}/${ROLLBACK_ARCHIVE_NAME}.sha256" "${output}"
           else
-            cp "${rollback_archive_dir}/${rollback_archive_name}" "${output}"
+            cp "${ROLLBACK_ARCHIVE_DIR}/${ROLLBACK_ARCHIVE_NAME}" "${output}"
           fi
           UPDATER_CURL
           chmod 0755 /tmp/fake-bin/curl
