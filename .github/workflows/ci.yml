@@ -198,6 +198,9 @@ jobs:
               exit 0
               ;;
             "stop iphoneloadly-api.service")
+              if [[ -e /tmp/rollback-stop-fails ]]; then
+                exit 1
+              fi
               if [[ -f "${api_pid_file}" ]]; then
                 api_pid="$(cat "${api_pid_file}")"
                 if kill -0 "${api_pid}" 2>/dev/null; then
@@ -363,6 +366,9 @@ jobs:
           #!/usr/bin/env bash
           set -Eeuo pipefail
           printf '%s\n' invoked >/tmp/rollback-installer-invoked
+          if [[ -e /tmp/rollback-stop-fails ]]; then
+            exit 1
+          fi
           replacement="$(mktemp /opt/iphoneloadly/bin/.rollback-failure.XXXXXX)"
           : >/tmp/update-path-enabled
           : >/tmp/source-sync-timer-enabled
@@ -455,6 +461,30 @@ jobs:
           test ! -e /tmp/source-sync-timer-enabled
           echo "rollback_runtime_restored=true"
           echo "rollback_status_preserved=failed"
+          echo "::group::Verify rollback stop failure blocks restore"
+          rm -f /tmp/rollback-restore-while-active /tmp/rollback-replace-while-active
+          : >/tmp/rollback-stop-fails
+          runtime_before_stop_failure="$(sha256sum /opt/iphoneloadly/bin/iphoneloadly-api | cut -d' ' -f1)"
+          printf '{"targetVersion":"%s","expectedArchiveSha256":"%s","createdAt":"2026-08-28T00:00:01Z"}\n' \
+            "${expected_version}" "${rollback_digest}" \
+            >/run/iphoneloadly/update-request.json
+          chmod 0600 /run/iphoneloadly/update-request.json
+          if PATH="/tmp/fake-bin:${PATH}" \
+            bash /tmp/package/deploy/host/update-iphoneloadly.sh; then
+            stop_failure_status=0
+          else
+            stop_failure_status=$?
+          fi
+          rm -f /tmp/rollback-stop-fails
+          test "${stop_failure_status}" -ne 0
+          test ! -e /run/iphoneloadly/update-request.json
+          grep -Fq '"status":"failed"' /var/lib/iphoneloadly/data/update-status.json
+          grep -Fq 'Rollback verification failed' /var/lib/iphoneloadly/data/update-status.json
+          runtime_after_stop_failure="$(sha256sum /opt/iphoneloadly/bin/iphoneloadly-api | cut -d' ' -f1)"
+          test "${runtime_after_stop_failure}" = "${runtime_before_stop_failure}"
+          test -e /tmp/api-service-active
+          test ! -e /tmp/rollback-restore-while-active
+          echo "rollback_stop_failure_blocks_restore=true"
           echo "::endgroup::"
           echo "::group::Verify preservation state"
           : >/tmp/post-hashes

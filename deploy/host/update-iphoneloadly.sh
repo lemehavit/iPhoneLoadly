@@ -30,27 +30,37 @@ capture_enablement() {
   fi
 }
 restore_enablement() {
+  local restore_failed=false
   if [[ "${update_path_was_enabled}" == true ]]; then
-    systemctl enable --now iphoneloadly-update.path
-  else
-    systemctl disable --now iphoneloadly-update.path
+    if ! systemctl enable --now iphoneloadly-update.path; then
+      restore_failed=true
+    fi
+  elif ! systemctl disable --now iphoneloadly-update.path; then
+    restore_failed=true
   fi
   if [[ "${source_sync_timer_was_enabled}" == true ]]; then
-    systemctl enable --now iphoneloadly-source-sync.timer
-  else
-    systemctl disable --now iphoneloadly-source-sync.timer
+    if ! systemctl enable --now iphoneloadly-source-sync.timer; then
+      restore_failed=true
+    fi
+  elif ! systemctl disable --now iphoneloadly-source-sync.timer; then
+    restore_failed=true
   fi
+  [[ "${restore_failed}" == false ]]
 }
 stop_api_service() {
-  systemctl stop iphoneloadly-api.service
+  if ! systemctl stop iphoneloadly-api.service; then
+    echo 'Failed to stop iPhoneLoadly API.' >&2
+    return 1
+  fi
   local started_at="$SECONDS"
   while systemctl is-active --quiet iphoneloadly-api.service; do
-    (( SECONDS - started_at >= 20 )) && {
+    if (( SECONDS - started_at >= 20 )); then
       echo 'Timed out waiting for iPhoneLoadly API to stop.' >&2
       return 1
-    }
+    fi
     sleep 1
   done
+  return 0
 }
 health_version() {
   local health="$1"
@@ -113,27 +123,62 @@ restore_runtime() {
     key="${key//\//__}"
     source="${backup_root}/${key}"
     if [[ -f "${backup_root}/${key}.missing" ]]; then
-      rm -f -- "${target}"
+      if ! rm -f -- "${target}"; then
+        return 1
+      fi
     elif [[ -e "${source}" ]]; then
-      install -d -- "$(dirname -- "${target}")"
-      temporary="$(mktemp "$(dirname -- "${target}")/.iphoneloadly-restore.XXXXXX")"
-      rm -f -- "${temporary}"
-      cp -a -- "${source}" "${temporary}"
-      mv -f -- "${temporary}" "${target}"
+      if ! install -d -- "$(dirname -- "${target}")"; then
+        return 1
+      fi
+      if ! temporary="$(mktemp "$(dirname -- "${target}")/.iphoneloadly-restore.XXXXXX")"; then
+        return 1
+      fi
+      if ! rm -f -- "${temporary}"; then
+        return 1
+      fi
+      if ! cp -a -- "${source}" "${temporary}"; then
+        rm -f -- "${temporary}" || true
+        return 1
+      fi
+      if ! mv -f -- "${temporary}" "${target}"; then
+        rm -f -- "${temporary}" || true
+        return 1
+      fi
     fi
   done
+  return 0
 }
 rollback_runtime() {
-  stop_api_service
-  restore_runtime
-  systemctl daemon-reload
-  restore_enablement
-  systemctl start iphoneloadly-api.service
-  if [[ -n "${previous_version}" ]]; then
-    wait_for_api_version "${previous_version}"
-  else
-    wait_for_api_health
+  local rollback_failed=false
+  if ! stop_api_service; then
+    echo 'Rollback could not stop the iPhoneLoadly API.' >&2
+    return 1
   fi
+  if ! restore_runtime; then
+    echo 'Rollback could not restore the previous runtime.' >&2
+    return 1
+  fi
+  if ! systemctl daemon-reload; then
+    rollback_failed=true
+  fi
+  if ! restore_enablement; then
+    rollback_failed=true
+  fi
+  if ! systemctl start iphoneloadly-api.service; then
+    echo 'Rollback could not start the iPhoneLoadly API.' >&2
+    return 1
+  fi
+  if [[ -n "${previous_version}" ]]; then
+    if ! wait_for_api_version "${previous_version}"; then
+      rollback_failed=true
+    fi
+  elif ! wait_for_api_health; then
+    rollback_failed=true
+  fi
+  if [[ "${rollback_failed}" == true ]]; then
+    return 1
+  fi
+  return 0
 }
 write_status() {
   local status="$1" message="$2"
