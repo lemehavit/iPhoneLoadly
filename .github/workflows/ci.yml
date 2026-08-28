@@ -101,7 +101,7 @@ jobs:
               "IPHONELOADLY_PAIRING_DIR=/var/lib/lockdown" \
               >/etc/iphoneloadly/api.env
             sqlite3 /var/lib/iphoneloadly/data/fixture.sqlite3 \
-              "CREATE TABLE marker (value TEXT NOT NULL); INSERT INTO marker VALUES (\"alpha2-database-fixture\");"
+              "CREATE TABLE marker (value TEXT NOT NULL); INSERT INTO marker VALUES ('alpha2-database-fixture');"
             printf "%s\n" "alpha2-uploaded-ipa-fixture" \
               >/var/lib/iphoneloadly/data/apps/fixture.ipa
             printf "%s\n" "alpha2-signing-state-fixture" \
