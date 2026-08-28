@@ -43,20 +43,20 @@ jobs:
           sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
           systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.path deploy/systemd/*.timer
       - name: Validate Debian 13 upgrade preservation
-        env:
-          RELEASE_ARCHIVE: dist/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz
-          RELEASE_CHECKSUM: dist/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz.sha256
         run: |
+          release_version="$(tr -d '[:space:]' < VERSION)"
+          release_archive="dist/iphoneloadly-v${release_version}-linux-amd64.tar.gz"
+          release_checksum="${release_archive}.sha256"
           set -Eeuo pipefail
           trap 'status=$?; echo "::error::Debian validation failed at line ${LINENO}: ${BASH_COMMAND}"; exit "${status}"' ERR
           echo "::group::Verify release checksum"
-          (cd dist && sha256sum -c "$(basename "${RELEASE_CHECKSUM}")")
+          (cd dist && sha256sum -c "$(basename "${release_checksum}")")
           echo "::endgroup::"
           echo "::group::Run Debian 13 preservation validation"
           container_log="${RUNNER_TEMP}/iphoneloadly-debian-validation.log"
           docker run --rm --interactive --platform linux/amd64 \
             --volume "${GITHUB_WORKSPACE}/dist:/release:ro" \
-            debian:13-slim bash -s -- "${RELEASE_ARCHIVE##*/}" <<'CONTAINER_SCRIPT' \
+            debian:13-slim bash -s -- "${release_archive##*/}" "${release_version}" <<'CONTAINER_SCRIPT' \
             | tee "${container_log}"
           set -Eeuo pipefail
           container_error() {
@@ -76,6 +76,7 @@ jobs:
           }
           trap container_error ERR
           release_archive="/release/$1"
+          expected_version="$2"
           echo "::group::Install Debian fixture dependencies"
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
@@ -204,7 +205,7 @@ jobs:
           fi
           echo "api_started_before_installer=false"
           echo "::endgroup::"
-          echo "::group::Run packaged alpha.3 upgrade installer"
+          echo "::group::Run packaged upgrade installer"
           bash /tmp/package/install-iphoneloadly.sh \
             --upgrade \
             --binary /tmp/package/bin/iphoneloadly-api \
@@ -240,7 +241,7 @@ jobs:
           echo "::endgroup::"
           echo "::group::Verify installer and post-install health"
           curl --fail --silent http://127.0.0.1:8080/healthz | tee /tmp/post-healthz.json
-          grep -Fq '"version":"0.2.0-alpha.3"' /tmp/post-healthz.json
+          grep -Fq "\"version\":\"${expected_version}\"" /tmp/post-healthz.json
           echo "::endgroup::"
           echo "::group::Verify preservation state"
           : >/tmp/post-hashes
