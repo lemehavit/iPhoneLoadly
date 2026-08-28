@@ -91,7 +91,7 @@ jobs:
           docker exec "${container}" test -x /tmp/package/bin/iphoneloadly-api
           docker exec "${container}" test -x /tmp/package/install-iphoneloadly.sh
           docker exec "${container}" bash -c '
-            set -Eeuo pipefail
+            set -Eeuxo pipefail
             mkdir -p /etc/iphoneloadly /etc/caddy \
               /var/lib/iphoneloadly/data/apps \
               /var/lib/iphoneloadly/data/signing /var/lib/lockdown
