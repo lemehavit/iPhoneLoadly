@@ -39,3 +39,22 @@ credentials, pairing records, UDIDs, tokens, or private keys. Contact the
 repository owner privately through the contact method listed on the GitHub
 profile, with a minimal reproduction and affected version. Allow time for a
 fix before public disclosure.
+
+## GitHub IPA sources and automatic downloads
+
+GitHub IPA sources are restricted to public canonical GitHub repositories and
+bounded, structurally validated release assets. This does not establish trust
+in the application code. A repository, maintainer account, release, or asset
+can be compromised or replaced, and re-signing an IPA with your Apple account
+does not make malicious code safe. Review release notes and provenance
+manually when possible.
+
+Automatic source downloads are disabled by default and require an explicit
+acknowledgement in the dashboard. Automatic sync updates only the server copy;
+it does not immediately install the IPA on an iPhone. If automatic refresh is
+enabled, the newer server copy may later be installed during that normal
+refresh cycle.
+
+The official self-updater accepts only verified release artifacts from the
+`lemehavit/iPhoneLoadly` repository. The browser cannot provide an update URL,
+repository, command, or arbitrary version.

@@ -1,6 +1,6 @@
 [package]
 name = "iphoneloadly-api"
-version = "0.2.0-alpha.2"
+version = "0.2.0-alpha.3"
 edition = "2024"
 publish = false
 
@@ -23,6 +23,9 @@ rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
 sha2 = "0.10.9"
 thiserror = "2.0.18"
 tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "net", "sync", "time"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "stream", "rustls-tls"] }
+semver = "1.0.27"
+futures-util = "0.3.31"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1.18.1", features = ["serde", "v7"] }

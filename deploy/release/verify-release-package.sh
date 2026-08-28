@@ -26,7 +26,12 @@ for required in \
   install.sh \
   install-iphoneloadly.sh \
   deploy/host/install-debian13.sh \
+  deploy/host/update-iphoneloadly.sh \
   deploy/systemd/iphoneloadly-api.service \
+  deploy/systemd/iphoneloadly-update.service \
+  deploy/systemd/iphoneloadly-update.path \
+  deploy/systemd/iphoneloadly-source-sync.service \
+  deploy/systemd/iphoneloadly-source-sync.timer \
   deploy/systemd/iphoneloadly-dashboard-mdns.service \
   deploy/systemd/iphoneloadly-refresh.service \
   deploy/systemd/iphoneloadly-refresh.timer \

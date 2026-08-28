@@ -31,6 +31,236 @@ jobs:
       - run: find deploy/host deploy/release scripts -type f -name '*.sh' -exec bash -n {} +
       - run: bash deploy/release/build-release.sh
       - run: bash deploy/release/verify-release-package.sh
+      - name: Verify shipped systemd units
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends systemd
+          getent group iphoneloadly-mux >/dev/null || sudo groupadd --system iphoneloadly-mux
+          sudo mkdir -p /opt/iphoneloadly/bin /usr/local/libexec/iphoneloadly /var/lib/lockdown
+          sudo install -m 0755 /usr/bin/true /opt/iphoneloadly/bin/iphoneloadly-api
+          sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/netmuxd
+          sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/publish-dashboard-mdns.sh
+          sudo install -m 0755 /usr/bin/true /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
+          systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.path deploy/systemd/*.timer
+      - name: Validate Debian 13 upgrade preservation
+        env:
+          RELEASE_ARCHIVE: dist/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz
+          RELEASE_CHECKSUM: dist/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz.sha256
+        run: |
+          set -Eeuo pipefail
+          trap 'status=$?; echo "::error::Debian validation failed at line ${LINENO}: ${BASH_COMMAND}"; exit "${status}"' ERR
+          echo "::group::Verify release checksum"
+          (cd dist && sha256sum -c "$(basename "${RELEASE_CHECKSUM}")")
+          echo "::endgroup::"
+          echo "::group::Run Debian 13 preservation validation"
+          container_log="${RUNNER_TEMP}/iphoneloadly-debian-validation.log"
+          docker run --rm --interactive --platform linux/amd64 \
+            --volume "${GITHUB_WORKSPACE}/dist:/release:ro" \
+            debian:13-slim bash -s -- "${RELEASE_ARCHIVE##*/}" <<'CONTAINER_SCRIPT' \
+            | tee "${container_log}"
+          set -Eeuo pipefail
+          container_error() {
+            status=$?
+            echo "::error::Debian container failed at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+            if [[ -f /tmp/systemctl-invocations.log ]]; then
+              echo "::group::systemctl log"
+              cat /tmp/systemctl-invocations.log
+              echo "::endgroup::"
+            fi
+            if [[ -f /tmp/api.log ]]; then
+              echo "::group::API log"
+              cat /tmp/api.log
+              echo "::endgroup::"
+            fi
+            exit "${status}"
+          }
+          trap container_error ERR
+          release_archive="/release/$1"
+          echo "::group::Install Debian fixture dependencies"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            ca-certificates \
+            curl \
+            libdbus-1-3 \
+            procps \
+            sqlite3 \
+            sudo
+          echo "::endgroup::"
+          echo "::group::Extract release archive"
+          mkdir -p /tmp/package
+          tar -xzf "${release_archive}" -C /tmp/package --strip-components=1
+          test -x /tmp/package/bin/iphoneloadly-api
+          test -x /tmp/package/install-iphoneloadly.sh
+          stat --format='%a %n' \
+            /tmp/package/bin/iphoneloadly-api \
+            /tmp/package/install-iphoneloadly.sh
+          echo "::endgroup::"
+          echo "::group::Seed preservation fixtures"
+          mkdir -p /etc/iphoneloadly /etc/caddy \
+            /var/lib/iphoneloadly/data/apps \
+            /var/lib/iphoneloadly/data/signing \
+            /var/lib/lockdown
+          install -d -o root -g root -m 0755 /usr/local/libexec/iphoneloadly
+          printf '%s\n' \
+            'RUST_LOG=warn' \
+            'IPHONELOADLY_ANISETTE_URL=http://127.0.0.1:6970' \
+            'IPHONELOADLY_MUX_SOCKET=/run/iphoneloadly/mux.sock' \
+            'IPHONELOADLY_PAIRING_DIR=/var/lib/lockdown' \
+            >/etc/iphoneloadly/api.env
+          sqlite3 /var/lib/iphoneloadly/data/fixture.sqlite3 <<'SQL'
+          CREATE TABLE marker (value TEXT NOT NULL);
+          INSERT INTO marker (value) VALUES ('alpha2-database-fixture');
+          SQL
+          printf '%s\n' 'alpha2-uploaded-ipa-fixture' \
+            >/var/lib/iphoneloadly/data/apps/fixture.ipa
+          printf '%s\n' 'alpha2-signing-state-fixture' \
+            >/var/lib/iphoneloadly/data/signing/fixture.state
+          printf '%s\n' 'alpha2-pairing-fixture' \
+            >/var/lib/lockdown/fixture.plist
+          printf '%s\n' 'alpha2-caddy-fixture' \
+            >/etc/caddy/Caddyfile
+          chmod 0600 /etc/iphoneloadly/api.env
+          chmod 0640 /var/lib/iphoneloadly/data/fixture.sqlite3
+          chmod 0640 /var/lib/iphoneloadly/data/apps/fixture.ipa
+          chmod 0600 /var/lib/iphoneloadly/data/signing/fixture.state
+          chmod 0600 /var/lib/lockdown/fixture.plist
+          chmod 0644 /etc/caddy/Caddyfile
+          echo "::endgroup::"
+          preserved_files=(
+            /etc/iphoneloadly/api.env
+            /var/lib/iphoneloadly/data/fixture.sqlite3
+            /var/lib/iphoneloadly/data/apps/fixture.ipa
+            /var/lib/iphoneloadly/data/signing/fixture.state
+            /var/lib/lockdown/fixture.plist
+            /etc/caddy/Caddyfile
+          )
+          echo "::group::Record pre-upgrade preservation state"
+          : >/tmp/pre-hashes
+          : >/tmp/pre-metadata
+          for path in "${preserved_files[@]}"; do
+            sha256sum "${path}" >>/tmp/pre-hashes
+            stat --format='%a %U:%G %n' "${path}" >>/tmp/pre-metadata
+          done
+          cat /tmp/pre-hashes
+          cat /tmp/pre-metadata
+          echo "::endgroup::"
+          echo "::group::Install restart-aware systemctl test double"
+          cat >/usr/local/bin/systemctl <<'SYSTEMCTL'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          invocations=/tmp/systemctl-invocations.log
+          printf '%s\n' "$*" >>"${invocations}"
+          case "$*" in
+            "daemon-reload")
+              exit 0
+              ;;
+            "enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer")
+              exit 0
+              ;;
+            "restart iphoneloadly-api.service")
+              set -a
+              # shellcheck disable=SC1091
+              source /etc/iphoneloadly/api.env
+              set +a
+              cd /var/lib/iphoneloadly
+              nohup /opt/iphoneloadly/bin/iphoneloadly-api \
+                >>/tmp/api.log 2>&1 </dev/null &
+              api_pid=$!
+              printf '%s\n' "${api_pid}" >/tmp/api.pid
+              for attempt in $(seq 1 30); do
+                if curl --fail --silent http://127.0.0.1:8080/healthz \
+                  >/tmp/api-healthz.json; then
+                  printf '%s\n' \
+                    "$(readlink -f "/proc/${api_pid}/exe")" \
+                    >/tmp/api-executable
+                  exit 0
+                fi
+                if ! kill -0 "${api_pid}" 2>/dev/null; then
+                  cat /tmp/api.log >&2 || true
+                  exit 1
+                fi
+                [[ "${attempt}" -lt 30 ]] || {
+                  cat /tmp/api.log >&2 || true
+                  exit 1
+                }
+                sleep 1
+              done
+              ;;
+            *)
+              echo "Unexpected systemctl invocation: $*" >&2
+              exit 64
+              ;;
+          esac
+          SYSTEMCTL
+          chmod 0755 /usr/local/bin/systemctl
+          test "$(sudo sh -c 'command -v systemctl')" = /usr/local/bin/systemctl
+          echo "::endgroup::"
+          echo "::group::Confirm API is stopped before installer"
+          test ! -e /opt/iphoneloadly/bin/iphoneloadly-api
+          if pgrep -f '/opt/iphoneloadly/bin/iphoneloadly-api' >/dev/null; then
+            echo "API is already running before installer invocation." >&2
+            exit 1
+          fi
+          echo "api_started_before_installer=false"
+          echo "::endgroup::"
+          echo "::group::Run packaged alpha.3 upgrade installer"
+          bash /tmp/package/install-iphoneloadly.sh \
+            --upgrade \
+            --binary /tmp/package/bin/iphoneloadly-api \
+            --package-root /tmp/package
+          echo "Installer exited 0; its internal health check passed."
+          echo "::endgroup::"
+          echo "::group::Verify expected systemctl calls and fresh API process"
+          cat >/tmp/expected-systemctl <<'EXPECTED_SYSTEMCTL'
+          daemon-reload
+          enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer
+          restart iphoneloadly-api.service
+          EXPECTED_SYSTEMCTL
+          diff --unified=0 /tmp/expected-systemctl /tmp/systemctl-invocations.log
+          api_pid="$(cat /tmp/api.pid)"
+          test -n "${api_pid}"
+          kill -0 "${api_pid}"
+          test "$(cat /tmp/api-executable)" = /opt/iphoneloadly/bin/iphoneloadly-api
+          test "$(readlink -f "/proc/${api_pid}/exe")" = /opt/iphoneloadly/bin/iphoneloadly-api
+          echo "api_started_before_installer=false"
+          echo "restart_launched=/opt/iphoneloadly/bin/iphoneloadly-api"
+          echo "::endgroup::"
+          echo "::group::Verify installed files"
+          test -x /opt/iphoneloadly/bin/iphoneloadly-api
+          test -x /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
+          for unit in \
+            iphoneloadly-api.service \
+            iphoneloadly-update.service \
+            iphoneloadly-update.path \
+            iphoneloadly-source-sync.service \
+            iphoneloadly-source-sync.timer; do
+            test -f "/etc/systemd/system/${unit}"
+          done
+          echo "::endgroup::"
+          echo "::group::Verify installer and post-install health"
+          curl --fail --silent http://127.0.0.1:8080/healthz | tee /tmp/post-healthz.json
+          grep -Fq '"version":"0.2.0-alpha.3"' /tmp/post-healthz.json
+          echo "::endgroup::"
+          echo "::group::Verify preservation state"
+          : >/tmp/post-hashes
+          : >/tmp/post-metadata
+          for path in "${preserved_files[@]}"; do
+            sha256sum "${path}" >>/tmp/post-hashes
+            stat --format='%a %U:%G %n' "${path}" >>/tmp/post-metadata
+          done
+          diff --unified=0 /tmp/pre-hashes /tmp/post-hashes
+          diff --unified=0 /tmp/pre-metadata /tmp/post-metadata
+          echo "Preservation hashes and metadata are unchanged."
+          echo "::endgroup::"
+          echo "debian-preservation-validation-complete"
+          echo "::endgroup::"
+          CONTAINER_SCRIPT
+          if ! grep -Fq 'debian-preservation-validation-complete' "${container_log}"; then
+            echo "Debian container completion marker was not observed." >&2
+            cat "${container_log}"
+            exit 1
+          fi
       - name: Upload verified Linux package
         uses: actions/upload-artifact@v4
         with:

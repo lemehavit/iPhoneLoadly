@@ -1,0 +1,10 @@
+[Unit]
+Description=Synchronize enabled iPhoneLoadly GitHub IPA sources
+After=network-online.target iphoneloadly-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/curl --fail --silent --show-error --request POST --header "Content-Type: application/json" --header "X-iPhoneLoadly-Action: 1" http://127.0.0.1:8080/api/sources/sync

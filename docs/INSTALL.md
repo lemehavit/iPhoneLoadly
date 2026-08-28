@@ -29,10 +29,12 @@ Expected checksum result:
 iphoneloadly-v<VERSION>-linux-amd64.tar.gz: OK
 ```
 
-The current alpha package version is `v0.2.0-alpha.2`. If that release is unavailable,
+The current alpha package version is `v0.2.0-alpha.3`. If that release is unavailable,
 use the advanced source-build instructions in
 [from-scratch.md](operations/from-scratch.md); never substitute an unverified
-archive from another site.
+archive from another site. For users upgrading from alpha.2, alpha.3 is the
+one-time bootstrap installation; later official releases can be requested from
+the dashboard after this version is installed.
 
 ## 2. Start the local anisette service
 

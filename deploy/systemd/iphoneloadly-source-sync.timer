@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic iPhoneLoadly GitHub IPA source synchronization
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+Unit=iphoneloadly-source-sync.service
+
+[Install]
+WantedBy=timers.target

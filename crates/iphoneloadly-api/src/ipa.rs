@@ -22,6 +22,8 @@ pub struct UploadMetadata {
     pub size_bytes: u64,
     pub app_bundle_path: String,
     pub bundle_id: String,
+    pub display_name: String,
+    pub app_version: Option<String>,
     pub info_plist_present: bool,
 }
 
@@ -74,6 +76,8 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let mut app_bundle: Option<String> = None;
     let mut info_plist_present = false;
     let mut bundle_id = None;
+    let mut display_name = None;
+    let mut app_version = None;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -108,18 +112,28 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
             entry
                 .read_to_end(&mut info_plist)
                 .map_err(|_| UploadError::InvalidArchive)?;
-            bundle_id = plist::Value::from_reader(Cursor::new(info_plist))
-                .ok()
-                .and_then(|value| {
-                    value
-                        .as_dictionary()?
-                        .get("CFBundleIdentifier")?
-                        .as_string()
-                        .map(str::to_owned)
-                });
+            let value = plist::Value::from_reader(Cursor::new(info_plist))
+                .map_err(|_| UploadError::InvalidBundleIdentifier)?;
+            let dictionary = value
+                .as_dictionary()
+                .ok_or(UploadError::InvalidBundleIdentifier)?;
+            bundle_id = dictionary
+                .get("CFBundleIdentifier")
+                .and_then(plist_string)
+                .map(str::to_owned);
+            display_name = dictionary
+                .get("CFBundleDisplayName")
+                .and_then(plist_string)
+                .or_else(|| dictionary.get("CFBundleName").and_then(plist_string))
+                .map(str::to_owned);
+            app_version = dictionary
+                .get("CFBundleShortVersionString")
+                .and_then(plist_string)
+                .or_else(|| dictionary.get("CFBundleVersion").and_then(plist_string))
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned);
         }
     }
-
     let app_bundle_path = app_bundle.ok_or(UploadError::InvalidPayload)?;
     if !info_plist_present {
         return Err(UploadError::MissingInfoPlist);
@@ -127,13 +141,22 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let bundle_id = bundle_id
         .filter(|value| !value.trim().is_empty())
         .ok_or(UploadError::InvalidBundleIdentifier)?;
+    let display_name = display_name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| bundle_id.clone());
     Ok(UploadMetadata {
         sha256: format!("{:x}", hasher.finalize()),
         size_bytes: metadata.len(),
         app_bundle_path,
         bundle_id,
+        display_name,
+        app_version,
         info_plist_present,
     })
+}
+
+fn plist_string(value: &plist::Value) -> Option<&str> {
+    value.as_string()
 }
 
 pub fn bundle_identifier(path: &Path) -> Result<String, UploadError> {

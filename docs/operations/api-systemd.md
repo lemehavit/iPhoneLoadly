@@ -73,3 +73,20 @@ sudo iphoneloadly-restore --verify /var/backups/iphoneloadly/REPLACE-WITH-BACKUP
 
 Use `sudo iphoneloadly-restore --apply BACKUP_DIRECTORY` only when recovering a
 host. It stops the API and asks you to type `RESTORE` before overwriting state.
+
+## Alpha.3 updater and source sync
+
+Install alpha.3 once using the verified release archive. It installs the
+constrained updater path and the six-hour source-sync timer:
+
+```bash
+sudo systemctl enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer
+systemctl list-timers iphoneloadly-source-sync.timer
+```
+
+The API writes only a typed update request under `/run/iphoneloadly`; the
+privileged updater constructs the fixed official GitHub URLs, verifies the
+archive and checksum, and preserves `/etc/iphoneloadly/api.env`,
+`/var/lib/iphoneloadly`, pairing records, uploaded IPAs and Caddy state.
+Automatic third-party source synchronization is disabled unless explicitly
+acknowledged in the dashboard.

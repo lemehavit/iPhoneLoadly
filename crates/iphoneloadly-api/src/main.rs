@@ -1,8 +1,10 @@
+mod github;
 mod ipa;
 mod jobs;
 mod signing;
+mod sources;
 mod store;
-
+mod update;
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
@@ -17,7 +19,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -27,11 +29,14 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Clone)]
-struct AppState {
-    signing: Arc<signing::AppleSigningProvider>,
-    devices: Arc<dyn DeviceTransport>,
-    apps_dir: PathBuf,
-    database: Arc<Mutex<rusqlite::Connection>>,
+pub(crate) struct AppState {
+    pub(crate) signing: Arc<signing::AppleSigningProvider>,
+    pub(crate) devices: Arc<dyn DeviceTransport>,
+    pub(crate) apps_dir: PathBuf,
+    pub(crate) database: Arc<Mutex<rusqlite::Connection>>,
+    pub(crate) app_mutation: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) source_sync: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) github: Arc<github::GitHubClient>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,13 +101,22 @@ trait DeviceTransport: Send + Sync {
         progress: Box<dyn Fn(u8) + Send + Sync>,
     ) -> Result<String, TransportError>;
 }
-
 #[derive(Debug, Error)]
 enum TransportError {
     #[error("network device transport is not configured")]
     Unavailable,
-    #[error("IPA installation could not be completed")]
-    InstallFailed,
+    #[error("device installation failed")]
+    DeviceInstallFailed,
+    #[error("device information lookup failed")]
+    DeviceInfoFailed,
+    #[error("developer team lookup failed")]
+    DeveloperTeamFailed,
+    #[error("device registration failed")]
+    DeviceRegistrationFailed,
+    #[error("IPA signing failed")]
+    IpaSigningFailed,
+    #[error("signed IPA metadata validation failed")]
+    SignedMetadataFailed,
 }
 
 #[async_trait]
@@ -163,7 +177,19 @@ impl DeviceTransport for NetmuxTransport {
         signing
             .install_ipa(&provider, ipa_path, progress)
             .await
-            .map_err(|_| TransportError::InstallFailed)
+            .map_err(|error| match error {
+                signing::SigningError::DeviceInfoFailed => TransportError::DeviceInfoFailed,
+                signing::SigningError::DeveloperTeamFailed => TransportError::DeveloperTeamFailed,
+                signing::SigningError::DeviceRegistrationFailed => {
+                    TransportError::DeviceRegistrationFailed
+                }
+                signing::SigningError::IpaSigningFailed => TransportError::IpaSigningFailed,
+                signing::SigningError::SignedMetadataFailed => TransportError::SignedMetadataFailed,
+                signing::SigningError::DeviceInstallFailed | signing::SigningError::NotReady => {
+                    TransportError::DeviceInstallFailed
+                }
+                _ => TransportError::DeviceInstallFailed,
+            })
     }
 
     async fn list_installed_apps(
@@ -501,7 +527,6 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn dashboard() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
-
 async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
     match state
         .database
@@ -513,6 +538,9 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
             apps.into_iter()
                 .map(|app| serde_json::json!({
                     "id": app.id,
+                    "displayName": app.display_name,
+                    "appVersion": app.app_version,
+                    "bundleId": app.bundle_id,
                     "sha256": app.sha256,
                     "sizeBytes": app.size_bytes,
                 }))
@@ -697,6 +725,46 @@ async fn list_device_apps(
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"The selected trusted iPhone is not reachable over Wi-Fi."}))).into_response(),
     }
 }
+async fn list_managed_installations(State(state): State<AppState>) -> impl IntoResponse {
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::list_managed_installations(&database).map_err(|_| ()))
+    {
+        Ok(items) => Json(serde_json::json!(
+            items
+                .into_iter()
+                .map(|item| serde_json::json!({
+                    "appId": item.app_id,
+                    "deviceId": item.device_id,
+                    "appDisplayName": item.app_display_name,
+                    "appVersion": item.app_version,
+                    "deviceLabel": item.device_label
+                }))
+                .collect::<Vec<_>>()
+        ))
+        .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to read managed installations."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn forget_managed_installation(
+    State(state): State<AppState>,
+    Path((device_id, app_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    match state.database.lock().map_err(|_| ()).and_then(|database| {
+        store::forget_managed_installation(&database, app_id, device_id).map_err(|_| ())
+    }) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::CONFLICT, Json(serde_json::json!({"message":"This installation has an active job and cannot be removed from management yet."}))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message":"Unable to remove the installation from management."}))).into_response(),
+    }
+}
 
 fn managed_app(bundle_id: &str, identities: &[store::ManagedAppIdentity]) -> bool {
     identities.iter().any(|identity| {
@@ -746,6 +814,7 @@ async fn create_install_job(
         ).into_response();
     };
 
+    let _mutation = state.app_mutation.read().await;
     let id = Uuid::now_v7();
     let ipa_path = state.database.lock().map_err(|_| ()).and_then(|database| {
         let path = store::app_path(&database, request.app_id).map_err(|_| ())?;
@@ -770,6 +839,7 @@ async fn create_install_job(
     tokio::spawn(run_install_job(
         state.clone(),
         id,
+        request.app_id,
         request.device_id,
         ipa_path,
     ));
@@ -792,6 +862,7 @@ struct RefreshResponse {
 }
 
 async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
+    let _mutation = state.app_mutation.read().await;
     if !state.signing.is_ready().await {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Apple signing is not ready. Sign in before refreshing apps."}))).into_response();
     }
@@ -841,6 +912,7 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
             tokio::spawn(run_install_job(
                 state.clone(),
                 id,
+                app_id,
                 device_id,
                 PathBuf::from(ipa_path),
             ));
@@ -848,8 +920,13 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
     }
     (StatusCode::ACCEPTED, Json(RefreshResponse { queued })).into_response()
 }
-
-async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: PathBuf) {
+async fn run_install_job(
+    state: AppState,
+    id: Uuid,
+    app_id: Uuid,
+    device_id: Uuid,
+    ipa_path: PathBuf,
+) {
     set_job_status(&state.database, id, "connecting", Some(0));
     set_job_status(&state.database, id, "signing", Some(1));
     let progress_database = state.database.clone();
@@ -873,6 +950,7 @@ async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: P
         Ok(bundle_id) => {
             if let Ok(connection) = state.database.lock() {
                 let _ = store::set_job_installed_bundle_id(&connection, id, &bundle_id);
+                let _ = store::restore_managed_installation(&connection, app_id, device_id);
             }
             set_job_status(&state.database, id, "succeeded", Some(100));
         }
@@ -883,7 +961,12 @@ async fn run_install_job(state: AppState, id: Uuid, device_id: Uuid, ipa_path: P
                 id,
                 match error {
                     TransportError::Unavailable => "iphone_unavailable",
-                    TransportError::InstallFailed => "installation_failed",
+                    TransportError::DeviceInfoFailed => "device_info_failed",
+                    TransportError::DeveloperTeamFailed => "developer_team_failed",
+                    TransportError::DeviceRegistrationFailed => "device_registration_failed",
+                    TransportError::IpaSigningFailed => "ipa_signing_failed",
+                    TransportError::SignedMetadataFailed => "signed_metadata_failed",
+                    TransportError::DeviceInstallFailed => "device_install_failed",
                 },
             );
             set_job_status(&state.database, id, "failed", None);
@@ -908,15 +991,31 @@ fn set_job_failure(database: &Arc<Mutex<rusqlite::Connection>>, id: Uuid, failur
     }
 }
 
-fn job_message(phase: &str) -> &'static str {
+fn job_message(phase: &str, failure_code: Option<&str>) -> &'static str {
+    if phase == "failed" {
+        return match failure_code.unwrap_or("installation_failed") {
+            "iphone_unavailable" => "The selected trusted iPhone is not reachable over Wi-Fi.",
+            "device_info_failed" => {
+                "Could not read the selected iPhone information over the trusted Wi-Fi connection."
+            }
+            "developer_team_failed" => "Apple developer team information could not be prepared.",
+            "device_registration_failed" => {
+                "The iPhone could not be registered for this signing session."
+            }
+            "ipa_signing_failed" => "The IPA could not be signed.",
+            "signed_metadata_failed" => "The signed IPA metadata could not be validated.",
+            "device_install_failed" => {
+                "Signing completed, but transfer/installation on the iPhone failed. Keep the phone unlocked, reachable, and check free storage."
+            }
+            _ => "Installation failed.",
+        };
+    }
     match phase {
         "queued" => "Installation job is queued.",
         "connecting" => "Connecting to the trusted iPhone over Wi-Fi.",
         "signing" => "Signing the IPA.",
-        "transferring" => "Transferring and installing the IPA on the iPhone.",
-        "installing" => "Transferring and installing the IPA on the iPhone.",
+        "transferring" | "installing" => "Transferring and installing the IPA on the iPhone.",
         "succeeded" => "IPA was signed and installed.",
-        "failed" => "Installation failed. Check the server logs for redacted diagnostics.",
         _ => "Installation job status is unavailable.",
     }
 }
@@ -935,9 +1034,10 @@ async fn get_install_job(State(state): State<AppState>, Path(id): Path<Uuid>) ->
                 "appId": job.app_id,
                 "deviceId": job.device_id,
                 "phase": job.phase,
-                "progressPercent": job.progress_percent,
+                "appDisplayName": job.app_display_name,
+                "appVersion": job.app_version,
                 "failureCode": job.failure_code,
-                "publicMessage": job_message(&job.phase)
+                "publicMessage": job_message(&job.phase, job.failure_code.as_deref())
             })),
         )
             .into_response(),
@@ -968,11 +1068,13 @@ async fn list_install_jobs(State(state): State<AppState>) -> impl IntoResponse {
                     "appId": job.app_id,
                     "deviceLabel": job.device_label,
                     "phase": job.phase,
+                    "appDisplayName": job.app_display_name,
+                    "appVersion": job.app_version,
                     "progressPercent": job.progress_percent,
                     "createdAt": job.created_at,
                     "completedAt": job.completed_at,
                     "failureCode": job.failure_code,
-                    "publicMessage": job_message(&job.phase)
+                    "publicMessage": job_message(&job.phase, job.failure_code.as_deref())
                 }))
                 .collect::<Vec<_>>()
         )),
@@ -1074,6 +1176,7 @@ async fn installation_validity(State(state): State<AppState>) -> impl IntoRespon
 }
 
 async fn delete_ipa(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let _mutation = state.app_mutation.write().await;
     let deletion = state
         .database
         .lock()
@@ -1112,14 +1215,62 @@ async fn delete_ipa(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl
     }
 }
 
-async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
-    let Some(mut field) = multipart.next_field().await.ok().flatten() else {
+fn validate_display_name(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.chars().count() > 120 || value.chars().any(|character| character.is_ascii_control()) {
+        return Err(
+            "Display name must be at most 120 characters and contain no control characters.",
+        );
+    }
+    Ok(value.to_owned())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameAppRequest {
+    display_name: String,
+}
+
+async fn rename_app(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<RenameAppRequest>,
+) -> impl IntoResponse {
+    let Ok(display_name) = validate_display_name(&request.display_name) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"message":"Expected an IPA file field."})),
+            Json(serde_json::json!({"message":"Invalid display name."})),
         )
             .into_response();
     };
+    if display_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message":"Display name cannot be empty when renaming."})),
+        )
+            .into_response();
+    }
+    match state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::rename_app(&database, id, &display_name).map_err(|_| ()))
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Uploaded IPA was not found."})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message":"Unable to rename the IPA."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     let id = Uuid::now_v7();
     let temporary = state.apps_dir.join(format!(".{id}.upload"));
     let final_path = state.apps_dir.join(format!("{id}.ipa"));
@@ -1130,37 +1281,81 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
         )
             .into_response();
     };
+    let mut display_name = None;
+    let mut file_seen = false;
     let mut written = 0_u64;
-    loop {
-        let chunk = match field.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(_) => {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"message":"Unable to read IPA upload."})),
-                )
-                    .into_response();
-            }
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        let Some(name) = field.name() else {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message":"Invalid multipart field."})),
+            )
+                .into_response();
         };
-        written = written.saturating_add(chunk.len() as u64);
-        if written > ipa::MAX_COMPRESSED_BYTES {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"message":"IPA exceeds the 2 GiB upload limit."})),
-            )
-                .into_response();
+        match name {
+            "displayName" if display_name.is_none() => {
+                let Ok(value) = field.text().await else {
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"message":"Invalid display name."})),
+                    )
+                        .into_response();
+                };
+                let Ok(value) = validate_display_name(&value) else {
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"message":"Invalid display name."})),
+                    )
+                        .into_response();
+                };
+                display_name = Some(value);
+            }
+            "file" if !file_seen => {
+                file_seen = true;
+                loop {
+                    let chunk = match field.chunk().await {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(_) => {
+                            let _ = tokio::fs::remove_file(&temporary).await;
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"message":"Unable to read IPA upload."})),
+                            )
+                                .into_response();
+                        }
+                    };
+                    written = written.saturating_add(chunk.len() as u64);
+                    if written > ipa::MAX_COMPRESSED_BYTES {
+                        let _ = tokio::fs::remove_file(&temporary).await;
+                        return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"message":"IPA exceeds the 2 GiB upload limit."}))).into_response();
+                    }
+                    if output.write_all(&chunk).await.is_err() {
+                        let _ = tokio::fs::remove_file(&temporary).await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"message":"Unable to store IPA upload."})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message":"Expected one file field and at most one display name field."}))).into_response();
+            }
         }
-        if output.write_all(&chunk).await.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"message":"Unable to store IPA upload."})),
-            )
-                .into_response();
-        }
+    }
+    if !file_seen {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message":"Expected an IPA file field."})),
+        )
+            .into_response();
     }
     if output.flush().await.is_err() || output.sync_all().await.is_err() {
         let _ = tokio::fs::remove_file(&temporary).await;
@@ -1171,9 +1366,11 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
             .into_response();
     }
     drop(output);
-    let inspected = ipa::inspect_ipa(&temporary);
-    match inspected {
+    match ipa::inspect_ipa(&temporary) {
         Ok(metadata) => {
+            let display_name = display_name
+                .filter(|value| !value.is_empty())
+                .unwrap_or(metadata.display_name.clone());
             if tokio::fs::rename(&temporary, &final_path).await.is_err() {
                 let _ = tokio::fs::remove_file(&temporary).await;
                 return (
@@ -1190,6 +1387,8 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
                     &final_path.to_string_lossy(),
                     metadata.size_bytes,
                     &metadata.bundle_id,
+                    &display_name,
+                    metadata.app_version.as_deref(),
                 )
                 .map_err(|_| ())
             });
@@ -1201,7 +1400,7 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
                 )
                     .into_response();
             }
-            (StatusCode::CREATED, Json(serde_json::json!({"id":id,"sha256":metadata.sha256,"sizeBytes":metadata.size_bytes}))).into_response()
+            (StatusCode::CREATED, Json(serde_json::json!({"id":id,"displayName":display_name,"appVersion":metadata.app_version,"sha256":metadata.sha256,"sizeBytes":metadata.size_bytes}))).into_response()
         }
         Err(error) => {
             let _ = tokio::fs::remove_file(&temporary).await;
@@ -1248,6 +1447,8 @@ async fn main() {
         mux_socket,
         pairing_path: pairing_dir.into(),
     });
+    let github =
+        github::GitHubClient::new(env!("CARGO_PKG_VERSION")).expect("create GitHub client");
     let state = AppState {
         signing: signing::AppleSigningProvider::new(
             std::env::var("IPHONELOADLY_ANISETTE_URL").ok(),
@@ -1256,6 +1457,9 @@ async fn main() {
         devices,
         apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
+        app_mutation: Arc::new(tokio::sync::RwLock::new(())),
+        source_sync: Arc::new(tokio::sync::Mutex::new(())),
+        github: Arc::new(github),
     };
     tokio::fs::create_dir_all(&state.apps_dir)
         .await
@@ -1283,8 +1487,31 @@ async fn main() {
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{id}/apps", get(list_device_apps))
         .route("/api/devices/rescan", post(rescan_devices))
+        .route(
+            "/api/managed-installations",
+            get(list_managed_installations),
+        )
+        .route(
+            "/api/devices/{device_id}/managed-apps/{app_id}",
+            delete(forget_managed_installation),
+        )
+        .route("/api/sources/preview", post(sources::preview))
+        .route("/api/sources", get(sources::list).post(sources::create))
+        .route(
+            "/api/sources/{id}",
+            axum::routing::put(sources::update).delete(sources::remove),
+        )
+        .route("/api/sources/{id}/check", post(sources::check))
+        .route("/api/sources/{id}/download", post(sources::download))
+        .route(
+            "/api/sources/{id}/automation",
+            axum::routing::put(sources::automation),
+        )
+        .route("/api/sources/sync", post(sources::sync))
+        .route("/api/update", get(update::info).post(update::request))
+        .route("/api/update/status", get(update::status))
         .route("/api/apps", get(list_apps).post(upload_ipa))
-        .route("/api/apps/{id}", delete(delete_ipa))
+        .route("/api/apps/{id}", patch(rename_app).delete(delete_ipa))
         .route("/api/install-jobs", post(create_install_job))
         .route("/api/install-jobs", get(list_install_jobs))
         .route("/api/install-jobs/{id}", get(get_install_job))
