@@ -31,6 +31,123 @@ jobs:
       - run: find deploy/host deploy/release scripts -type f -name '*.sh' -exec bash -n {} +
       - run: bash deploy/release/build-release.sh
       - run: bash deploy/release/verify-release-package.sh
+      - name: Verify shipped systemd units
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends systemd
+          getent group iphoneloadly-mux >/dev/null || sudo groupadd --system iphoneloadly-mux
+          systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.path deploy/systemd/*.timer
+      - name: Validate Debian 13 upgrade preservation
+        env:
+          RELEASE_ARCHIVE: dist/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz
+          RELEASE_CHECKSUM: dist/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz.sha256
+        run: |
+          set -Eeuo pipefail
+          (cd dist && sha256sum -c "$(basename "${RELEASE_CHECKSUM}")")
+          container="iphoneloadly-upgrade-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker rm --force "${container}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run --platform linux/amd64 --detach --privileged --cgroupns=host \
+            --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+            --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --volume "${GITHUB_WORKSPACE}/dist:/release:ro" \
+            --name "${container}" debian:13-slim /sbin/init
+          for attempt in $(seq 1 30); do
+            if docker exec "${container}" test -d /run/systemd/system; then
+              break
+            fi
+            [[ "${attempt}" -lt 30 ]] || {
+              docker logs "${container}"
+              exit 1
+            }
+            sleep 2
+          done
+          docker exec "${container}" bash -c \
+            'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates curl sudo systemd systemd-sysv socat sqlite3'
+          docker exec "${container}" mkdir -p /tmp/package
+          docker exec "${container}" tar -xzf \
+            /release/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz \
+            -C /tmp/package --strip-components=1
+          docker exec "${container}" bash -c '
+            set -Eeuo pipefail
+            mkdir -p /etc/iphoneloadly /etc/caddy \
+              /var/lib/iphoneloadly/data/apps \
+              /var/lib/iphoneloadly/data/signing /var/lib/lockdown
+            printf "%s\n" "RUST_LOG=warn" \
+              "IPHONELOADLY_ANISETTE_URL=http://127.0.0.1:6970" \
+              "IPHONELOADLY_MUX_SOCKET=/run/iphoneloadly/mux.sock" \
+              "IPHONELOADLY_PAIRING_DIR=/var/lib/lockdown" \
+              >/etc/iphoneloadly/api.env
+            sqlite3 /var/lib/iphoneloadly/data/fixture.sqlite3 \
+              "CREATE TABLE marker (value TEXT NOT NULL); INSERT INTO marker VALUES (\"alpha2-database-fixture\");"
+            printf "%s\n" "alpha2-uploaded-ipa-fixture" \
+              >/var/lib/iphoneloadly/data/apps/fixture.ipa
+            printf "%s\n" "alpha2-signing-state-fixture" \
+              >/var/lib/iphoneloadly/data/signing/fixture.state
+            printf "%s\n" "alpha2-pairing-fixture" \
+              >/var/lib/lockdown/fixture.plist
+            printf "%s\n" "alpha2-caddy-fixture" \
+              >/etc/caddy/Caddyfile
+            chmod 0600 /etc/iphoneloadly/api.env
+            chmod 0640 /var/lib/iphoneloadly/data/fixture.sqlite3
+            chmod 0640 /var/lib/iphoneloadly/data/apps/fixture.ipa
+            chmod 0600 /var/lib/iphoneloadly/data/signing/fixture.state
+            chmod 0600 /var/lib/lockdown/fixture.plist
+            chmod 0644 /etc/caddy/Caddyfile
+          '
+          preserved_files=(
+            /etc/iphoneloadly/api.env
+            /var/lib/iphoneloadly/data/fixture.sqlite3
+            /var/lib/iphoneloadly/data/apps/fixture.ipa
+            /var/lib/iphoneloadly/data/signing/fixture.state
+            /var/lib/lockdown/fixture.plist
+            /etc/caddy/Caddyfile
+          )
+          : >"${RUNNER_TEMP}/iphoneloadly-pre-hashes"
+          : >"${RUNNER_TEMP}/iphoneloadly-pre-modes"
+          for path in "${preserved_files[@]}"; do
+            docker exec "${container}" sha256sum "${path}" \
+              >>"${RUNNER_TEMP}/iphoneloadly-pre-hashes"
+            docker exec "${container}" stat --format='%a %U:%G %n' "${path}" \
+              >>"${RUNNER_TEMP}/iphoneloadly-pre-modes"
+          done
+          docker exec "${container}" bash -c \
+            'mkdir -p /run/iphoneloadly && socat UNIX-LISTEN:/run/iphoneloadly/mux.sock,fork SYSTEM:"cat" >/tmp/mux.log 2>&1 &'
+          echo "Using seeded alpha.2 preservation fixture; no Apple credentials or real pairing are used."
+          docker exec "${container}" bash /tmp/package/install-iphoneloadly.sh \
+            --upgrade \
+            --binary /tmp/package/bin/iphoneloadly-api \
+            --package-root /tmp/package
+          : >"${RUNNER_TEMP}/iphoneloadly-post-hashes"
+          : >"${RUNNER_TEMP}/iphoneloadly-post-modes"
+          for path in "${preserved_files[@]}"; do
+            docker exec "${container}" sha256sum "${path}" \
+              >>"${RUNNER_TEMP}/iphoneloadly-post-hashes"
+            docker exec "${container}" stat --format='%a %U:%G %n' "${path}" \
+              >>"${RUNNER_TEMP}/iphoneloadly-post-modes"
+          done
+          diff --unified=0 \
+            "${RUNNER_TEMP}/iphoneloadly-pre-hashes" \
+            "${RUNNER_TEMP}/iphoneloadly-post-hashes"
+          diff --unified=0 \
+            "${RUNNER_TEMP}/iphoneloadly-pre-modes" \
+            "${RUNNER_TEMP}/iphoneloadly-post-modes"
+          docker exec "${container}" test -x /opt/iphoneloadly/bin/iphoneloadly-api
+          docker exec "${container}" test -x /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
+          for unit in \
+            iphoneloadly-api.service \
+            iphoneloadly-update.service \
+            iphoneloadly-update.path \
+            iphoneloadly-source-sync.service \
+            iphoneloadly-source-sync.timer; do
+            docker exec "${container}" test -f "/etc/systemd/system/${unit}"
+          done
+          docker exec "${container}" bash -c \
+            'curl --fail --silent http://127.0.0.1:8080/healthz | tee /tmp/healthz.json'
+          docker exec "${container}" grep -Fq \
+            '"version":"0.2.0-alpha.3"' /tmp/healthz.json
       - name: Upload verified Linux package
         uses: actions/upload-artifact@v4
         with:
