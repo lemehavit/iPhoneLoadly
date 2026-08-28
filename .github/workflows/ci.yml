@@ -84,6 +84,8 @@ jobs:
           docker exec "${container}" tar -xzf \
             /release/iphoneloadly-v0.2.0-alpha.3-linux-amd64.tar.gz \
             -C /tmp/package --strip-components=1
+          docker exec "${container}" chmod 0755 \
+            /tmp/package/bin/iphoneloadly-api /tmp/package/install-iphoneloadly.sh
           docker exec "${container}" bash -c '
             set -Eeuo pipefail
             mkdir -p /etc/iphoneloadly /etc/caddy \
