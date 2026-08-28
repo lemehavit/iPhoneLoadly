@@ -411,6 +411,19 @@ jobs:
           fi
           UPDATER_CURL
           chmod 0755 /tmp/fake-bin/curl
+          cat >/tmp/fake-bin/cp <<'ROLLBACK_CP'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          if [[ "$*" == *".iphoneloadly-restore."* ]]; then
+            if [[ -e /tmp/api-service-active ]]; then
+              printf '%s\n' true >/tmp/rollback-restore-while-active
+            else
+              printf '%s\n' false >/tmp/rollback-restore-while-active
+            fi
+          fi
+          exec /usr/bin/cp "$@"
+          ROLLBACK_CP
+          chmod 0755 /tmp/fake-bin/cp
           mkdir -p /run/iphoneloadly
           printf '{"targetVersion":"%s","expectedArchiveSha256":"%s","createdAt":"2026-08-28T00:00:00Z"}\n' \
             "${expected_version}" "${rollback_digest}" \
@@ -430,6 +443,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/healthz | \
             grep -Fq "\"version\":\"${prior_version}\""
           test "$(sed -n '1p' /tmp/rollback-replace-while-active)" = true
+          test "$(cat /tmp/rollback-restore-while-active)" = false
           test -e /tmp/update-path-enabled
           test ! -e /tmp/source-sync-timer-enabled
           echo "rollback_runtime_restored=true"
