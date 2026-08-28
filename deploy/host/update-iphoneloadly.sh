@@ -18,6 +18,82 @@ runtime_targets=(
   /etc/systemd/system/iphoneloadly-source-sync.timer
   /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
 )
+startup_timeout_seconds="${IPHONELOADLY_STARTUP_TIMEOUT_SECONDS:-30}"
+update_path_was_enabled=false
+source_sync_timer_was_enabled=false
+capture_enablement() {
+  if systemctl is-enabled --quiet iphoneloadly-update.path; then
+    update_path_was_enabled=true
+  fi
+  if systemctl is-enabled --quiet iphoneloadly-source-sync.timer; then
+    source_sync_timer_was_enabled=true
+  fi
+}
+restore_enablement() {
+  if [[ "${update_path_was_enabled}" == true ]]; then
+    systemctl enable --now iphoneloadly-update.path
+  else
+    systemctl disable --now iphoneloadly-update.path
+  fi
+  if [[ "${source_sync_timer_was_enabled}" == true ]]; then
+    systemctl enable --now iphoneloadly-source-sync.timer
+  else
+    systemctl disable --now iphoneloadly-source-sync.timer
+  fi
+}
+stop_api_service() {
+  systemctl stop iphoneloadly-api.service
+  local started_at="$SECONDS"
+  while systemctl is-active --quiet iphoneloadly-api.service; do
+    (( SECONDS - started_at >= 20 )) && {
+      echo 'Timed out waiting for iPhoneLoadly API to stop.' >&2
+      return 1
+    }
+    sleep 1
+  done
+}
+health_version() {
+  local health="$1"
+  if [[ "${health}" =~ \"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+wait_for_api_health() {
+  local started_at="$SECONDS"
+  local deadline=$((started_at + startup_timeout_seconds))
+  local remaining curl_timeout health
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    curl_timeout=$((remaining < 2 ? remaining : 2))
+    if health="$(curl --fail --silent --show-error --max-time "${curl_timeout}" \
+      http://127.0.0.1:8080/healthz 2>/dev/null)"; then
+      printf '%s\n' "${health}"
+      return 0
+    fi
+    (( SECONDS < deadline )) && sleep 1
+  done
+  return 1
+}
+wait_for_api_version() {
+  local expected_version="$1"
+  local started_at="$SECONDS"
+  local deadline=$((started_at + startup_timeout_seconds))
+  local remaining curl_timeout health actual_version
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    curl_timeout=$((remaining < 2 ? remaining : 2))
+    if health="$(curl --fail --silent --show-error --max-time "${curl_timeout}" \
+      http://127.0.0.1:8080/healthz 2>/dev/null)"; then
+      actual_version="$(health_version "${health}")"
+      if [[ -n "${actual_version}" && "${actual_version}" == "${expected_version}" ]]; then
+        printf '%s\n' "${health}"
+        return 0
+      fi
+    fi
+    (( SECONDS < deadline )) && sleep 1
+  done
+  return 1
+}
 backup_runtime() {
   local target key
   for target in "${runtime_targets[@]}"; do
@@ -31,31 +107,47 @@ backup_runtime() {
   done
 }
 restore_runtime() {
-  local target key
+  local target key source temporary
   for target in "${runtime_targets[@]}"; do
     key="${target#/}"
     key="${key//\//__}"
+    source="${backup_root}/${key}"
     if [[ -f "${backup_root}/${key}.missing" ]]; then
       rm -f -- "${target}"
-    elif [[ -e "${backup_root}/${key}" ]]; then
+    elif [[ -e "${source}" ]]; then
       install -d -- "$(dirname -- "${target}")"
-      cp -a -- "${backup_root}/${key}" "${target}"
+      temporary="$(mktemp "$(dirname -- "${target}")/.iphoneloadly-restore.XXXXXX")"
+      rm -f -- "${temporary}"
+      cp -a -- "${source}" "${temporary}"
+      mv -f -- "${temporary}" "${target}"
     fi
   done
 }
-
+rollback_runtime() {
+  stop_api_service
+  restore_runtime
+  systemctl daemon-reload
+  restore_enablement
+  systemctl start iphoneloadly-api.service
+  if [[ -n "${previous_version}" ]]; then
+    wait_for_api_version "${previous_version}"
+  else
+    wait_for_api_health
+  fi
+}
 write_status() {
   local status="$1" message="$2"
   install -d -o root -g root -m 0700 "$(dirname -- "${status_file}")"
   printf '{"status":"%s","message":"%s"}\n' "${status}" "${message//\"/\\\"}" >"${status_file}"
 }
 fail() {
+  local message="$1"
   if [[ "${upgrade_started}" == true ]]; then
-    restore_runtime
-    systemctl daemon-reload || true
-    systemctl restart iphoneloadly-api.service || true
+    if ! rollback_runtime; then
+      message="${message} Rollback verification failed."
+    fi
   fi
-  write_status failed "$1"
+  write_status failed "${message}"
   mv -- "${request}" "${request}.failed.$(date +%s)" 2>/dev/null || true
   exit 1
 }
@@ -125,19 +217,16 @@ for required in \
   [[ -f "${required}" ]] || fail "Release package is missing ${required#"${package_root}/"}"
 done
 
+current_health="$(curl --fail --silent --show-error --max-time 2 \
+  http://127.0.0.1:8080/healthz 2>/dev/null || true)"
+previous_version="$(health_version "${current_health}")"
 backup_root="${work_root}/backup"
 mkdir -p -- "${backup_root}"
-backup_runtime
+capture_enablement
+backup_runtime || fail 'Unable to back up the current iPhoneLoadly runtime.'
 upgrade_started=true
 write_status installing "Installing verified iPhoneLoadly runtime files."
-bash "${package_root}/install-iphoneloadly.sh" --upgrade --binary "${package_root}/bin/iphoneloadly-api" --package-root "${package_root}" || fail 'Verified package installation failed.'
-systemctl restart iphoneloadly-api.service || fail 'iPhoneLoadly API restart failed.'
-for _ in $(seq 1 20); do
-  if curl --fail --silent http://127.0.0.1:8080/healthz | grep -q '"version":"'"${version}"'"'; then
-    write_status succeeded "iPhoneLoadly ${version} installed successfully."
-    rm -f -- "${request}"
-    exit 0
-  fi
-  sleep 1
-done
-fail 'Updated API did not report the target version; previous runtime was restored.'
+bash "${package_root}/install-iphoneloadly.sh" --upgrade --binary "${package_root}/bin/iphoneloadly-api" --package-root "${package_root}" || fail "Verified package installation failed while starting API version ${version}."
+write_status succeeded "iPhoneLoadly ${version} installed successfully."
+rm -f -- "${request}"
+exit 0

@@ -146,12 +146,27 @@ jobs:
           cat /tmp/pre-hashes
           cat /tmp/pre-metadata
           echo "::endgroup::"
-          echo "::group::Install restart-aware systemctl test double"
+          echo "::group::Install lifecycle-aware systemctl test double"
           cat >/usr/local/bin/systemctl <<'SYSTEMCTL'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           invocations=/tmp/systemctl-invocations.log
+          active_file=/tmp/api-service-active
+          api_pid_file=/tmp/api.pid
+          api_log=/tmp/api.log
           printf '%s\n' "$*" >>"${invocations}"
+          start_api() {
+            set -a
+            # shellcheck disable=SC1091
+            source /etc/iphoneloadly/api.env
+            set +a
+            cd /var/lib/iphoneloadly
+            nohup /opt/iphoneloadly/bin/iphoneloadly-api \
+              >>"${api_log}" 2>&1 </dev/null &
+            api_pid=$!
+            printf '%s\n' "${api_pid}" >"${api_pid_file}"
+            : >"${active_file}"
+          }
           case "$*" in
             "daemon-reload")
               exit 0
@@ -159,34 +174,52 @@ jobs:
             "enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer")
               exit 0
               ;;
-            "restart iphoneloadly-api.service")
-              set -a
-              # shellcheck disable=SC1091
-              source /etc/iphoneloadly/api.env
-              set +a
-              cd /var/lib/iphoneloadly
-              nohup /opt/iphoneloadly/bin/iphoneloadly-api \
-                >>/tmp/api.log 2>&1 </dev/null &
-              api_pid=$!
-              printf '%s\n' "${api_pid}" >/tmp/api.pid
-              for attempt in $(seq 1 30); do
-                if curl --fail --silent http://127.0.0.1:8080/healthz \
-                  >/tmp/api-healthz.json; then
-                  printf '%s\n' \
-                    "$(readlink -f "/proc/${api_pid}/exe")" \
-                    >/tmp/api-executable
-                  exit 0
+            "is-enabled --quiet iphoneloadly-update.path")
+              [[ -f /tmp/update-path-enabled ]]
+              ;;
+            "is-enabled --quiet iphoneloadly-source-sync.timer")
+              [[ -f /tmp/source-sync-timer-enabled ]]
+              ;;
+            "enable --now iphoneloadly-update.path")
+              : >/tmp/update-path-enabled
+              exit 0
+              ;;
+            "enable --now iphoneloadly-source-sync.timer")
+              : >/tmp/source-sync-timer-enabled
+              exit 0
+              ;;
+            "disable --now iphoneloadly-update.path")
+              rm -f /tmp/update-path-enabled
+              exit 0
+              ;;
+            "disable --now iphoneloadly-source-sync.timer")
+              rm -f /tmp/source-sync-timer-enabled
+              exit 0
+              ;;
+            "stop iphoneloadly-api.service")
+              if [[ -f "${api_pid_file}" ]]; then
+                api_pid="$(cat "${api_pid_file}")"
+                if kill -0 "${api_pid}" 2>/dev/null; then
+                  kill "${api_pid}" 2>/dev/null || true
+                  for _ in $(seq 1 20); do
+                    kill -0 "${api_pid}" 2>/dev/null || break
+                    sleep 1
+                  done
                 fi
-                if ! kill -0 "${api_pid}" 2>/dev/null; then
-                  cat /tmp/api.log >&2 || true
-                  exit 1
-                fi
-                [[ "${attempt}" -lt 30 ]] || {
-                  cat /tmp/api.log >&2 || true
-                  exit 1
-                }
-                sleep 1
-              done
+              fi
+              rm -f -- "${active_file}"
+              exit 0
+              ;;
+            "is-active --quiet iphoneloadly-api.service")
+              [[ -f "${active_file}" ]]
+              ;;
+            "start iphoneloadly-api.service")
+              (
+                sleep 2
+                start_api
+              ) >/dev/null 2>&1 </dev/null &
+              printf '%s\n' started >/tmp/api-start-returned
+              exit 0
               ;;
             *)
               echo "Unexpected systemctl invocation: $*" >&2
@@ -197,37 +230,62 @@ jobs:
           chmod 0755 /usr/local/bin/systemctl
           test "$(sudo sh -c 'command -v systemctl')" = /usr/local/bin/systemctl
           echo "::endgroup::"
-          echo "::group::Confirm API is stopped before installer"
-          test ! -e /opt/iphoneloadly/bin/iphoneloadly-api
-          if pgrep -f '/opt/iphoneloadly/bin/iphoneloadly-api' >/dev/null; then
-            echo "API is already running before installer invocation." >&2
-            exit 1
+          echo "::group::Seed running old API and replacement guard"
+          install -m 0755 /usr/bin/sleep /opt/iphoneloadly/bin/iphoneloadly-api
+          nohup /opt/iphoneloadly/bin/iphoneloadly-api 300 \
+            >/tmp/old-api.log 2>&1 </dev/null &
+          old_api_pid=$!
+          printf '%s\n' "${old_api_pid}" >/tmp/api.pid
+          : >/tmp/api-service-active
+          mkdir -p /tmp/fake-bin
+          cat >/tmp/fake-bin/sudo <<'SUDO'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          if [[ "${1:-}" == "mv" ]]; then
+            api_pid="$(cat /tmp/api.pid 2>/dev/null || true)"
+            if [[ -n "${api_pid}" ]] && kill -0 "${api_pid}" 2>/dev/null; then
+              printf '%s\n' true >/tmp/replacement-while-active
+            else
+              printf '%s\n' false >/tmp/replacement-while-active
+            fi
           fi
-          echo "api_started_before_installer=false"
+          exec /usr/bin/sudo "$@"
+          SUDO
+          chmod 0755 /tmp/fake-bin/sudo
+          test "$(kill -0 "${old_api_pid}" 2>/dev/null && echo active)" = active
+          echo "old_api_pid=${old_api_pid}"
           echo "::endgroup::"
           echo "::group::Run packaged upgrade installer"
-          bash /tmp/package/install-iphoneloadly.sh \
-            --upgrade \
-            --binary /tmp/package/bin/iphoneloadly-api \
-            --package-root /tmp/package
-          echo "Installer exited 0; its internal health check passed."
+          PATH="/tmp/fake-bin:${PATH}" \
+            bash /tmp/package/install-iphoneloadly.sh \
+              --upgrade \
+              --binary /tmp/package/bin/iphoneloadly-api \
+              --package-root /tmp/package
+          echo "Installer exited 0; its internal exact-version retry check passed."
           echo "::endgroup::"
-          echo "::group::Verify expected systemctl calls and fresh API process"
-          cat >/tmp/expected-systemctl <<'EXPECTED_SYSTEMCTL'
-          daemon-reload
-          enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer
-          restart iphoneloadly-api.service
-          EXPECTED_SYSTEMCTL
-          diff --unified=0 /tmp/expected-systemctl /tmp/systemctl-invocations.log
+          echo "::group::Verify stop-before-replace and delayed readiness"
+          test "$(cat /tmp/replacement-while-active)" = false
+          test -e /tmp/api-start-returned
           api_pid="$(cat /tmp/api.pid)"
           test -n "${api_pid}"
+          for _ in $(seq 1 10); do
+            kill -0 "${api_pid}" 2>/dev/null && break
+            sleep 1
+          done
           kill -0 "${api_pid}"
-          test "$(cat /tmp/api-executable)" = /opt/iphoneloadly/bin/iphoneloadly-api
           test "$(readlink -f "/proc/${api_pid}/exe")" = /opt/iphoneloadly/bin/iphoneloadly-api
-          echo "api_started_before_installer=false"
-          echo "restart_launched=/opt/iphoneloadly/bin/iphoneloadly-api"
+          echo "replacement_while_active=false"
+          echo "delayed_readiness=passed"
           echo "::endgroup::"
-          echo "::group::Verify installed files"
+          echo "::group::Verify expected systemctl calls and installed files"
+          cat >/tmp/expected-systemctl <<'EXPECTED_SYSTEMCTL'
+          stop iphoneloadly-api.service
+          is-active --quiet iphoneloadly-api.service
+          daemon-reload
+          enable --now iphoneloadly-update.path iphoneloadly-source-sync.timer
+          start iphoneloadly-api.service
+          EXPECTED_SYSTEMCTL
+          diff --unified=0 /tmp/expected-systemctl /tmp/systemctl-invocations.log
           test -x /opt/iphoneloadly/bin/iphoneloadly-api
           test -x /usr/local/libexec/iphoneloadly/update-iphoneloadly.sh
           for unit in \
@@ -239,9 +297,153 @@ jobs:
             test -f "/etc/systemd/system/${unit}"
           done
           echo "::endgroup::"
-          echo "::group::Verify installer and post-install health"
+          echo "::group::Verify installer exact target version"
           curl --fail --silent http://127.0.0.1:8080/healthz | tee /tmp/post-healthz.json
           grep -Fq "\"version\":\"${expected_version}\"" /tmp/post-healthz.json
+          echo "::endgroup::"
+          echo "::group::Verify missing and wrong target versions fail"
+          missing_package=/tmp/package-missing-version
+          wrong_package=/tmp/package-wrong-version
+          cp -a /tmp/package "${missing_package}"
+          cp -a /tmp/package "${wrong_package}"
+          rm -f "${missing_package}/VERSION"
+          if bash "${missing_package}/install-iphoneloadly.sh" \
+            --upgrade \
+            --binary "${missing_package}/bin/iphoneloadly-api" \
+            --package-root "${missing_package}"; then
+            echo "Installer accepted a package without VERSION." >&2
+            exit 1
+          fi
+          printf '%s\n' wrong-target-version >"${wrong_package}/VERSION"
+          mkdir -p /tmp/fake-bin-wrong
+          cat >/tmp/fake-bin-wrong/curl <<'WRONG_CURL'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"status":"ok","version":"0.3.0-alpha.999"}'
+          WRONG_CURL
+          chmod 0755 /tmp/fake-bin-wrong/curl
+          started_at="$(date +%s)"
+          if IPHONELOADLY_STARTUP_TIMEOUT_SECONDS=3 \
+            PATH="/tmp/fake-bin-wrong:/tmp/fake-bin:${PATH}" \
+            bash "${wrong_package}/install-iphoneloadly.sh" \
+              --upgrade \
+              --binary "${wrong_package}/bin/iphoneloadly-api" \
+              --package-root "${wrong_package}"; then
+            echo "Installer accepted a wrong API version." >&2
+            exit 1
+          fi
+          elapsed_seconds=$(( $(date +%s) - started_at ))
+          test "${elapsed_seconds}" -lt 10
+          /usr/local/bin/systemctl stop iphoneloadly-api.service
+          echo "missing_version=failed"
+          echo "wrong_version=failed"
+          echo "bounded_timeout_seconds=${elapsed_seconds}"
+          echo "::endgroup::"
+          /usr/local/bin/systemctl start iphoneloadly-api.service
+          for _ in $(seq 1 10); do
+            if curl --fail --silent http://127.0.0.1:8080/healthz >/tmp/restarted-healthz.json; then
+              break
+            fi
+            sleep 1
+          done
+          grep -Fq "\"version\":\"${expected_version}\"" /tmp/restarted-healthz.json
+          prior_health="$(curl --fail --silent http://127.0.0.1:8080/healthz)"
+          prior_version="$(printf '%s\n' "${prior_health}" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+          test "${prior_version}" = "${expected_version}"
+          : >/tmp/update-path-enabled
+          rm -f /tmp/source-sync-timer-enabled
+          echo "::group::Verify rollback restores runtime after failure"
+          rollback_dir=/tmp/rollback-package
+          rollback_root=/tmp/rollback-root
+          rollback_archive_dir=/tmp/rollback-release
+          rollback_archive_name="iphoneloadly-v${expected_version}-linux-amd64.tar.gz"
+          mkdir -p "${rollback_dir}" "${rollback_root}" "${rollback_archive_dir}"
+          cp -a /tmp/package/. "${rollback_dir}/"
+          cat >"${rollback_dir}/install-iphoneloadly.sh" <<'ROLLBACK_INSTALLER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          replacement="$(mktemp /opt/iphoneloadly/bin/.rollback-failure.XXXXXX)"
+          : >/tmp/update-path-enabled
+          : >/tmp/source-sync-timer-enabled
+          rm -f -- "${replacement}"
+          cp -a -- /usr/bin/false "${replacement}"
+          mv -f -- "${replacement}" /opt/iphoneloadly/bin/iphoneloadly-api
+          exit 1
+          ROLLBACK_INSTALLER
+          chmod 0755 "${rollback_dir}/install-iphoneloadly.sh"
+          mkdir -p "${rollback_root}/iphoneloadly-v${expected_version}-linux-amd64"
+          cp -a "${rollback_dir}/." \
+            "${rollback_root}/iphoneloadly-v${expected_version}-linux-amd64/"
+          tar -czf "${rollback_archive_dir}/${rollback_archive_name}" \
+            -C "${rollback_root}" "iphoneloadly-v${expected_version}-linux-amd64"
+          (
+            cd "${rollback_archive_dir}"
+            sha256sum "${rollback_archive_name}" >"${rollback_archive_name}.sha256"
+          )
+          rollback_digest="$(sha256sum "${rollback_archive_dir}/${rollback_archive_name}" | cut -d' ' -f1)"
+          runtime_before="$(sha256sum /opt/iphoneloadly/bin/iphoneloadly-api | cut -d' ' -f1)"
+          cat >/tmp/fake-bin/curl <<'UPDATER_CURL'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          for argument in "$@"; do
+            if [[ "${argument}" == *"/healthz" ]]; then
+              exec /usr/bin/curl "$@"
+            fi
+          done
+          output=""
+          url=""
+          while (($#)); do
+            case "$1" in
+              --output) output="$2"; shift 2 ;;
+              http://*|https://*) url="$1"; shift ;;
+              *) shift ;;
+            esac
+          done
+          [[ -n "${output}" && -n "${url}" ]]
+          if [[ "${url}" == *.sha256 ]]; then
+            cp "${rollback_archive_dir}/${rollback_archive_name}.sha256" "${output}"
+          else
+            cp "${rollback_archive_dir}/${rollback_archive_name}" "${output}"
+          fi
+          UPDATER_CURL
+          chmod 0755 /tmp/fake-bin/curl
+          cat >/tmp/fake-bin/mv <<'ROLLBACK_MV'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          if [[ "$*" == *"/opt/iphoneloadly/bin/iphoneloadly-api" ]]; then
+            api_pid="$(cat /tmp/api.pid 2>/dev/null || true)"
+            if [[ -e /tmp/api-service-active && -n "${api_pid}" ]] \
+              && kill -0 "${api_pid}" 2>/dev/null; then
+              printf '%s\n' true >>/tmp/rollback-replace-while-active
+            else
+              printf '%s\n' false >>/tmp/rollback-replace-while-active
+            fi
+          fi
+          exec /usr/bin/mv "$@"
+          ROLLBACK_MV
+          chmod 0755 /tmp/fake-bin/mv
+          mkdir -p /run/iphoneloadly
+          printf '{"targetVersion":"%s","expectedArchiveSha256":"%s","createdAt":"2026-08-28T00:00:00Z"}\n' \
+            "${expected_version}" "${rollback_digest}" \
+            >/run/iphoneloadly/update-request.json
+          chmod 0600 /run/iphoneloadly/update-request.json
+          set +e
+          PATH="/tmp/fake-bin:${PATH}" \
+            bash /tmp/package/deploy/host/update-iphoneloadly.sh
+          updater_status=$?
+          set -e
+          test "${updater_status}" -ne 0
+          test ! -e /run/iphoneloadly/update-request.json
+          grep -Fq '"status":"failed"' /var/lib/iphoneloadly/data/update-status.json
+          runtime_after="$(sha256sum /opt/iphoneloadly/bin/iphoneloadly-api | cut -d' ' -f1)"
+          test "${runtime_after}" = "${runtime_before}"
+          curl --fail --silent http://127.0.0.1:8080/healthz | \
+            grep -Fq "\"version\":\"${prior_version}\""
+          test "$(sed -n '1p' /tmp/rollback-replace-while-active)" = true
+          test "$(sed -n '$p' /tmp/rollback-replace-while-active)" = false
+          test -e /tmp/update-path-enabled
+          test ! -e /tmp/source-sync-timer-enabled
+          echo "rollback_runtime_restored=true"
+          echo "rollback_status_preserved=failed"
           echo "::endgroup::"
           echo "::group::Verify preservation state"
           : >/tmp/post-hashes
