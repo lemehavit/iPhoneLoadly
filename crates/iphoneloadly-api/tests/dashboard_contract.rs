@@ -10,6 +10,7 @@ fn dashboard_keeps_the_app_shell_accessibility_contract() {
     assert!(DASHBOARD.contains("prefers-reduced-motion"));
     assert!(DASHBOARD.contains("aria-live=\"polite\""));
     assert!(DASHBOARD.contains("aria-current=\"page\""));
+    assert!(DASHBOARD.contains("[hidden] { display:none !important; }"));
     assert!(DASHBOARD.contains("data-view-target"));
     for view in ["overview", "apps", "install", "activity", "settings"] {
         assert!(DASHBOARD.contains(&format!("data-view=\"{view}\"")));

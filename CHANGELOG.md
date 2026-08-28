@@ -2,6 +2,32 @@
 
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
+## [0.3.0-alpha.1] - 2026-08-28
+
+### Added
+
+- Five app views: Overview, Apps, Install, Activity and Settings.
+- Responsive desktop/mobile navigation with iPhone safe-area-aware bottom tabs.
+- Adaptive light/dark appearance, clearer spacing and a more deliberate visual hierarchy.
+
+### Changed
+
+- Added visible pressed, focus and busy states with consistent loading, empty, success, warning and error feedback.
+- Added meaningful activity text and determinate upload/install progress.
+- Replaced browser prompt/confirm workflows with accessible in-app dialogs and sheets.
+- Consolidated device management, IPA Library, GitHub sources, installation readiness, Activity history and Settings.
+- Completed Swedish and English localization across the dashboard.
+- Single-job and history responses now share canonical install-job serialization, including `progressPercent`.
+
+### Security
+
+- `Remove from management` does not uninstall or unpair an iPhone; installation history is retained.
+- No true phone-unpairing, physical uninstall, native iOS app, or private GitHub source support is provided.
+
+### Upgrade
+
+- After publication, users on `v0.2.0-alpha.3` can update from **Settings → Software update**.
+
 ## [0.2.0-alpha.3] - 2026-08-27
 
 ### Added

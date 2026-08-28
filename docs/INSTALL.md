@@ -17,24 +17,29 @@ The version in the two filenames must match.
 
 ```bash
 mkdir -p ~/iphoneloadly-install && cd ~/iphoneloadly-install
-# Copy the two downloaded release assets into this directory.
-sha256sum -c iphoneloadly-v<VERSION>-linux-amd64.tar.gz.sha256
-tar -xzf iphoneloadly-v<VERSION>-linux-amd64.tar.gz
-cd iphoneloadly-v<VERSION>-linux-amd64
+# Copy both v0.3.0-alpha.1 release assets into this directory.
+sha256sum -c iphoneloadly-v0.3.0-alpha.1-linux-amd64.tar.gz.sha256
+tar -xzf iphoneloadly-v0.3.0-alpha.1-linux-amd64.tar.gz
+cd iphoneloadly-v0.3.0-alpha.1-linux-amd64
 ```
 
 Expected checksum result:
 
 ```text
-iphoneloadly-v<VERSION>-linux-amd64.tar.gz: OK
+iphoneloadly-v0.3.0-alpha.1-linux-amd64.tar.gz: OK
 ```
 
-The current alpha package version is `v0.2.0-alpha.3`. If that release is unavailable,
-use the advanced source-build instructions in
+The current prerelease package version is `v0.3.0-alpha.1`. If it is
+unavailable, use the advanced source-build instructions in
 [from-scratch.md](operations/from-scratch.md); never substitute an unverified
-archive from another site. For users upgrading from alpha.2, alpha.3 is the
-one-time bootstrap installation; later official releases can be requested from
-the dashboard after this version is installed.
+archive from another site.
+
+Users already running `v0.2.0-alpha.3` can update to this release after it is
+published from **Settings → Software update**. Older installations that
+predate alpha.3 should first install `v0.2.0-alpha.3` from its
+[verified GitHub release archive](https://github.com/lemehavit/iPhoneLoadly/releases/tag/v0.2.0-alpha.3)
+using that release's checksum and bootstrap installer guidance, then use the
+in-dashboard updater for later releases.
 
 ## 2. Start the local anisette service
 

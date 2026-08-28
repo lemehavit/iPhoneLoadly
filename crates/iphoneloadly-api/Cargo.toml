@@ -1,6 +1,6 @@
 [package]
 name = "iphoneloadly-api"
-version = "0.2.0-alpha.3"
+version = "0.3.0-alpha.1"
 edition = "2024"
 publish = false
 
