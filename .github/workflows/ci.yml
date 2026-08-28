@@ -86,6 +86,10 @@ jobs:
             -C /tmp/package --strip-components=1
           docker exec "${container}" chmod 0755 \
             /tmp/package/bin/iphoneloadly-api /tmp/package/install-iphoneloadly.sh
+          docker exec "${container}" stat --format='%a %n' \
+            /tmp/package/bin/iphoneloadly-api /tmp/package/install-iphoneloadly.sh
+          docker exec "${container}" test -x /tmp/package/bin/iphoneloadly-api
+          docker exec "${container}" test -x /tmp/package/install-iphoneloadly.sh
           docker exec "${container}" bash -c '
             set -Eeuo pipefail
             mkdir -p /etc/iphoneloadly /etc/caddy \
