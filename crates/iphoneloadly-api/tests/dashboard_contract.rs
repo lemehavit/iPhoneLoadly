@@ -57,6 +57,10 @@ fn dashboard_uses_application_dialogs_and_local_assets() {
 #[test]
 fn overview_has_one_wifi_status_and_keeps_device_controls() {
     assert_eq!(occurrences("function renderDevices("), 1);
+    assert_eq!(occurrences("function handleHash("), 1);
+    assert!(DASHBOARD.contains("window.addEventListener('hashchange',handleHash)"));
+    assert!(DASHBOARD.contains("window.addEventListener('popstate',handleHash)"));
+    assert!(DASHBOARD.contains("handleHash();load();"));
     assert!(DASHBOARD.contains("statusNode('ok',t('online'"));
     assert!(DASHBOARD.contains("byId('devices-status').hidden=true"));
     assert!(!DASHBOARD.contains("setStatus('devices-status','ok'"));
