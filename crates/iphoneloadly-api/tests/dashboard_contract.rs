@@ -85,7 +85,9 @@ fn activity_and_source_views_use_version_aware_data_refresh() {
         DASHBOARD.contains("const version=job.appVersion?`${t('version')} ${job.appVersion}`:''")
     );
     assert!(DASHBOARD.contains("function sourceVersionDetail("));
-    assert!(DASHBOARD.contains("function sourceVersionComparison("));
+    assert!(!DASHBOARD.contains("function sourceVersionComparison("));
+    assert!(!DASHBOARD.contains("function semverParts("));
+    assert!(DASHBOARD.contains("switch(source?.lastStatus)"));
     assert!(DASHBOARD.contains("t('currentVersion')"));
     assert!(DASHBOARD.contains("t('githubVersion')"));
     assert!(DASHBOARD.contains("await loadApps();const sourcesRefreshed=await loadSources()"));

@@ -274,37 +274,7 @@
     async function saveSource(){const button=byId('save-source');await runAction(button,'source-preview-status',t('saveSource'),async()=>{const method=state.editingSource?'PUT':'POST',url=state.editingSource?`/api/sources/${state.editingSource}`:'/api/sources';await json(url,{method,headers:actionHeaders(),body:JSON.stringify(sourcePayload())});setStatus('source-preview-status','ok',t('sourceSaved'));await loadSources();setTimeout(()=>byId('source-dialog').close(),350);}).catch(()=>{});}
     async function removeSource(source,button){const accepted=await openConfirmation(t('remove'),t('removeSourceCopy'),true);if(!accepted)return;await runAction(button,'source-list',t('remove'),async()=>{await json(`/api/sources/${source.id}`,{method:'DELETE',headers:actionHeaders()});await loadSources();}).catch(()=>{});}
     function sourceVersionDetail(source,releaseTag=source?.lastReleaseTag){const current=source?.appId?appById(source.appId)?.appVersion:'';const latest=releaseTag||'';return [[t('currentVersion'),current],[t('githubVersion'),latest]].filter(([,value])=>value).map(([label,value])=>`${label}: ${value}`).join(' · ');}
-    function semverParts(value){
-      const match=String(value||'').trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
-      if(!match)return null;
-      return {core:[Number(match[1]),Number(match[2]),Number(match[3])],pre:match[4]?match[4].split('.'):[]};
-    }
-    function sourceVersionComparison(source){
-      const current=source?.appId?appById(source.appId)?.appVersion:'';
-      const latest=source?.lastReleaseTag||'';
-      const currentParts=semverParts(current);
-      const latestParts=semverParts(latest);
-      if(!currentParts||!latestParts)return null;
-      for(let index=0;index<currentParts.core.length;index+=1){if(latestParts.core[index]!==currentParts.core[index])return latestParts.core[index]>currentParts.core[index]?1:-1;}
-      if(!currentParts.pre.length&&!latestParts.pre.length)return 0;
-      if(!currentParts.pre.length)return -1;
-      if(!latestParts.pre.length)return 1;
-      const length=Math.max(currentParts.pre.length,latestParts.pre.length);
-      for(let index=0;index<length;index+=1){
-        const currentIdentifier=currentParts.pre[index];
-        const latestIdentifier=latestParts.pre[index];
-        if(currentIdentifier===undefined)return -1;
-        if(latestIdentifier===undefined)return 1;
-        if(currentIdentifier===latestIdentifier)continue;
-        const currentNumeric=/^\d+$/.test(currentIdentifier);
-        const latestNumeric=/^\d+$/.test(latestIdentifier);
-        if(currentNumeric&&latestNumeric)return Number(latestIdentifier)>Number(currentIdentifier)?1:-1;
-        if(currentNumeric!==latestNumeric)return currentNumeric?1:-1;
-        return latestIdentifier>currentIdentifier?1:-1;
-      }
-      return 0;
-    }
-    function sourcePresentation(source){const detail=sourceVersionDetail(source);const status=source?.lastStatus==='up_to_date'&&sourceVersionComparison(source)===1?'update_available':source?.lastStatus;switch(status){case 'update_available':return {kind:'warning',message:t('newVersionAvailable'),detail};case 'up_to_date':return {kind:'ok',message:t('noNewerVersion'),detail};case 'downloaded':return {kind:'ok',message:t('sourceDownloaded'),detail};case 'unchanged':return {kind:'ok',message:t('sourceUnchanged'),detail};case 'error':return {kind:'error',message:t('sourceCheckFailed'),detail};default:return {kind:'info',message:t('manual'),detail};}}
+    function sourcePresentation(source){const detail=sourceVersionDetail(source);switch(source?.lastStatus){case 'update_available':return {kind:'warning',message:t('newVersionAvailable'),detail};case 'up_to_date':return {kind:'ok',message:t('noNewerVersion'),detail};case 'downloaded':return {kind:'ok',message:t('sourceDownloaded'),detail};case 'unchanged':return {kind:'ok',message:t('sourceUnchanged'),detail};case 'error':return {kind:'error',message:t('sourceCheckFailed'),detail};default:return {kind:'info',message:t('manual'),detail};}}
     async function sourceAction(source,action,button){await runAction(button,'source-status',action==='check'?t('checkLatest'):t('downloadLatest'),async()=>{const body=await json(`/api/sources/${source.id}/${action}`,{method:'POST',headers:actionHeaders()});if(action==='download'){const appsRefreshed=await loadApps();const sourcesRefreshed=await loadSources();if(!appsRefreshed||!sourcesRefreshed){const message=!appsRefreshed&&!sourcesRefreshed?t('sourceDownloadedRefreshFailed'):!appsRefreshed?t('sourceAppsRefreshFailed'):t('sourceStatusRefreshFailed');setStatus('source-status','warning',message,sourceVersionDetail(source,body?.releaseTag));return;}}else if(!await loadSources()){setStatus('source-status','error',t('sourceRefreshFailed'),sourceVersionDetail(source,body?.releaseTag));return;}const refreshed=state.sources.find(item=>String(item.id)===String(source.id));const presentation=sourcePresentation(refreshed||{...source,lastReleaseTag:body?.releaseTag,lastStatus:action==='check'?'up_to_date':'downloaded'});setStatus('source-status',presentation.kind,presentation.message,presentation.detail);}).catch(()=>{});}
     async function toggleSourceAutomation(source,enabled,button){if(enabled){const accepted=await openConfirmation(t('automatic'),t('securityCopy'),false,true);if(!accepted){button.checked=false;return;}await runSourceAutomation(source,true,button,true);}else await runSourceAutomation(source,false,button,false);}
     async function loadSources(){renderLoading('source-list','checkingSources');try{state.sources=await json('/api/sources');renderSources();return true;}catch(error){setStatus('source-list','error',safeMessage(error));return false;}}
