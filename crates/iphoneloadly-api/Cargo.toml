@@ -29,4 +29,4 @@ futures-util = "0.3.31"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
-zip = { version = "7.0.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
