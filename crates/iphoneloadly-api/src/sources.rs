@@ -322,6 +322,26 @@ pub async fn remove(
     }
 }
 
+fn source_check_status(
+    last_release_id: Option<i64>,
+    last_asset_id: Option<i64>,
+    last_status: Option<&str>,
+    release_id: i64,
+    asset_id: i64,
+) -> &'static str {
+    let same_asset = last_release_id == Some(release_id) && last_asset_id == Some(asset_id);
+    if same_asset
+        && matches!(
+            last_status,
+            Some("downloaded") | Some("unchanged") | Some("up_to_date")
+        )
+    {
+        "up_to_date"
+    } else {
+        "update_available"
+    }
+}
+
 pub async fn check(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -368,8 +388,14 @@ pub async fn check(
             return error_response(error);
         }
     };
-    let current =
-        source.last_release_id == Some(release.id) && source.last_asset_id == Some(asset.id);
+    let status = source_check_status(
+        source.last_release_id,
+        source.last_asset_id,
+        source.last_status.as_deref(),
+        release.id,
+        asset.id,
+    );
+    let current = status == "up_to_date";
     if let Ok(db) = state.database.lock() {
         let _ = store::record_source_check(
             &db,
@@ -379,11 +405,7 @@ pub async fn check(
             Some(asset.id),
             Some(&asset.name),
             source.last_download_sha256.as_deref(),
-            if current {
-                "up_to_date"
-            } else {
-                "update_available"
-            },
+            status,
             None,
         );
     }
@@ -665,4 +687,33 @@ pub async fn sync(State(state): State<AppState>, headers: HeaderMap) -> impl Int
         Json(serde_json::json!({"checked":updated + unchanged + failed,"updated":updated,"failed":failed,"unchanged":unchanged,"skipped":0})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_check_status;
+
+    #[test]
+    fn repeated_checks_keep_pending_release_available_until_downloaded() {
+        assert_eq!(
+            source_check_status(None, None, None, 1, 10),
+            "update_available"
+        );
+        assert_eq!(
+            source_check_status(Some(1), Some(10), Some("downloaded"), 2, 20),
+            "update_available"
+        );
+        assert_eq!(
+            source_check_status(Some(2), Some(20), Some("update_available"), 2, 20),
+            "update_available"
+        );
+        assert_eq!(
+            source_check_status(Some(2), Some(20), Some("downloaded"), 2, 20),
+            "up_to_date"
+        );
+        assert_eq!(
+            source_check_status(Some(2), Some(20), Some("unchanged"), 2, 20),
+            "up_to_date"
+        );
+    }
 }
