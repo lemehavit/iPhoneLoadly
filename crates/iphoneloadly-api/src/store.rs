@@ -951,8 +951,8 @@ pub fn record_source_check(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_REFRESH_AFTER_DAYS, forget_managed_installation, initialize,
-        list_managed_installations, managed_app_identities, refresh_after_days,
+        DEFAULT_REFRESH_AFTER_DAYS, find_job, forget_managed_installation, initialize, insert_app,
+        insert_job, list_managed_installations, managed_app_identities, refresh_after_days,
         refresh_due_targets, restore_managed_installation, set_refresh_after_days,
     };
     use rusqlite::Connection;
@@ -1146,6 +1146,68 @@ mod tests {
                 .len(),
             1
         );
+        drop(connection);
+        std::fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn insert_job_snapshots_historical_app_version() {
+        let path =
+            std::env::temp_dir().join(format!("iphoneloadly-job-version-{}.db", Uuid::now_v7()));
+        let connection = initialize(&path).expect("initialize database");
+        let app_id = Uuid::now_v7();
+        let device_id = Uuid::now_v7();
+        insert_app(
+            &connection,
+            app_id,
+            "version-hash",
+            "version.ipa",
+            1,
+            "com.example.version",
+            "Versioned App",
+            Some("0.4.3"),
+        )
+        .expect("insert versioned app");
+        let job_id = Uuid::now_v7();
+        insert_job(&connection, job_id, app_id, device_id, "Test iPhone").expect("insert job");
+
+        connection
+            .execute(
+                "UPDATE apps SET app_version = '0.4.4' WHERE id = ?1",
+                [app_id.to_string()],
+            )
+            .expect("update app version");
+        let job = find_job(&connection, job_id)
+            .expect("find job")
+            .expect("job exists");
+        assert_eq!(job.app_version.as_deref(), Some("0.4.3"));
+
+        let unversioned_app_id = Uuid::now_v7();
+        insert_app(
+            &connection,
+            unversioned_app_id,
+            "unversioned-hash",
+            "unversioned.ipa",
+            1,
+            "com.example.unversioned",
+            "Unversioned App",
+            None,
+        )
+        .expect("insert unversioned app");
+        let unversioned_job_id = Uuid::now_v7();
+        insert_job(
+            &connection,
+            unversioned_job_id,
+            unversioned_app_id,
+            device_id,
+            "Test iPhone",
+        )
+        .expect("insert unversioned job");
+        let unversioned_job = find_job(&connection, unversioned_job_id)
+            .expect("find unversioned job")
+            .expect("unversioned job exists");
+        assert!(unversioned_job.app_version.is_none());
+
         drop(connection);
         std::fs::remove_file(path).expect("remove test database");
     }
