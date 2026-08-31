@@ -3,6 +3,20 @@
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
 
+## [0.3.0-alpha.3] - 2026-08-31
+
+### Changed
+
+- Overview no longer duplicates the Wi-Fi success presentation; selected-device information and controls remain available.
+- Settings no longer duplicates the persistent “Up to date” presentation; manual update checks still show clear feedback.
+- GitHub sources show the current local IPA version separately from the exact GitHub release tag, refresh app and source metadata after successful downloads, and provide clearer status and failure feedback.
+
+### Fixed
+
+- Activity history preserves each installation job’s recorded app version when the server IPA is later replaced.
+- Repeated GitHub checks keep a pending source update available until the new release asset is downloaded or otherwise authoritatively resolved; release tags and IPA internal versions remain separate authorities.
+- Dashboard hash navigation is retained with regression coverage.
+
 ## [0.3.0-alpha.2] - 2026-08-28
 
 ### Fixed
