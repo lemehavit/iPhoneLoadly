@@ -1,4 +1,5 @@
 use std::{
+    fmt::Display,
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -198,6 +199,21 @@ struct SessionRuntime {
     resources: Arc<Mutex<Option<MdnsAdvertisement>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingFailure {
+    stage: &'static str,
+    detail: String,
+}
+
+impl PairingFailure {
+    fn from_display(stage: &'static str, error: impl Display) -> Self {
+        Self {
+            stage,
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl WirelessPairingService {
     pub fn new(config: WirelessPairingConfig) -> Self {
         Self {
@@ -369,11 +385,23 @@ impl WirelessPairingService {
         .await;
         let (stream, _) = match accepted {
             Ok(Ok(value)) => value,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(error)) => {
                 self.finish(
                     id,
                     PairingPhase::Expired,
                     "The wireless pairing session expired.",
+                    Some(PairingFailure::from_display("tcp_accept", error)),
+                    resources,
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                self.finish(
+                    id,
+                    PairingPhase::Expired,
+                    "The wireless pairing session expired.",
+                    None,
                     resources,
                 )
                 .await;
@@ -402,11 +430,12 @@ impl WirelessPairingService {
         .await;
         let peer = match result {
             Ok(Ok(peer)) => peer,
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 self.finish(
                     id,
                     PairingPhase::Failed,
                     "The iPhone or iPad rejected wireless pairing.",
+                    Some(PairingFailure::from_display("rppairing_accept", error)),
                     resources,
                 )
                 .await;
@@ -417,6 +446,7 @@ impl WirelessPairingService {
                     id,
                     PairingPhase::Expired,
                     "The wireless pairing session expired.",
+                    None,
                     resources,
                 )
                 .await;
@@ -424,11 +454,12 @@ impl WirelessPairingService {
             }
         };
         material.paired_peer_id = Some(fingerprint_peer(&peer.remotepairing_udid));
-        if self.store.save(&material).is_err() {
+        if let Err(error) = self.store.save(&material) {
             self.finish(
                 id,
                 PairingPhase::Failed,
                 "Wireless pairing completed but its state could not be saved.",
+                Some(PairingFailure::from_display("pairing_state_save", error)),
                 resources,
             )
             .await;
@@ -489,8 +520,17 @@ impl WirelessPairingService {
         id: Uuid,
         phase: PairingPhase,
         public_message: &str,
+        failure: Option<PairingFailure>,
         resources: Arc<Mutex<Option<MdnsAdvertisement>>>,
     ) {
+        if let Some(failure) = failure {
+            tracing::warn!(
+                session_id = %id,
+                stage = failure.stage,
+                error = %failure.detail,
+                "wireless pairing failed"
+            );
+        }
         resources.lock().await.take();
         let _ = self.set_phase(id, phase, public_message, None).await;
     }
@@ -1007,5 +1047,31 @@ mod tests {
         assert!(!encoded.contains("pairing_file"));
         assert!(!encoded.contains("private_key"));
         assert!(!encoded.contains("alt_irk"));
+    }
+
+    #[test]
+    fn handshake_failure_detail_is_retained_outside_public_status() {
+        let failure = PairingFailure::from_display(
+            "rppairing_accept",
+            idevice::IdeviceError::UnexpectedResponse(
+                "unexpected pair-setup state: expected 3, got Some(4)".into(),
+            ),
+        );
+        assert_eq!(failure.stage, "rppairing_accept");
+        assert_eq!(
+            failure.detail,
+            "unexpected response from device: unexpected pair-setup state: expected 3, got Some(4)"
+        );
+
+        let status = PairingSessionStatus {
+            id: Uuid::now_v7(),
+            phase: PairingPhase::Failed,
+            expires_at: 1_700_000_000,
+            public_message: "The iPhone or iPad rejected wireless pairing.".into(),
+            setup_code: None,
+        };
+        let encoded = serde_json::to_string(&status).expect("serialize status");
+        assert!(!encoded.contains("unexpected pair-setup state"));
+        assert!(!encoded.contains("rppairing_accept"));
     }
 }
