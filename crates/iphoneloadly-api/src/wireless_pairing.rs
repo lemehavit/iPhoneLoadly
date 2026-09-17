@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use idevice::remote_pairing::{
     PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, RpPairingFile, RpPairingSocket,
 };
-use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
+use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -25,6 +25,10 @@ const SERVICE_NAME: &str = "iPhoneLoadly";
 const SERVICE_MODEL: &str = "Mac17,7";
 const STATE_FILE: &str = "pairing-state.json";
 const KEY_FILE: &str = "pairing-state.key";
+// mdns-sd 0.20.3 defaults to 15; this API permits up to 30 and the
+// PairableHost service label is 27 bytes after its leading underscore.
+const MDNS_SERVICE_NAME_LIMIT: u8 = 30;
+const MDNS_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WirelessPairingMode {
@@ -185,6 +189,7 @@ pub struct WirelessPairingService {
     config: WirelessPairingConfig,
     store: Arc<PairingStore>,
     session: Arc<Mutex<Option<SessionRuntime>>>,
+    start_lock: Arc<Mutex<()>>,
 }
 
 struct SessionRuntime {
@@ -199,6 +204,7 @@ impl WirelessPairingService {
             store: Arc::new(PairingStore::new(config.state_dir.clone())),
             config,
             session: Arc::new(Mutex::new(None)),
+            start_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -207,18 +213,21 @@ impl WirelessPairingService {
             return Err(PairingError::Disabled);
         }
 
-        let mut current = self.session.lock().await;
-        if let Some(runtime) = current.as_mut()
-            && !runtime.status.phase.is_terminal()
+        let _start_lock = self.start_lock.lock().await;
         {
-            if session_expired(&runtime.status, SystemTime::now()) {
-                runtime.status.phase = PairingPhase::Expired;
-                runtime.status.setup_code = None;
-                runtime.status.public_message = "The wireless pairing session expired.".into();
-                runtime.cancel.abort();
-                runtime.resources.lock().await.take();
-            } else {
-                return Err(PairingError::Busy);
+            let mut current = self.session.lock().await;
+            if let Some(runtime) = current.as_mut()
+                && !runtime.status.phase.is_terminal()
+            {
+                if session_expired(&runtime.status, SystemTime::now()) {
+                    runtime.status.phase = PairingPhase::Expired;
+                    runtime.status.setup_code = None;
+                    runtime.status.public_message = "The wireless pairing session expired.".into();
+                    runtime.cancel.abort();
+                    runtime.resources.lock().await.take();
+                } else {
+                    return Err(PairingError::Busy);
+                }
             }
         }
 
@@ -231,7 +240,8 @@ impl WirelessPairingService {
             &material.host_info,
             &material.pairing_file,
             self.config.interface.as_deref(),
-        )?;
+        )
+        .await?;
         let id = Uuid::now_v7();
         let status = PairingSessionStatus {
             id,
@@ -253,7 +263,7 @@ impl WirelessPairingService {
             cancel: task.abort_handle(),
             resources,
         };
-        *current = Some(runtime);
+        *self.session.lock().await = Some(runtime);
         Ok(status)
     }
 
@@ -557,7 +567,7 @@ fn is_safe_default_address(ip: &IpAddr) -> bool {
     }
 }
 
-fn advertise(
+async fn advertise(
     addresses: &[IpAddr],
     port: u16,
     host_info: &PairableHostInfo,
@@ -579,8 +589,36 @@ fn advertise(
         service.set_interfaces(vec![IfKind::Name(interface.to_owned())]);
     }
     let daemon = ServiceDaemon::new().map_err(|_| PairingError::Advertisement)?;
+    daemon
+        .set_service_name_len_max(MDNS_SERVICE_NAME_LIMIT)
+        .map_err(|_| {
+            let _ = daemon.shutdown();
+            PairingError::Advertisement
+        })?;
+    let monitor = daemon.monitor().map_err(|_| {
+        let _ = daemon.shutdown();
+        PairingError::Advertisement
+    })?;
     let fullname = service.get_fullname().to_owned();
     if daemon.register(service).is_err() {
+        let _ = daemon.shutdown();
+        return Err(PairingError::Advertisement);
+    }
+    let deadline = Instant::now() + MDNS_ANNOUNCE_TIMEOUT;
+    let announced = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        match timeout(remaining, monitor.recv_async()).await {
+            Ok(Ok(DaemonEvent::Announce(name, _))) if name.eq_ignore_ascii_case(&fullname) => {
+                break true;
+            }
+            Ok(Ok(DaemonEvent::Error(_))) | Ok(Err(_)) | Err(_) => break false,
+            Ok(Ok(_)) => {}
+        }
+    };
+    if !announced {
         let _ = daemon.shutdown();
         return Err(PairingError::Advertisement);
     }
@@ -817,6 +855,15 @@ mod tests {
             validate_pairing_port(80),
             Err(ConfigError::InvalidPort)
         ));
+    }
+
+    #[test]
+    fn pairable_host_service_type_fits_configured_mdns_limit() {
+        let service_name = PAIRABLE_HOST_SERVICE_TYPE
+            .strip_suffix("._tcp.local.")
+            .and_then(|value| value.strip_prefix('_'))
+            .expect("PairableHost service type has a valid DNS-SD suffix");
+        assert!(service_name.len() <= MDNS_SERVICE_NAME_LIMIT as usize);
     }
 
     #[test]
