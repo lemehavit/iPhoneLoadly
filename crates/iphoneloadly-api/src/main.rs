@@ -60,6 +60,11 @@ struct InstalledAppSummary {
     bundle_id: String,
     version: String,
 }
+#[derive(Debug, Clone, Serialize)]
+struct AfcProbeResponse {
+    transport: &'static str,
+    afc: &'static str,
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +100,7 @@ trait DeviceTransport: Send + Sync {
         &self,
         device_id: Uuid,
     ) -> Result<Vec<InstalledAppSummary>, TransportError>;
+    async fn probe_afc(&self, device_id: Uuid) -> Result<(), TransportError>;
     async fn install_ipa(
         &self,
         signing: &signing::AppleSigningProvider,
@@ -249,6 +255,28 @@ impl DeviceTransport for NetmuxTransport {
                 })
             })
             .collect())
+    }
+
+    async fn probe_afc(&self, device_id: Uuid) -> Result<(), TransportError> {
+        use idevice::{IdeviceService, services::afc::AfcClient};
+
+        let (udid, address, _) = self
+            .reachable_network_devices()
+            .await?
+            .into_iter()
+            .find(|(udid, _, _)| device_id_for_udid(udid) == device_id)
+            .ok_or(TransportError::Unavailable)?;
+        let provider = self.provider_for(&udid, address)?;
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(10), AfcClient::connect(&provider))
+                .await
+                .map_err(|_| TransportError::Unavailable)?
+                .map_err(|_| TransportError::Unavailable)?;
+        tokio::time::timeout(Duration::from_secs(10), client.get_device_info())
+            .await
+            .map_err(|_| TransportError::Unavailable)?
+            .map_err(|_| TransportError::Unavailable)?;
+        Ok(())
     }
 }
 
@@ -467,7 +495,9 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartAppleLoginRequest, device_id_for_udid, install_job_json, managed_app};
+    use super::{
+        AfcProbeResponse, StartAppleLoginRequest, device_id_for_udid, install_job_json, managed_app,
+    };
     use crate::store::{ManagedAppIdentity, StoredJob};
     use uuid::Uuid;
 
@@ -476,6 +506,22 @@ mod tests {
         let first = device_id_for_udid("00008110-001A2B3C00000000");
         assert_eq!(first, device_id_for_udid("00008110-001A2B3C00000000"));
         assert_ne!(first, device_id_for_udid("00008110-001A2B3C00000001"));
+    }
+
+    #[test]
+    fn afc_probe_response_contains_only_non_secret_status() {
+        let value = serde_json::to_value(AfcProbeResponse {
+            transport: "lockdown",
+            afc: "ok",
+        })
+        .expect("serialize AFC probe response");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "transport": "lockdown",
+                "afc": "ok",
+            })
+        );
     }
 
     #[test]
@@ -847,6 +893,27 @@ async fn list_device_apps(
             (StatusCode::OK, Json(apps)).into_response()
         }
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"The selected trusted iPhone is not reachable over Wi-Fi."}))).into_response(),
+    }
+}
+
+async fn spike_afc_probe(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    match state.devices.probe_afc(id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(AfcProbeResponse {
+                transport: "lockdown",
+                afc: "ok",
+            }),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AfcProbeResponse {
+                transport: "lockdown",
+                afc: "unavailable",
+            }),
+        )
+            .into_response(),
     }
 }
 async fn list_managed_installations(State(state): State<AppState>) -> impl IntoResponse {
@@ -1671,7 +1738,13 @@ async fn main() {
             "/api/settings/refresh",
             get(get_refresh_settings).put(update_refresh_settings),
         )
-        .route("/api/installation-validity", get(installation_validity))
+        .route("/api/installation-validity", get(installation_validity));
+    let app = if spike_mode {
+        app.route("/api/spike/devices/{id}/afc-probe", get(spike_afc_probe))
+    } else {
+        app
+    };
+    let app = app
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
         .with_state(state);
     let address: SocketAddr = if spike_mode {
