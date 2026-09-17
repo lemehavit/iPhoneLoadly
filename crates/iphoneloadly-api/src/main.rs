@@ -5,6 +5,7 @@ mod signing;
 mod sources;
 mod store;
 mod update;
+mod wireless_pairing;
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
@@ -17,11 +18,11 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, patch, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -32,6 +33,7 @@ use uuid::Uuid;
 pub(crate) struct AppState {
     pub(crate) signing: Arc<signing::AppleSigningProvider>,
     pub(crate) devices: Arc<dyn DeviceTransport>,
+    pub(crate) wireless_pairing: Arc<wireless_pairing::WirelessPairingService>,
     pub(crate) apps_dir: PathBuf,
     pub(crate) database: Arc<Mutex<rusqlite::Connection>>,
     pub(crate) app_mutation: Arc<tokio::sync::RwLock<()>>,
@@ -727,6 +729,96 @@ async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn rescan_devices(State(state): State<AppState>) -> impl IntoResponse {
     list_devices(State(state)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatePairingSessionRequest {
+    mode: String,
+}
+
+async fn create_pairing_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreatePairingSessionRequest>,
+) -> impl IntoResponse {
+    if request.mode != "wireless" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"message":"Only wireless pairing is available in this spike."}),
+            ),
+        )
+            .into_response();
+    }
+    if !sources::action_allowed(&headers) {
+        return sources::action_required();
+    }
+    match state.wireless_pairing.start_wireless().await {
+        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Err(wireless_pairing::PairingError::Disabled) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Wireless pairing is disabled."})),
+        )
+            .into_response(),
+        Err(wireless_pairing::PairingError::Busy) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"message":"A wireless pairing session is already active."})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"message":"Unable to start wireless pairing."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_pairing_session(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state.wireless_pairing.status(id).await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(wireless_pairing::PairingError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Wireless pairing session was not found."})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"message":"Unable to read wireless pairing status."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn cancel_pairing_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    if !sources::action_allowed(&headers) {
+        return sources::action_required();
+    }
+    match state.wireless_pairing.cancel(id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(wireless_pairing::PairingError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message":"Wireless pairing session was not found."})),
+        )
+            .into_response(),
+        Err(wireless_pairing::PairingError::Terminal) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"message":"Wireless pairing session is already finished."})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"message":"Unable to cancel wireless pairing."})),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_device_apps(
@@ -1442,11 +1534,23 @@ async fn main() {
         .expect("install rustls AWS-LC crypto provider");
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("idevice=info".parse().expect("static tracing directive")),
+        )
         .with_target(false)
         .init();
 
-    let data_dir = PathBuf::from("data");
+    let spike_mode = std::env::args().any(|argument| argument == "--wireless-pairing-spike");
+    let data_dir = if spike_mode {
+        std::env::var("IPHONELOADLY_SPIKE_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("spike-data"))
+    } else {
+        PathBuf::from("data")
+    };
+    std::fs::create_dir_all(&data_dir).expect("create API data directory");
+
     let database_path = data_dir.join("iphoneloadly.db");
     let database = store::initialize(&database_path).expect("initialize SQLite store");
     for (id, path) in store::apps_missing_bundle_id(&database).unwrap_or_default() {
@@ -1469,6 +1573,24 @@ async fn main() {
         mux_socket,
         pairing_path: pairing_dir.into(),
     });
+    let wireless_pairing_config = match wireless_pairing::WirelessPairingConfig::from_env(
+        data_dir.join("wireless-pairing"),
+    ) {
+        Ok(mut config) => {
+            if !spike_mode && matches!(config.mode, wireless_pairing::WirelessPairingMode::On) {
+                tracing::warn!("wireless pairing on-mode is restricted to the disposable spike");
+                config.mode = wireless_pairing::WirelessPairingMode::Off;
+            }
+            config
+        }
+        Err(_) => {
+            tracing::warn!("invalid wireless pairing configuration; feature disabled");
+            wireless_pairing::WirelessPairingConfig::disabled(data_dir.join("wireless-pairing"))
+        }
+    };
+    let wireless_pairing = Arc::new(wireless_pairing::WirelessPairingService::new(
+        wireless_pairing_config,
+    ));
     let github =
         github::GitHubClient::new(env!("CARGO_PKG_VERSION")).expect("create GitHub client");
     let state = AppState {
@@ -1477,6 +1599,7 @@ async fn main() {
             data_dir.join("signing"),
         ),
         devices,
+        wireless_pairing,
         apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
         app_mutation: Arc::new(tokio::sync::RwLock::new(())),
@@ -1509,6 +1632,11 @@ async fn main() {
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{id}/apps", get(list_device_apps))
         .route("/api/devices/rescan", post(rescan_devices))
+        .route("/api/pairing-sessions", post(create_pairing_session))
+        .route(
+            "/api/pairing-sessions/{id}",
+            get(get_pairing_session).delete(cancel_pairing_session),
+        )
         .route(
             "/api/managed-installations",
             get(list_managed_installations),
@@ -1546,11 +1674,19 @@ async fn main() {
         .route("/api/installation-validity", get(installation_validity))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
         .with_state(state);
-
-    let address: SocketAddr = "127.0.0.1:8080".parse().expect("static socket address");
+    let address: SocketAddr = if spike_mode {
+        std::env::var("IPHONELOADLY_SPIKE_API_ADDRESS").unwrap_or_else(|_| "127.0.0.1:18080".into())
+    } else {
+        "127.0.0.1:8080".into()
+    }
+    .parse()
+    .expect("valid API socket address");
+    if spike_mode && !address.ip().is_loopback() {
+        panic!("wireless pairing spike API must bind to loopback");
+    }
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("bind API listener");
-    tracing::info!(%address, "iPhoneLoadly API listening");
+    tracing::info!(%address, spike_mode, "iPhoneLoadly API listening");
     axum::serve(listener, app).await.expect("serve API");
 }

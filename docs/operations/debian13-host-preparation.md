@@ -201,6 +201,46 @@ sudo env USBMUXD_SOCKET_ADDRESS=/run/iphoneloadly/mux.sock \
 
 USB must remain disconnected. Version 0.1 may proceed to its native Rust device spike only after this succeeds and emits usable progress/status.
 
+## 9. Run the disposable iOS 27 wireless-pairing spike
+
+This is a hardware-spike path, not a production service update. Do not run it
+while the installed `iphoneloadly-api.service` is active if the selected
+pairing port or mDNS host identity could conflict. It does not install a
+binary, edit a systemd unit, change firewall rules, or use production state.
+
+From a repository checkout on the Debian host:
+
+```bash
+export IPHONELOADLY_SPIKE_DATA_DIR=/var/tmp/iphoneloadly-wireless-spike
+export IPHONELOADLY_PAIRING_INTERFACE=wlan0
+bash scripts/run-wireless-pairing-spike.sh
+```
+
+Keep `IPHONELOADLY_SPIKE_DATA_DIR` unchanged when restarting the disposable
+process; it contains the encrypted RemotePairing state used for the restart
+gate. The launcher defaults to `IPHONELOADLY_WIRELESS_PAIRING=experimental`,
+loopback API `127.0.0.1:18080`, and pairing port `52345`. It emits only phase
+and result diagnostics. Keep the spike API loopback-only and reach it through
+an SSH tunnel, or put it behind the same authenticated Caddy boundary used by
+the production API; never expose port `18080` directly to the LAN.
+
+Start one session:
+
+```bash
+curl --fail --silent \
+  -H 'content-type: application/json' \
+  -H 'X-iPhoneLoadly-Action: 1' \
+  -d '{"mode":"wireless"}' \
+  http://127.0.0.1:18080/api/pairing-sessions
+```
+Poll the returned session ID through the same loopback tunnel or authenticated
+proxy. Mutation requests must include the existing
+`X-iPhoneLoadly-Action: 1` JSON header. The one-time setup code is shown only
+by the authenticated pairing-session status path; it is never written to logs
+or pairing diagnostics.
+Cancel with `DELETE` if the physical pairing ceremony is not immediately
+available.
+
 ## Recovery rules
 
 - If mDNS is empty, inspect AP client isolation, VLAN boundaries, multicast filtering, Proxmox bridge configuration and the phone's current Wi-Fi network.

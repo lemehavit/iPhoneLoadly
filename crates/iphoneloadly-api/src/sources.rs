@@ -37,7 +37,7 @@ pub struct AutomationRequest {
     #[serde(default)]
     pub acknowledged_security_warning: bool,
 }
-fn action_allowed(headers: &HeaderMap) -> bool {
+pub(crate) fn action_allowed(headers: &HeaderMap) -> bool {
     headers
         .get("x-iphoneloadly-action")
         .and_then(|value| value.to_str().ok())
@@ -48,7 +48,7 @@ fn action_allowed(headers: &HeaderMap) -> bool {
             .is_some_and(|value| value.starts_with("application/json"))
 }
 
-fn action_required() -> axum::response::Response {
+pub(crate) fn action_required() -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"message":"JSON action header required."})),
