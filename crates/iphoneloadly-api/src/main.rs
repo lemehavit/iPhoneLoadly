@@ -66,6 +66,33 @@ struct AfcProbeResponse {
     afc: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RsdProbeSuccessResponse {
+    transport: &'static str,
+    remote_pairing: &'static str,
+    rsd: &'static str,
+    core_device: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RsdProbeFailureResponse {
+    transport: &'static str,
+    status: &'static str,
+    stage: &'static str,
+}
+
+const SPIKE_AFC_PROBE_PATH: &str = "/api/spike/devices/{id}/afc-probe";
+const SPIKE_RSD_PROBE_PATH: &str = "/api/spike/remote-pairing/rsd-probe";
+
+fn spike_route_paths(spike_mode: bool) -> &'static [&'static str] {
+    if spike_mode {
+        &[SPIKE_AFC_PROBE_PATH, SPIKE_RSD_PROBE_PATH]
+    } else {
+        &[]
+    }
+}
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ConnectionType {
@@ -496,7 +523,9 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::{
-        AfcProbeResponse, StartAppleLoginRequest, device_id_for_udid, install_job_json, managed_app,
+        AfcProbeResponse, RsdProbeFailureResponse, RsdProbeSuccessResponse, SPIKE_RSD_PROBE_PATH,
+        StartAppleLoginRequest, device_id_for_udid, install_job_json, managed_app,
+        spike_route_paths,
     };
     use crate::store::{ManagedAppIdentity, StoredJob};
     use uuid::Uuid;
@@ -522,6 +551,67 @@ mod tests {
                 "afc": "ok",
             })
         );
+    }
+
+    #[test]
+    fn rsd_probe_success_response_is_non_secret() {
+        let value = serde_json::to_value(RsdProbeSuccessResponse {
+            transport: "rsdCoreDevice",
+            remote_pairing: "ok",
+            rsd: "ok",
+            core_device: "ok",
+        })
+        .expect("serialize RSD probe response");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "transport": "rsdCoreDevice",
+                "remotePairing": "ok",
+                "rsd": "ok",
+                "coreDevice": "ok",
+            })
+        );
+        let encoded = value.to_string();
+        for secret_name in [
+            "pairingFile",
+            "privateKey",
+            "altIrk",
+            "authTag",
+            "encryptionKey",
+            "identifier",
+        ] {
+            assert!(
+                !encoded.contains(secret_name),
+                "response leaked {secret_name}"
+            );
+        }
+    }
+    #[test]
+    fn rsd_probe_failure_response_is_non_secret() {
+        let value = serde_json::to_value(RsdProbeFailureResponse {
+            transport: "rsdCoreDevice",
+            status: "unavailable",
+            stage: "validatePairing",
+        })
+        .expect("serialize RSD probe failure response");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "transport": "rsdCoreDevice",
+                "status": "unavailable",
+                "stage": "validatePairing",
+            })
+        );
+        let encoded = value.to_string();
+        assert!(!encoded.contains("auth"));
+        assert!(!encoded.contains("key"));
+        assert!(!encoded.contains("secret"));
+    }
+
+    #[test]
+    fn rsd_probe_route_is_registered_only_in_spike_mode() {
+        assert!(!spike_route_paths(false).contains(&SPIKE_RSD_PROBE_PATH));
+        assert!(spike_route_paths(true).contains(&SPIKE_RSD_PROBE_PATH));
     }
 
     #[test]
@@ -911,6 +1001,30 @@ async fn spike_afc_probe(State(state): State<AppState>, Path(id): Path<Uuid>) ->
             Json(AfcProbeResponse {
                 transport: "lockdown",
                 afc: "unavailable",
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn spike_remote_pairing_rsd_probe(State(state): State<AppState>) -> impl IntoResponse {
+    match state.wireless_pairing.probe_remote_pairing_rsd().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(RsdProbeSuccessResponse {
+                transport: "rsdCoreDevice",
+                remote_pairing: "ok",
+                rsd: "ok",
+                core_device: "ok",
+            }),
+        )
+            .into_response(),
+        Err(failure) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(RsdProbeFailureResponse {
+                transport: "rsdCoreDevice",
+                status: "unavailable",
+                stage: failure.stage.as_str(),
             }),
         )
             .into_response(),
@@ -1739,8 +1853,9 @@ async fn main() {
             get(get_refresh_settings).put(update_refresh_settings),
         )
         .route("/api/installation-validity", get(installation_validity));
-    let app = if spike_mode {
-        app.route("/api/spike/devices/{id}/afc-probe", get(spike_afc_probe))
+    let app = if !spike_route_paths(spike_mode).is_empty() {
+        app.route(SPIKE_AFC_PROBE_PATH, get(spike_afc_probe))
+            .route(SPIKE_RSD_PROBE_PATH, get(spike_remote_pairing_rsd_probe))
     } else {
         app
     };

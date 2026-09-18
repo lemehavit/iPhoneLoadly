@@ -9,7 +9,7 @@ async-trait = "0.1.89"
 aes-gcm = "0.10.3"
 axum = { version = "0.8.8", features = ["multipart"] }
 base64 = "0.22.1"
-idevice = { version = "=0.1.65", features = ["tcp", "usbmuxd", "remote_pairing", "mdns", "rsd", "afc", "installation_proxy", "core_device_proxy", "tunnel_tcp_stack"] }
+idevice = { version = "=0.1.65", features = ["tcp", "usbmuxd", "remote_pairing", "mdns", "rsd", "afc", "installation_proxy", "core_device", "core_device_proxy", "tunnel_tcp_stack"] }
 # Pin the same signing stack as iLoader. The Git branch is required because
 # published isideload releases do not contain its current signing backend.
 isideload = { version = "0.3.17", git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick", features = ["fs-storage"] }

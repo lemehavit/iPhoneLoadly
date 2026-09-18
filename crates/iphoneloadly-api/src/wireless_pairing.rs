@@ -9,18 +9,29 @@ use std::{
 
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use idevice::remote_pairing::{
-    PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, RpPairingFile, RpPairingSocket,
+use idevice::{
+    provider::RsdProvider,
+    remote_pairing::{
+        PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, PeerDevice,
+        RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
+    },
+    services::{core_device::AppServiceClient, rsd::RsdHandshake},
+    tcp::adapter::Adapter,
 };
-use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceInfo};
+use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{net::TcpListener, sync::Mutex, task::AbortHandle, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+    task::AbortHandle,
+    time::timeout,
+};
 use uuid::Uuid;
-
 const DEFAULT_PAIRING_PORT: u16 = 52_345;
+
 const SESSION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const SERVICE_NAME: &str = "iPhoneLoadly";
 const SERVICE_MODEL: &str = "Mac17,7";
@@ -30,6 +41,35 @@ const KEY_FILE: &str = "pairing-state.key";
 // PairableHost service label is 27 bytes after its leading underscore.
 const MDNS_SERVICE_NAME_LIMIT: u8 = 30;
 const MDNS_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_PAIRING_SERVICE_TYPE: &str = "_remotepairing._tcp.local.";
+const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsdProbeStage {
+    Discovery,
+    ValidatePairing,
+    Tunnel,
+    RsdHandshake,
+    CoreDeviceService,
+}
+
+impl RsdProbeStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::ValidatePairing => "validatePairing",
+            Self::Tunnel => "tunnel",
+            Self::RsdHandshake => "rsdHandshake",
+            Self::CoreDeviceService => "coreDeviceService",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsdProbeFailure {
+    pub stage: RsdProbeStage,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WirelessPairingMode {
@@ -353,6 +393,100 @@ impl WirelessPairingService {
         Ok(runtime.status.clone())
     }
 
+    pub async fn probe_remote_pairing_rsd(&self) -> Result<(), RsdProbeFailure> {
+        let material = self
+            .store
+            .load_existing(SERVICE_NAME)
+            .map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
+        if material.paired_peer_id.is_none() {
+            return Err(probe_failure(RsdProbeStage::Discovery));
+        }
+        let pairing_file = material.pairing_file;
+        if pairing_file
+            .alt_irk()
+            .is_none_or(|alt_irk| alt_irk.len() != 16)
+        {
+            return Err(probe_failure(RsdProbeStage::Discovery));
+        }
+
+        let endpoints = discover_remote_pairing_endpoints(&pairing_file).await?;
+        let (address, mut client) =
+            connect_and_validate_remote_pairing(&endpoints, &pairing_file).await?;
+        let listener_port = timeout(REMOTE_CONNECT_TIMEOUT, client.create_tcp_listener())
+            .await
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let listener_stream = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            TcpStream::connect(SocketAddr::new(address, listener_port)),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let encryption_key = client.encryption_key().to_owned();
+        let tunnel = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            connect_tls_psk_tunnel_native(listener_stream, &encryption_key),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let tunnel_info = tunnel.info.clone();
+        if tunnel_info.server_rsd_port == 0 {
+            return Err(probe_failure(RsdProbeStage::Tunnel));
+        }
+        let host_ip = tunnel_info
+            .client_address
+            .parse::<IpAddr>()
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let peer_ip = tunnel_info
+            .server_address
+            .parse::<IpAddr>()
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), host_ip, peer_ip);
+        adapter.set_mss(usize::from(tunnel_info.mtu.saturating_sub(60)));
+        let mut provider = adapter.to_async_handle();
+        let rsd_stream = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            provider.connect(tunnel_info.server_rsd_port),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
+        .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
+        let handshake = timeout(REMOTE_CONNECT_TIMEOUT, RsdHandshake::new(rsd_stream))
+            .await
+            .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
+            .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
+        let app_port = handshake
+            .services
+            .get("com.apple.coredevice.appservice")
+            .map(|service| service.port)
+            .ok_or_else(|| probe_failure(RsdProbeStage::CoreDeviceService))?;
+        let app_stream = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            provider.connect_to_service_port(app_port),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?
+        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?;
+        let mut app_service = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            AppServiceClient::<idevice::IdeviceSocket>::new(app_stream),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?
+        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?;
+        timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            app_service.list_apps(false, false, false, false, false),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?
+        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?;
+        let _ = provider.close().await;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn load_pairing_material(&self) -> Result<StoredPairingMaterial, PairingError> {
         self.store.load_or_create(SERVICE_NAME)
@@ -534,6 +668,117 @@ impl WirelessPairingService {
         resources.lock().await.take();
         let _ = self.set_phase(id, phase, public_message, None).await;
     }
+}
+
+fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
+    tracing::debug!(stage = stage.as_str(), "remote pairing RSD probe failed");
+    RsdProbeFailure { stage }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemotePairingEndpoint {
+    addresses: Vec<IpAddr>,
+    port: u16,
+}
+
+fn authenticated_remote_pairing_endpoint(
+    alt_irk: &[u8],
+    identifier: &str,
+    auth_tag: &str,
+    mut addresses: Vec<IpAddr>,
+    port: u16,
+) -> Option<RemotePairingEndpoint> {
+    if port == 0
+        || addresses.is_empty()
+        || !PeerDevice::validate_auth_tag(alt_irk, identifier, auth_tag)
+    {
+        return None;
+    }
+    addresses.sort_by_key(|address| (!address.is_ipv4(), address.to_string()));
+    Some(RemotePairingEndpoint { addresses, port })
+}
+
+async fn discover_remote_pairing_endpoints(
+    pairing_file: &RpPairingFile,
+) -> Result<Vec<RemotePairingEndpoint>, RsdProbeFailure> {
+    let alt_irk = pairing_file
+        .alt_irk()
+        .ok_or_else(|| probe_failure(RsdProbeStage::Discovery))?;
+    let daemon = ServiceDaemon::new().map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
+    let receiver = daemon
+        .browse(REMOTE_PAIRING_SERVICE_TYPE)
+        .map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
+    let deadline = Instant::now() + REMOTE_DISCOVERY_TIMEOUT;
+    let mut endpoints = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let event = match timeout(remaining, receiver.recv_async()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        if let ServiceEvent::ServiceResolved(info) = event {
+            let Some(identifier) = info.get_property_val_str("identifier") else {
+                continue;
+            };
+            let Some(auth_tag) = info.get_property_val_str("authTag") else {
+                continue;
+            };
+            let addresses = info
+                .get_addresses()
+                .iter()
+                .map(|address| address.to_ip_addr())
+                .collect::<Vec<_>>();
+            if let Some(endpoint) = authenticated_remote_pairing_endpoint(
+                alt_irk,
+                identifier,
+                auth_tag,
+                addresses,
+                info.get_port(),
+            ) && !endpoints.contains(&endpoint)
+            {
+                endpoints.push(endpoint);
+            }
+        }
+    }
+    let _ = daemon.shutdown();
+    if endpoints.is_empty() {
+        Err(probe_failure(RsdProbeStage::Discovery))
+    } else {
+        Ok(endpoints)
+    }
+}
+
+async fn connect_and_validate_remote_pairing(
+    endpoints: &[RemotePairingEndpoint],
+    pairing_file: &RpPairingFile,
+) -> Result<(IpAddr, RemotePairingClient<RpPairingSocket<TcpStream>>), RsdProbeFailure> {
+    for endpoint in endpoints {
+        for address in &endpoint.addresses {
+            let stream = match timeout(
+                REMOTE_CONNECT_TIMEOUT,
+                TcpStream::connect(SocketAddr::new(*address, endpoint.port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) | Err(_) => continue,
+            };
+            let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), SERVICE_NAME);
+            let mut pairing_file = pairing_file.clone();
+            if let Ok(Ok(())) = timeout(
+                REMOTE_CONNECT_TIMEOUT,
+                client.validate_pairing(&mut pairing_file),
+            )
+            .await
+            {
+                return Ok((*address, client));
+            }
+        }
+    }
+    Err(probe_failure(RsdProbeStage::ValidatePairing))
 }
 
 fn session_expired(status: &PairingSessionStatus, now: SystemTime) -> bool {
@@ -752,6 +997,27 @@ impl PairingStore {
             return Ok(material);
         }
         set_private_permissions(&path, false);
+        self.load_encrypted(&key, sending_host)
+    }
+
+    fn load_existing(&self, sending_host: &str) -> Result<StoredPairingMaterial, PairingError> {
+        let path = self.state_dir.join(STATE_FILE);
+        if !path.exists() {
+            return Err(PairingError::Storage);
+        }
+        let key: [u8; 32] = fs::read(self.state_dir.join(KEY_FILE))
+            .map_err(|_| PairingError::Storage)?
+            .try_into()
+            .map_err(|_| PairingError::CorruptedState)?;
+        self.load_encrypted(&key, sending_host)
+    }
+
+    fn load_encrypted(
+        &self,
+        key: &[u8; 32],
+        sending_host: &str,
+    ) -> Result<StoredPairingMaterial, PairingError> {
+        let path = self.state_dir.join(STATE_FILE);
         let encrypted = fs::read(&path).map_err(|_| PairingError::Storage)?;
         let record: EncryptedState =
             serde_json::from_slice(&encrypted).map_err(|_| PairingError::CorruptedState)?;
@@ -764,7 +1030,7 @@ impl PairingStore {
         if nonce.len() != 12 {
             return Err(PairingError::CorruptedState);
         }
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| PairingError::CorruptedState)?;
+        let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| PairingError::CorruptedState)?;
         let payload = cipher
             .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
             .map_err(|_| PairingError::CorruptedState)?;
@@ -1016,6 +1282,65 @@ mod tests {
             Err(PairingError::CorruptedState)
         ));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rsd_probe_does_not_create_wireless_state() {
+        let dir = temp_state_dir("rsd-empty");
+        let service = WirelessPairingService::new(WirelessPairingConfig {
+            mode: WirelessPairingMode::Experimental,
+            pairing_port: DEFAULT_PAIRING_PORT,
+            interface: None,
+            state_dir: dir.clone(),
+        });
+
+        let failure = service
+            .probe_remote_pairing_rsd()
+            .await
+            .expect_err("empty pairing state must fail closed");
+        assert_eq!(failure.stage, RsdProbeStage::Discovery);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn valid_auth_tag_accepts_discovery_and_invalid_tag_is_rejected() {
+        let alt_irk = BASE64
+            .decode("Mgp6ZGPzXM2ku9br46vsiw==")
+            .expect("decode authTag test altIRK");
+        let addresses = vec!["192.0.2.1".parse().expect("parse test address")];
+        let endpoint = authenticated_remote_pairing_endpoint(
+            &alt_irk,
+            "2BE6E510-0325-4365-923E-B14C6F57DB3A",
+            "kXjlTr2l",
+            addresses.clone(),
+            52_345,
+        )
+        .expect("valid authTag should authenticate discovery");
+        assert_eq!(endpoint.port, 52_345);
+        assert_eq!(endpoint.addresses, addresses);
+        assert!(
+            authenticated_remote_pairing_endpoint(
+                &alt_irk,
+                "2BE6E510-0325-4365-923E-B14C6F57DB3A",
+                "invalid",
+                addresses,
+                52_345,
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_validation_failure_stops_before_tunnel_creation() {
+        let endpoint = RemotePairingEndpoint {
+            addresses: vec!["127.0.0.1".parse().expect("parse loopback")],
+            port: 0,
+        };
+        let pairing_file = RpPairingFile::generate(SERVICE_NAME);
+        let failure = connect_and_validate_remote_pairing(&[endpoint], &pairing_file)
+            .await
+            .expect_err("unreachable endpoint must fail validation");
+        assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
     }
 
     #[test]
