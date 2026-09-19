@@ -647,16 +647,15 @@ mod tests {
 
     fn capture_tracing(spike_mode: bool, run: impl FnOnce()) -> Vec<CapturedEvent> {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry()
-            .with(operator_env_filter(Some("trace,idevice=trace")))
-            .with(
-                EventCapture {
-                    events: events.clone(),
-                }
-                .with_filter(filter_fn(move |metadata| {
-                    spike_target_allowed(spike_mode, metadata)
-                })),
-            );
+        let subscriber = tracing_subscriber::registry().with(
+            EventCapture {
+                events: events.clone(),
+            }
+            .with_filter(operator_env_filter(Some("trace,idevice=trace")))
+            .with_filter(filter_fn(move |metadata| {
+                spike_target_allowed(spike_mode, metadata)
+            })),
+        );
         tracing::subscriber::with_default(subscriber, run);
         events.lock().expect("read captured events").clone()
     }
@@ -1007,20 +1006,33 @@ mod tests {
     }
 
     #[test]
-    fn non_spike_subscriber_preserves_operator_filtered_targets() {
+    fn non_spike_subscriber_preserves_every_hostile_operator_enabled_event() {
         let events = capture_tracing(false, emit_hostile_filter_sentinels);
-        let targets = events
+        let sentinels = events
             .iter()
-            .map(|event| event.target.as_str())
+            .flat_map(|event| event.fields.iter())
+            .filter(|(name, _)| name == "sentinel")
+            .map(|(_, value)| value.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(targets.contains("idevice"));
-        assert!(targets.contains("idevice::services::afc"));
-        assert!(targets.contains("jktcp"));
-        assert!(targets.contains("jktcp::adapter"));
-        assert!(targets.contains("revision4_dependency_sentinel"));
-        assert!(targets.contains("iphoneloadly_api"));
-        assert!(targets.contains("iphoneloadly_api::wireless_pairing"));
-        assert!(targets.contains(wireless_pairing::SPIKE_DIAGNOSTICS_TARGET));
+        assert_eq!(
+            sentinels,
+            [
+                "approved_target_descendant",
+                "dependency_error",
+                "idevice_afc_packet_debug",
+                "idevice_afc_warn",
+                "idevice_debug",
+                "idevice_error",
+                "idevice_other",
+                "jktcp_adapter",
+                "jktcp_other",
+                "jktcp_root",
+                "wireless_application",
+                "default_application",
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
@@ -2180,10 +2192,10 @@ async fn main() {
         .expect("install rustls AWS-LC crypto provider");
 
     tracing_subscriber::registry()
-        .with(operator_env_filter(None))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
+                .with_filter(operator_env_filter(None))
                 .with_filter(filter_fn(move |metadata| {
                     spike_target_allowed(spike_mode, metadata)
                 })),

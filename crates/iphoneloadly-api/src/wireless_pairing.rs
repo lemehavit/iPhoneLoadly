@@ -788,174 +788,199 @@ impl WirelessPairingService {
 
     pub(crate) async fn probe_remote_pairing_afc(&self) -> Result<(), ReadOnlyProbeFailure> {
         let service = ReadOnlyProbeService::Afc;
+        let deadline = tokio::time::Instant::now() + READ_ONLY_ENDPOINT_TIMEOUT;
         let mut current_stage = ReadOnlyProbeStage::Discovery;
-        let mut primary_failure = None;
-        match timeout(
-            READ_ONLY_ENDPOINT_TIMEOUT,
-            self.probe_remote_pairing_afc_inner(&mut current_stage, &mut primary_failure),
+        let mut session = match tokio::time::timeout_at(
+            deadline,
+            RemoteRsdSession::open(self, Some(&mut current_stage)),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(read_only_endpoint_timeout_failure(
-                service,
-                current_stage,
-                primary_failure,
-            )),
-        }
-    }
-
-    async fn probe_remote_pairing_afc_inner(
-        &self,
-        current_stage: &mut ReadOnlyProbeStage,
-        primary_failure: &mut Option<ReadOnlyProbeFailure>,
-    ) -> Result<(), ReadOnlyProbeFailure> {
-        let service = ReadOnlyProbeService::Afc;
-        let mut session = RemoteRsdSession::open(self, Some(current_stage))
-            .await
-            .map_err(|failure| {
+            Ok(Ok(session)) => session,
+            Ok(Err(failure)) => {
                 let stage = ReadOnlyProbeStage::from(failure.stage);
-                *current_stage = stage;
-                read_only_probe_failure(service, stage, "setup", "error", "unavailable")
-            })?;
-        let primary = async {
-            *current_stage = ReadOnlyProbeStage::ServiceLookup;
+                return Err(read_only_probe_failure(
+                    service,
+                    stage,
+                    "setup",
+                    "error",
+                    "unavailable",
+                ));
+            }
+            Err(_) => {
+                return Err(read_only_probe_failure(
+                    service,
+                    current_stage,
+                    current_stage.operation(),
+                    "timeout",
+                    "timeout",
+                ));
+            }
+        };
+
+        current_stage = ReadOnlyProbeStage::ServiceLookup;
+        let primary = match tokio::time::timeout_at(deadline, async {
             let service_port = exact_rsd_service_port(session.handshake(), AFC_SERVICE_NAME)
                 .ok_or_else(|| {
                     read_only_probe_failure(
                         service,
-                        *current_stage,
+                        current_stage,
                         "service_lookup",
                         "missing",
                         "service_not_found",
                     )
                 })?;
 
-            *current_stage = ReadOnlyProbeStage::ServiceConnect;
+            current_stage = ReadOnlyProbeStage::ServiceConnect;
             let stream = run_read_only_probe_step(
                 service,
-                *current_stage,
+                current_stage,
                 "service_connect",
                 REMOTE_CONNECT_TIMEOUT,
                 session.provider_mut().connect_to_service_port(service_port),
             )
             .await?;
 
-            *current_stage = ReadOnlyProbeStage::ClientInit;
+            current_stage = ReadOnlyProbeStage::ClientInit;
             let mut client = run_read_only_probe_step(
                 service,
-                *current_stage,
+                current_stage,
                 "client_init",
                 REMOTE_CONNECT_TIMEOUT,
                 <AfcClient as RsdService>::from_stream(stream),
             )
             .await?;
 
-            *current_stage = ReadOnlyProbeStage::AfcQuery;
+            current_stage = ReadOnlyProbeStage::AfcQuery;
             let _ = run_read_only_probe_step(
                 service,
-                *current_stage,
+                current_stage,
                 "afc_query",
                 READ_ONLY_QUERY_TIMEOUT,
                 client.get_device_info(),
             )
             .await?;
             Ok(())
-        }
-        .await;
-        *primary_failure = primary.as_ref().err().copied();
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(read_only_probe_failure(
+                service,
+                current_stage,
+                current_stage.operation(),
+                "timeout",
+                "timeout",
+            )),
+        };
 
-        *current_stage = ReadOnlyProbeStage::Cleanup;
-        complete_read_only_probe(service, primary, session).await
+        complete_read_only_probe_with_timeout(
+            service,
+            primary,
+            session,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
     }
 
     pub(crate) async fn probe_remote_pairing_installation_proxy(
         &self,
     ) -> Result<(), ReadOnlyProbeFailure> {
         let service = ReadOnlyProbeService::InstallationProxy;
+        let deadline = tokio::time::Instant::now() + READ_ONLY_ENDPOINT_TIMEOUT;
         let mut current_stage = ReadOnlyProbeStage::Discovery;
-        let mut primary_failure = None;
-        match timeout(
-            READ_ONLY_ENDPOINT_TIMEOUT,
-            self.probe_remote_pairing_installation_proxy_inner(
-                &mut current_stage,
-                &mut primary_failure,
-            ),
+        let mut session = match tokio::time::timeout_at(
+            deadline,
+            RemoteRsdSession::open(self, Some(&mut current_stage)),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(read_only_endpoint_timeout_failure(
-                service,
-                current_stage,
-                primary_failure,
-            )),
-        }
-    }
-
-    async fn probe_remote_pairing_installation_proxy_inner(
-        &self,
-        current_stage: &mut ReadOnlyProbeStage,
-        primary_failure: &mut Option<ReadOnlyProbeFailure>,
-    ) -> Result<(), ReadOnlyProbeFailure> {
-        let service = ReadOnlyProbeService::InstallationProxy;
-        let mut session = RemoteRsdSession::open(self, Some(current_stage))
-            .await
-            .map_err(|failure| {
+            Ok(Ok(session)) => session,
+            Ok(Err(failure)) => {
                 let stage = ReadOnlyProbeStage::from(failure.stage);
-                *current_stage = stage;
-                read_only_probe_failure(service, stage, "setup", "error", "unavailable")
-            })?;
-        let primary = async {
-            *current_stage = ReadOnlyProbeStage::ServiceLookup;
+                return Err(read_only_probe_failure(
+                    service,
+                    stage,
+                    "setup",
+                    "error",
+                    "unavailable",
+                ));
+            }
+            Err(_) => {
+                return Err(read_only_probe_failure(
+                    service,
+                    current_stage,
+                    current_stage.operation(),
+                    "timeout",
+                    "timeout",
+                ));
+            }
+        };
+
+        current_stage = ReadOnlyProbeStage::ServiceLookup;
+        let primary = match tokio::time::timeout_at(deadline, async {
             let service_port =
                 exact_rsd_service_port(session.handshake(), INSTALLATION_PROXY_SERVICE_NAME)
                     .ok_or_else(|| {
                         read_only_probe_failure(
                             service,
-                            *current_stage,
+                            current_stage,
                             "service_lookup",
                             "missing",
                             "service_not_found",
                         )
                     })?;
 
-            *current_stage = ReadOnlyProbeStage::ServiceConnect;
+            current_stage = ReadOnlyProbeStage::ServiceConnect;
             let stream = run_read_only_probe_step(
                 service,
-                *current_stage,
+                current_stage,
                 "service_connect",
                 REMOTE_CONNECT_TIMEOUT,
                 session.provider_mut().connect_to_service_port(service_port),
             )
             .await?;
 
-            *current_stage = ReadOnlyProbeStage::ClientInit;
+            current_stage = ReadOnlyProbeStage::ClientInit;
             let mut client = run_read_only_probe_step(
                 service,
-                *current_stage,
+                current_stage,
                 "client_init",
                 REMOTE_CONNECT_TIMEOUT,
                 <InstallationProxyClient as RsdService>::from_stream(stream),
             )
             .await?;
 
-            *current_stage = ReadOnlyProbeStage::AppLookup;
+            current_stage = ReadOnlyProbeStage::AppLookup;
             let _ = run_read_only_probe_step(
                 service,
-                *current_stage,
+                current_stage,
                 "app_lookup",
                 READ_ONLY_QUERY_TIMEOUT,
                 client.get_apps(Some("User"), None),
             )
             .await?;
             Ok(())
-        }
-        .await;
-        *primary_failure = primary.as_ref().err().copied();
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(read_only_probe_failure(
+                service,
+                current_stage,
+                current_stage.operation(),
+                "timeout",
+                "timeout",
+            )),
+        };
 
-        *current_stage = ReadOnlyProbeStage::Cleanup;
-        complete_read_only_probe(service, primary, session).await
+        complete_read_only_probe_with_timeout(
+            service,
+            primary,
+            session,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -1387,22 +1412,6 @@ fn read_only_probe_failure(
     ReadOnlyProbeFailure { stage }
 }
 
-fn read_only_endpoint_timeout_failure(
-    service: ReadOnlyProbeService,
-    current_stage: ReadOnlyProbeStage,
-    primary_failure: Option<ReadOnlyProbeFailure>,
-) -> ReadOnlyProbeFailure {
-    primary_failure.unwrap_or_else(|| {
-        read_only_probe_failure(
-            service,
-            current_stage,
-            current_stage.operation(),
-            "timeout",
-            "timeout",
-        )
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn emit_spike_diagnostic_for_filter_test() {
     let _ = read_only_probe_failure(
@@ -1434,14 +1443,6 @@ async fn run_read_only_probe_step<T>(
             service, stage, operation, "timeout", "timeout",
         )),
     }
-}
-
-async fn complete_read_only_probe<P: ClosableRsdProvider>(
-    service: ReadOnlyProbeService,
-    primary: Result<(), ReadOnlyProbeFailure>,
-    session: RemoteRsdSession<P>,
-) -> Result<(), ReadOnlyProbeFailure> {
-    complete_read_only_probe_with_timeout(service, primary, session, REMOTE_CONNECT_TIMEOUT).await
 }
 
 async fn complete_read_only_probe_with_timeout<P: ClosableRsdProvider>(
@@ -1481,12 +1482,7 @@ fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
 fn report_appservice_setup_failure(failure: RsdProbeFailure) -> RsdProbeFailure {
     tracing::debug!(
         target: "iphoneloadly_api::spike_diagnostics",
-        transport = "rsd",
-        service = "appService",
         stage = failure.stage.as_str(),
-        operation = "setup",
-        result = "error",
-        error_kind = "unavailable",
         "remote pairing RSD probe failed"
     );
     failure
@@ -1516,12 +1512,10 @@ fn parsed_rsd_service_summary(handshake: &RsdHandshake) -> ParsedRsdServiceSumma
 fn report_parsed_rsd_service_summary(summary: ParsedRsdServiceSummary) {
     tracing::warn!(
         target: "iphoneloadly_api::spike_diagnostics",
-        transport = "rsd",
-        service = "appService",
         stage = RsdProbeStage::CoreDeviceService.as_str(),
         operation = "service_summary",
         result = "observed",
-        error_kind = "none",
+        source = "parsed_rsd_services",
         parsed_appservice_present = summary.parsed_appservice_present,
         parsed_deviceinfo_present = summary.parsed_deviceinfo_present,
         parsed_untrusted_tunnelservice_present = summary.parsed_untrusted_tunnelservice_present,
@@ -1563,8 +1557,6 @@ async fn run_core_device_service_operation<T>(
 fn report_core_device_service_failure(failure: CoreDeviceServiceFailure) -> RsdProbeFailure {
     tracing::warn!(
         target: "iphoneloadly_api::spike_diagnostics",
-        transport = "rsd",
-        service = "appService",
         stage = RsdProbeStage::CoreDeviceService.as_str(),
         operation = failure.operation.as_str(),
         result = failure.result,
@@ -3615,7 +3607,6 @@ mod tests {
         assert_eq!(
             summary.keys().map(String::as_str).collect::<BTreeSet<_>>(),
             [
-                "error_kind",
                 "message",
                 "operation",
                 "parsed_afc_present",
@@ -3625,9 +3616,8 @@ mod tests {
                 "parsed_installation_proxy_present",
                 "parsed_untrusted_tunnelservice_present",
                 "result",
-                "service",
+                "source",
                 "stage",
-                "transport",
             ]
             .into_iter()
             .collect()
@@ -3645,12 +3635,10 @@ mod tests {
             Some("service_summary")
         );
         assert_eq!(summary.get("result").map(String::as_str), Some("observed"));
-        assert_eq!(summary.get("transport").map(String::as_str), Some("rsd"));
         assert_eq!(
-            summary.get("service").map(String::as_str),
-            Some("appService")
+            summary.get("source").map(String::as_str),
+            Some("parsed_rsd_services")
         );
-        assert_eq!(summary.get("error_kind").map(String::as_str), Some("none"));
         assert_eq!(events[0].target, "iphoneloadly_api::spike_diagnostics");
         for (field, expected) in [
             ("parsed_appservice_present", "false"),
@@ -3662,8 +3650,27 @@ mod tests {
         ] {
             assert_eq!(summary.get(field).map(String::as_str), Some(expected));
         }
+        let failure = &events[1];
+        assert_eq!(failure.target, "iphoneloadly_api::spike_diagnostics");
         assert_eq!(
-            events[1].fields.get("operation").map(String::as_str),
+            failure
+                .fields
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "appservice_present",
+                "error_kind",
+                "message",
+                "operation",
+                "result",
+                "stage",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            failure.fields.get("operation").map(String::as_str),
             Some("service_lookup")
         );
 
@@ -3679,6 +3686,29 @@ mod tests {
         ] {
             assert!(!rendered.contains(sentinel), "event leaked {sentinel}");
         }
+    }
+
+    #[test]
+    fn appservice_setup_reporter_only_changes_the_target() {
+        let failure = RsdProbeFailure {
+            stage: RsdProbeStage::Tunnel,
+        };
+        let (reported, events) = capture_events(|| report_appservice_setup_failure(failure));
+        assert_eq!(reported, failure);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target, "iphoneloadly_api::spike_diagnostics");
+        assert_eq!(
+            events[0]
+                .fields
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            ["message", "stage"].into_iter().collect()
+        );
+        assert_eq!(
+            events[0].fields.get("stage").map(String::as_str),
+            Some("tunnel")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4597,29 +4627,20 @@ mod tests {
         .expect_err("primary failure must win");
         assert_eq!(preserved, primary);
 
-        let outer_timeout = timeout(
-            Duration::from_millis(1),
-            complete_read_only_probe_with_timeout(
-                ReadOnlyProbeService::Afc,
-                Err(primary),
-                test_remote_session(
-                    TestCloseOutcome::Pending,
-                    close_calls.clone(),
-                    drops.clone(),
-                ),
-                Duration::from_secs(1),
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
+        let preserved_after_deadline = complete_read_only_probe_with_timeout(
+            ReadOnlyProbeService::Afc,
+            Err(primary),
+            test_remote_session(
+                TestCloseOutcome::Pending,
+                close_calls.clone(),
+                drops.clone(),
             ),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
-        .await;
-        assert!(outer_timeout.is_err());
-        assert_eq!(
-            read_only_endpoint_timeout_failure(
-                ReadOnlyProbeService::Afc,
-                ReadOnlyProbeStage::Cleanup,
-                Some(primary),
-            ),
-            primary
-        );
+        .await
+        .expect_err("primary failure must survive cleanup deadline");
+        assert_eq!(preserved_after_deadline, primary);
 
         let timeout_failure = complete_read_only_probe_with_timeout(
             ReadOnlyProbeService::InstallationProxy,
