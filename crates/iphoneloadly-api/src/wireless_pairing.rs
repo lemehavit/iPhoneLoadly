@@ -53,6 +53,10 @@ const POST_PAIR_TUNNEL_SERVICE_STAGE: &str = "post_pair_tunnel_service";
 const POST_PAIR_COMMIT_STAGE: &str = "post_pair_commit";
 const TUNNEL_SERVICE_NAME: &str = "com.apple.internal.dt.coredevice.untrusted.tunnelservice";
 const CORE_DEVICE_APP_SERVICE_NAME: &str = "com.apple.coredevice.appservice";
+const CORE_DEVICE_INFO_SERVICE_NAME: &str = "com.apple.coredevice.deviceinfo";
+const MOBILE_IMAGE_MOUNTER_SERVICE_NAME: &str = "com.apple.mobile.mobile_image_mounter.shim.remote";
+const INSTALLATION_PROXY_SERVICE_NAME: &str = "com.apple.mobile.installation_proxy.shim.remote";
+const AFC_SERVICE_NAME: &str = "com.apple.afc.shim.remote";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsdProbeStage {
@@ -105,6 +109,16 @@ struct CoreDeviceServiceFailure {
     result: &'static str,
     error_kind: &'static str,
     appservice_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedRsdServiceSummary {
+    parsed_appservice_present: bool,
+    parsed_deviceinfo_present: bool,
+    parsed_untrusted_tunnelservice_present: bool,
+    parsed_image_mounter_present: bool,
+    parsed_installation_proxy_present: bool,
+    parsed_afc_present: bool,
 }
 
 impl CoreDeviceServiceFailure {
@@ -662,6 +676,7 @@ impl WirelessPairingService {
             .await
             .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
             .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
+        report_parsed_rsd_service_summary(parsed_rsd_service_summary(&handshake));
         let app_port =
             core_device_appservice_port(&handshake).map_err(report_core_device_service_failure)?;
         let app_stream = run_core_device_service_operation(
@@ -994,6 +1009,43 @@ impl WirelessPairingService {
 fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
     tracing::debug!(stage = stage.as_str(), "remote pairing RSD probe failed");
     RsdProbeFailure { stage }
+}
+
+fn parsed_rsd_service_summary(handshake: &RsdHandshake) -> ParsedRsdServiceSummary {
+    ParsedRsdServiceSummary {
+        parsed_appservice_present: handshake
+            .services
+            .contains_key(CORE_DEVICE_APP_SERVICE_NAME),
+        parsed_deviceinfo_present: handshake
+            .services
+            .contains_key(CORE_DEVICE_INFO_SERVICE_NAME),
+        parsed_untrusted_tunnelservice_present: handshake
+            .services
+            .contains_key(TUNNEL_SERVICE_NAME),
+        parsed_image_mounter_present: handshake
+            .services
+            .contains_key(MOBILE_IMAGE_MOUNTER_SERVICE_NAME),
+        parsed_installation_proxy_present: handshake
+            .services
+            .contains_key(INSTALLATION_PROXY_SERVICE_NAME),
+        parsed_afc_present: handshake.services.contains_key(AFC_SERVICE_NAME),
+    }
+}
+
+fn report_parsed_rsd_service_summary(summary: ParsedRsdServiceSummary) {
+    tracing::warn!(
+        stage = RsdProbeStage::CoreDeviceService.as_str(),
+        operation = "service_summary",
+        result = "observed",
+        source = "parsed_rsd_services",
+        parsed_appservice_present = summary.parsed_appservice_present,
+        parsed_deviceinfo_present = summary.parsed_deviceinfo_present,
+        parsed_untrusted_tunnelservice_present = summary.parsed_untrusted_tunnelservice_present,
+        parsed_image_mounter_present = summary.parsed_image_mounter_present,
+        parsed_installation_proxy_present = summary.parsed_installation_proxy_present,
+        parsed_afc_present = summary.parsed_afc_present,
+        "remote pairing parsed RSD service summary"
+    );
 }
 
 fn core_device_appservice_port(handshake: &RsdHandshake) -> Result<u16, CoreDeviceServiceFailure> {
@@ -2200,7 +2252,108 @@ fn set_private_permissions(_path: &Path, _directory: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{Arc as StdArc, Mutex as StdMutex},
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing::{
+        Event, Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{
+        Layer,
+        layer::{Context, SubscriberExt},
+        registry::LookupSpan,
+    };
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for CapturedEvent {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    #[derive(Clone)]
+    struct EventCapture {
+        events: StdArc<StdMutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut captured = CapturedEvent {
+                level: *event.metadata().level(),
+                fields: BTreeMap::new(),
+            };
+            event.record(&mut captured);
+            self.events
+                .lock()
+                .expect("capture tracing event")
+                .push(captured);
+        }
+    }
+
+    fn capture_events<T>(run: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventCapture {
+            events: events.clone(),
+        });
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let captured = events.lock().expect("read captured tracing events").clone();
+        (result, captured)
+    }
+
+    fn test_rsd_handshake() -> RsdHandshake {
+        RsdHandshake {
+            services: std::collections::HashMap::new(),
+            protocol_version: 7,
+            properties: std::collections::HashMap::new(),
+            uuid: String::new(),
+        }
+    }
+
+    fn test_rsd_service(
+        entitlement: impl Into<String>,
+        port: u16,
+    ) -> idevice::services::rsd::RsdService {
+        idevice::services::rsd::RsdService {
+            entitlement: entitlement.into(),
+            port,
+            uses_remote_xpc: true,
+            features: Some(vec!["sentinel-feature".into()]),
+            service_version: Some(1),
+        }
+    }
+
+    fn summary_values(summary: ParsedRsdServiceSummary) -> [bool; 6] {
+        [
+            summary.parsed_appservice_present,
+            summary.parsed_deviceinfo_present,
+            summary.parsed_untrusted_tunnelservice_present,
+            summary.parsed_image_mounter_present,
+            summary.parsed_installation_proxy_present,
+            summary.parsed_afc_present,
+        ]
+    }
 
     fn temp_state_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("iphoneloadly-wireless-{name}-{}", Uuid::now_v7()))
@@ -2652,6 +2805,199 @@ mod tests {
             .expect_err("empty pairing state must fail closed");
         assert_eq!(failure.stage, RsdProbeStage::Discovery);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn parsed_rsd_service_summary_uses_only_six_exact_names() {
+        let service_names = [
+            CORE_DEVICE_APP_SERVICE_NAME,
+            CORE_DEVICE_INFO_SERVICE_NAME,
+            TUNNEL_SERVICE_NAME,
+            MOBILE_IMAGE_MOUNTER_SERVICE_NAME,
+            INSTALLATION_PROXY_SERVICE_NAME,
+            AFC_SERVICE_NAME,
+        ];
+
+        let empty = test_rsd_handshake();
+        assert_eq!(
+            summary_values(parsed_rsd_service_summary(&empty)),
+            [false; 6]
+        );
+
+        for (index, service_name) in service_names.iter().enumerate() {
+            let mut handshake = test_rsd_handshake();
+            handshake.services.insert(
+                (*service_name).to_owned(),
+                test_rsd_service("sentinel-entitlement", 62_000 + index as u16),
+            );
+            let mut expected = [false; 6];
+            expected[index] = true;
+            assert_eq!(
+                summary_values(parsed_rsd_service_summary(&handshake)),
+                expected,
+                "incorrect projection for {service_name}"
+            );
+        }
+
+        let mut all = test_rsd_handshake();
+        for (index, service_name) in service_names.iter().enumerate() {
+            all.services.insert(
+                (*service_name).to_owned(),
+                test_rsd_service("sentinel-entitlement", 62_100 + index as u16),
+            );
+        }
+        assert_eq!(summary_values(parsed_rsd_service_summary(&all)), [true; 6]);
+
+        let mut mixed = test_rsd_handshake();
+        for index in [0, 2, 5] {
+            mixed.services.insert(
+                service_names[index].to_owned(),
+                test_rsd_service("sentinel-entitlement", 62_200 + index as u16),
+            );
+        }
+        mixed.services.insert(
+            format!("{CORE_DEVICE_APP_SERVICE_NAME}.unexpected"),
+            test_rsd_service("sentinel-entitlement", 62_300),
+        );
+        mixed.services.insert(
+            "sentinel-unknown-service".into(),
+            test_rsd_service("sentinel-entitlement", 62_301),
+        );
+        assert_eq!(
+            summary_values(parsed_rsd_service_summary(&mixed)),
+            [true, false, true, false, false, true]
+        );
+
+        let before = mixed.services.keys().cloned().collect::<BTreeSet<String>>();
+        let _ = parsed_rsd_service_summary(&mixed);
+        assert_eq!(
+            mixed.services.keys().cloned().collect::<BTreeSet<String>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn parsed_rsd_service_summary_event_is_bounded_and_precedes_lookup_failure() {
+        let mut handshake = test_rsd_handshake();
+        handshake.uuid = "sentinel-peer-uuid".into();
+        handshake.properties.insert(
+            "sentinel-property-name".into(),
+            plist::Value::String("sentinel-property-value".into()),
+        );
+        handshake.services.insert(
+            "sentinel-unknown-service".into(),
+            test_rsd_service("sentinel-entitlement", 62_345),
+        );
+        for (index, service_name) in [
+            CORE_DEVICE_INFO_SERVICE_NAME,
+            TUNNEL_SERVICE_NAME,
+            AFC_SERVICE_NAME,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            handshake.services.insert(
+                service_name.to_owned(),
+                test_rsd_service("sentinel-entitlement", 62_346 + index as u16),
+            );
+        }
+
+        let (result, events) = capture_events(|| {
+            report_parsed_rsd_service_summary(parsed_rsd_service_summary(&handshake));
+            core_device_appservice_port(&handshake).map_err(report_core_device_service_failure)
+        });
+
+        assert_eq!(
+            result
+                .expect_err("missing AppService must still fail")
+                .stage,
+            RsdProbeStage::CoreDeviceService
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        let summary = &events[0].fields;
+        assert_eq!(
+            summary.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            [
+                "message",
+                "operation",
+                "parsed_afc_present",
+                "parsed_appservice_present",
+                "parsed_deviceinfo_present",
+                "parsed_image_mounter_present",
+                "parsed_installation_proxy_present",
+                "parsed_untrusted_tunnelservice_present",
+                "result",
+                "source",
+                "stage",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            summary.get("message").map(String::as_str),
+            Some("remote pairing parsed RSD service summary")
+        );
+        assert_eq!(
+            summary.get("stage").map(String::as_str),
+            Some("coreDeviceService")
+        );
+        assert_eq!(
+            summary.get("operation").map(String::as_str),
+            Some("service_summary")
+        );
+        assert_eq!(summary.get("result").map(String::as_str), Some("observed"));
+        assert_eq!(
+            summary.get("source").map(String::as_str),
+            Some("parsed_rsd_services")
+        );
+        for (field, expected) in [
+            ("parsed_appservice_present", "false"),
+            ("parsed_deviceinfo_present", "true"),
+            ("parsed_untrusted_tunnelservice_present", "true"),
+            ("parsed_image_mounter_present", "false"),
+            ("parsed_installation_proxy_present", "false"),
+            ("parsed_afc_present", "true"),
+        ] {
+            assert_eq!(summary.get(field).map(String::as_str), Some(expected));
+        }
+        assert_eq!(
+            events[1].fields.get("operation").map(String::as_str),
+            Some("service_lookup")
+        );
+
+        let rendered = format!("{summary:?}");
+        for sentinel in [
+            "sentinel-peer-uuid",
+            "sentinel-property-name",
+            "sentinel-property-value",
+            "sentinel-unknown-service",
+            "sentinel-entitlement",
+            "sentinel-feature",
+            "62345",
+        ] {
+            assert!(!rendered.contains(sentinel), "event leaked {sentinel}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_rsd_handshake_emits_no_service_summary() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventCapture {
+            events: events.clone(),
+        });
+        let guard = tracing::subscriber::set_default(subscriber);
+        let (stream, peer) = tokio::io::duplex(64);
+        drop(peer);
+
+        assert!(RsdHandshake::new(stream).await.is_err());
+        drop(guard);
+
+        let captured = events.lock().expect("read captured tracing events");
+        assert!(!captured.iter().any(|event| {
+            event.fields.get("message").map(String::as_str)
+                == Some("remote pairing parsed RSD service summary")
+        }));
     }
 
     #[test]
