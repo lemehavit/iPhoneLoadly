@@ -10,6 +10,7 @@ use std::{
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use idevice::{
+    RemoteXpcClient,
     provider::RsdProvider,
     remote_pairing::{
         PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, PeerDevice,
@@ -17,7 +18,7 @@ use idevice::{
         errors::RemotePairingError,
     },
     services::{core_device::AppServiceClient, rsd::RsdHandshake},
-    tcp::adapter::Adapter,
+    tcp::{adapter::Adapter, stream::AdapterStream},
 };
 use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize, Serializer};
@@ -45,6 +46,12 @@ const MDNS_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_PAIRING_SERVICE_TYPE: &str = "_remotepairing._tcp.local.";
 const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const POST_PAIR_BOOTSTRAP_STAGE: &str = "post_pair_bootstrap";
+const POST_PAIR_TUNNEL_STAGE: &str = "post_pair_tunnel";
+const POST_PAIR_RSD_STAGE: &str = "post_pair_rsd";
+const POST_PAIR_TUNNEL_SERVICE_STAGE: &str = "post_pair_tunnel_service";
+const POST_PAIR_COMMIT_STAGE: &str = "post_pair_commit";
+const TUNNEL_SERVICE_NAME: &str = "com.apple.internal.dt.coredevice.untrusted.tunnelservice";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsdProbeStage {
@@ -240,18 +247,26 @@ struct SessionRuntime {
     resources: Arc<Mutex<Option<MdnsAdvertisement>>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PairingFailure {
     stage: &'static str,
-    detail: String,
 }
 
 impl PairingFailure {
-    fn from_display(stage: &'static str, error: impl Display) -> Self {
-        Self {
-            stage,
-            detail: error.to_string(),
-        }
+    fn from_display(stage: &'static str, _error: impl Display) -> Self {
+        Self { stage }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostPairCommitFailure {
+    stage: &'static str,
+    error_kind: &'static str,
+}
+
+impl PostPairCommitFailure {
+    const fn new(stage: &'static str, error_kind: &'static str) -> Self {
+        Self { stage, error_kind }
     }
 }
 
@@ -588,27 +603,143 @@ impl WirelessPairingService {
                 return;
             }
         };
-        material.paired_peer_id = Some(fingerprint_peer(&peer.remotepairing_udid));
-        if let Err(error) = self.store.save(&material) {
-            self.finish(
+        drop(host);
+        let commitment_deadline = Instant::now()
+            + Duration::from_secs(expires_at.saturating_sub(unix_seconds(SystemTime::now())));
+        let commitment =
+            commit_remote_pairing(&mut material.pairing_file, commitment_deadline).await;
+        self.finalize_new_pairing(
+            id,
+            material,
+            peer,
+            resources,
+            commitment_deadline,
+            commitment,
+        )
+        .await;
+    }
+
+    async fn finalize_new_pairing(
+        &self,
+        id: Uuid,
+        mut material: StoredPairingMaterial,
+        peer: PeerDevice,
+        resources: Arc<Mutex<Option<MdnsAdvertisement>>>,
+        commitment_deadline: Instant,
+        commitment: Result<(), PostPairCommitFailure>,
+    ) {
+        if let Err(failure) = commitment {
+            tracing::warn!(
+                session_id = %id,
+                stage = failure.stage,
+                result = "error",
+                error_kind = failure.error_kind,
+                "remote pairing post-pair commitment failed"
+            );
+            self.finish_if_active(
                 id,
                 PairingPhase::Failed,
-                "Wireless pairing completed but its state could not be saved.",
-                Some(PairingFailure::from_display("pairing_state_save", error)),
+                "Wireless pairing could not be completed.",
+                None,
                 resources,
             )
             .await;
             return;
         }
-        resources.lock().await.take();
-        let _ = self
-            .set_phase(
-                id,
-                PairingPhase::VerifyingTransport,
-                "RemotePairing completed. Verifying trusted device transport.",
-                None,
-            )
-            .await;
+
+        let mut expired = false;
+        let mut save_failure = None;
+        let should_cleanup = {
+            let mut current = self.session.lock().await;
+            let Some(runtime) = current.as_mut() else {
+                return;
+            };
+            if runtime.status.id != id || runtime.status.phase.is_terminal() {
+                return;
+            }
+            if commitment_deadline
+                .saturating_duration_since(Instant::now())
+                .is_zero()
+            {
+                runtime.status.phase = PairingPhase::Failed;
+                runtime.status.public_message = "Wireless pairing could not be completed.".into();
+                runtime.status.setup_code = None;
+                expired = true;
+            } else {
+                material.paired_peer_id = Some(fingerprint_peer(&peer.remotepairing_udid));
+                match self.store.save(&material) {
+                    Ok(()) => {
+                        runtime.status.phase = PairingPhase::VerifyingTransport;
+                        runtime.status.public_message =
+                            "RemotePairing completed. Verifying trusted device transport.".into();
+                        runtime.status.setup_code = None;
+                    }
+                    Err(error) => {
+                        save_failure =
+                            Some(PairingFailure::from_display("pairing_state_save", error));
+                        runtime.status.phase = PairingPhase::Failed;
+                        runtime.status.public_message =
+                            "Wireless pairing completed but its state could not be saved.".into();
+                        runtime.status.setup_code = None;
+                    }
+                }
+            }
+            true
+        };
+        if should_cleanup {
+            resources.lock().await.take();
+        }
+        if expired {
+            tracing::warn!(
+                session_id = %id,
+                stage = POST_PAIR_COMMIT_STAGE,
+                result = "timeout",
+                error_kind = "session_expired",
+                "remote pairing post-pair commitment exceeded the pairing session"
+            );
+        }
+        if let Some(failure) = save_failure {
+            tracing::warn!(
+                session_id = %id,
+                stage = failure.stage,
+                result = "error",
+                "wireless pairing failed"
+            );
+        }
+    }
+
+    async fn finish_if_active(
+        &self,
+        id: Uuid,
+        phase: PairingPhase,
+        public_message: &str,
+        failure: Option<PairingFailure>,
+        resources: Arc<Mutex<Option<MdnsAdvertisement>>>,
+    ) {
+        if let Some(failure) = failure.as_ref() {
+            tracing::warn!(
+                session_id = %id,
+                stage = failure.stage,
+                result = "error",
+                "wireless pairing failed"
+            );
+        }
+        let should_cleanup = {
+            let mut current = self.session.lock().await;
+            let Some(runtime) = current.as_mut() else {
+                return;
+            };
+            if runtime.status.id != id || runtime.status.phase.is_terminal() {
+                return;
+            }
+            runtime.status.phase = phase;
+            runtime.status.public_message = public_message.into();
+            runtime.status.setup_code = None;
+            true
+        };
+        if should_cleanup {
+            resources.lock().await.take();
+        }
     }
 
     async fn set_pairing_phase(&self, id: Uuid) -> bool {
@@ -662,7 +793,7 @@ impl WirelessPairingService {
             tracing::warn!(
                 session_id = %id,
                 stage = failure.stage,
-                error = %failure.detail,
+                result = "error",
                 "wireless pairing failed"
             );
         }
@@ -674,6 +805,660 @@ impl WirelessPairingService {
 fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
     tracing::debug!(stage = stage.as_str(), "remote pairing RSD probe failed");
     RsdProbeFailure { stage }
+}
+
+#[cfg(test)]
+fn post_pair_commit_failure(error_kind: &'static str) -> PostPairCommitFailure {
+    PostPairCommitFailure::new(POST_PAIR_COMMIT_STAGE, error_kind)
+}
+
+fn post_pair_stage_failure(stage: &'static str, error_kind: &'static str) -> PostPairCommitFailure {
+    PostPairCommitFailure::new(stage, error_kind)
+}
+
+async fn commit_remote_pairing(
+    pairing_file: &mut RpPairingFile,
+    deadline: Instant,
+) -> Result<(), PostPairCommitFailure> {
+    let discovery_deadline = std::cmp::min(deadline, Instant::now() + REMOTE_DISCOVERY_TIMEOUT);
+    let endpoints =
+        match discover_remote_pairing_endpoints_until(pairing_file, discovery_deadline).await {
+            Ok(endpoints) => endpoints,
+            Err(_) if deadline.saturating_duration_since(Instant::now()).is_zero() => {
+                tracing::warn!(
+                    stage = POST_PAIR_BOOTSTRAP_STAGE,
+                    result = "timeout",
+                    error_kind = "discovery_timeout",
+                    "remote pairing commitment discovery timed out"
+                );
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_BOOTSTRAP_STAGE,
+                    "discovery_timeout",
+                ));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    stage = POST_PAIR_BOOTSTRAP_STAGE,
+                    result = "error",
+                    error_kind = "discovery",
+                    "remote pairing commitment discovery failed"
+                );
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_BOOTSTRAP_STAGE,
+                    "discovery",
+                ));
+            }
+        };
+    commit_remote_pairing_endpoints(&endpoints, pairing_file, deadline).await
+}
+
+async fn commit_remote_pairing_endpoints(
+    endpoints: &[RemotePairingEndpoint],
+    pairing_file: &mut RpPairingFile,
+    deadline: Instant,
+) -> Result<(), PostPairCommitFailure> {
+    let mut last_failure = post_pair_stage_failure(POST_PAIR_BOOTSTRAP_STAGE, "no_candidate");
+    for (candidate_index, endpoint) in endpoints.iter().enumerate() {
+        for (address_index, address) in endpoint.addresses.iter().enumerate() {
+            let address_family = address_family(*address);
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REMOTE_CONNECT_TIMEOUT);
+            if remaining.is_zero() {
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_BOOTSTRAP_STAGE,
+                    "session_expired",
+                ));
+            }
+            let stream = match timeout(
+                remaining,
+                TcpStream::connect(SocketAddr::new(*address, endpoint.port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_BOOTSTRAP_STAGE, io_error_kind(&error));
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_BOOTSTRAP_STAGE,
+                        result = "tcp_connect_error",
+                        error_kind = io_error_kind(&error),
+                        "remote pairing bootstrap TCP connection failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_BOOTSTRAP_STAGE, "tcp_connect_timeout");
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_BOOTSTRAP_STAGE,
+                        result = "tcp_connect_timeout",
+                        "remote pairing bootstrap TCP connection timed out"
+                    );
+                    continue;
+                }
+            };
+
+            let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), SERVICE_NAME);
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REMOTE_CONNECT_TIMEOUT);
+            if remaining.is_zero() {
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_BOOTSTRAP_STAGE,
+                    "session_expired",
+                ));
+            }
+            match timeout(remaining, client.attempt_pair_verify()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    last_failure = post_pair_stage_failure(
+                        POST_PAIR_BOOTSTRAP_STAGE,
+                        idevice_error_kind(&error),
+                    );
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_BOOTSTRAP_STAGE,
+                        result = "error",
+                        operation = "attempt_pair_verify",
+                        error_kind = idevice_error_kind(&error),
+                        "remote pairing bootstrap verification failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    last_failure = post_pair_stage_failure(
+                        POST_PAIR_BOOTSTRAP_STAGE,
+                        "attempt_pair_verify_timeout",
+                    );
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_BOOTSTRAP_STAGE,
+                        result = "timeout",
+                        operation = "attempt_pair_verify",
+                        "remote pairing bootstrap verification timed out"
+                    );
+                    continue;
+                }
+            }
+
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REMOTE_CONNECT_TIMEOUT);
+            if remaining.is_zero() {
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_BOOTSTRAP_STAGE,
+                    "session_expired",
+                ));
+            }
+            match timeout(remaining, client.validate_pairing(pairing_file)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    last_failure = post_pair_stage_failure(
+                        POST_PAIR_BOOTSTRAP_STAGE,
+                        idevice_error_kind(&error),
+                    );
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_BOOTSTRAP_STAGE,
+                        result = "error",
+                        operation = "validate_pairing",
+                        error_kind = idevice_error_kind(&error),
+                        "remote pairing bootstrap validation failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    last_failure = post_pair_stage_failure(
+                        POST_PAIR_BOOTSTRAP_STAGE,
+                        "validate_pairing_timeout",
+                    );
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_BOOTSTRAP_STAGE,
+                        result = "timeout",
+                        operation = "validate_pairing",
+                        "remote pairing bootstrap validation timed out"
+                    );
+                    continue;
+                }
+            }
+            tracing::info!(
+                candidate_index,
+                address_index,
+                address_family,
+                stage = POST_PAIR_BOOTSTRAP_STAGE,
+                result = "success",
+                "remote pairing bootstrap verification succeeded"
+            );
+
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REMOTE_CONNECT_TIMEOUT);
+            if remaining.is_zero() {
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_TUNNEL_STAGE,
+                    "session_expired",
+                ));
+            }
+            let listener_port = match timeout(remaining, client.create_tcp_listener()).await {
+                Ok(Ok(port)) => port,
+                Ok(Err(error)) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, idevice_error_kind(&error));
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "error",
+                        operation = "create_tcp_listener",
+                        error_kind = idevice_error_kind(&error),
+                        "remote pairing tunnel listener creation failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    last_failure = post_pair_stage_failure(
+                        POST_PAIR_TUNNEL_STAGE,
+                        "create_tcp_listener_timeout",
+                    );
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "timeout",
+                        operation = "create_tcp_listener",
+                        "remote pairing tunnel listener creation timed out"
+                    );
+                    continue;
+                }
+            };
+            let encryption_key = client.encryption_key().to_owned();
+            drop(client);
+
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REMOTE_CONNECT_TIMEOUT);
+            if remaining.is_zero() {
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_TUNNEL_STAGE,
+                    "session_expired",
+                ));
+            }
+            let listener_stream = match timeout(
+                remaining,
+                TcpStream::connect(SocketAddr::new(*address, listener_port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, io_error_kind(&error));
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "tcp_connect_error",
+                        operation = "tunnel_listener",
+                        error_kind = io_error_kind(&error),
+                        "remote pairing tunnel listener connection failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    last_failure = post_pair_stage_failure(
+                        POST_PAIR_TUNNEL_STAGE,
+                        "tunnel_listener_connect_timeout",
+                    );
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "timeout",
+                        operation = "tunnel_listener",
+                        "remote pairing tunnel listener connection timed out"
+                    );
+                    continue;
+                }
+            };
+
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REMOTE_CONNECT_TIMEOUT);
+            if remaining.is_zero() {
+                return Err(post_pair_stage_failure(
+                    POST_PAIR_TUNNEL_STAGE,
+                    "session_expired",
+                ));
+            }
+            let tunnel = match timeout(
+                remaining,
+                connect_tls_psk_tunnel_native(listener_stream, &encryption_key),
+            )
+            .await
+            {
+                Ok(Ok(tunnel)) => tunnel,
+                Ok(Err(error)) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, idevice_error_kind(&error));
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "error",
+                        operation = "connect_tls_psk_tunnel_native",
+                        error_kind = idevice_error_kind(&error),
+                        "remote pairing TLS/CDTunnel setup failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, "tunnel_timeout");
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "timeout",
+                        operation = "connect_tls_psk_tunnel_native",
+                        "remote pairing TLS/CDTunnel setup timed out"
+                    );
+                    continue;
+                }
+            };
+            let tunnel_info = tunnel.info.clone();
+            if tunnel_info.server_rsd_port == 0 {
+                last_failure = post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, "missing_rsd_port");
+                tracing::warn!(
+                    candidate_index,
+                    address_index,
+                    address_family,
+                    stage = POST_PAIR_TUNNEL_STAGE,
+                    result = "error",
+                    operation = "tunnel_info",
+                    error_kind = "missing_rsd_port",
+                    "remote pairing tunnel did not advertise an RSD port"
+                );
+                continue;
+            }
+            let host_ip = match tunnel_info.client_address.parse::<IpAddr>() {
+                Ok(address) => address,
+                Err(_) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, "invalid_host_address");
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "error",
+                        operation = "tunnel_info",
+                        error_kind = "invalid_host_address",
+                        "remote pairing tunnel advertised an invalid host address"
+                    );
+                    continue;
+                }
+            };
+            let peer_ip = match tunnel_info.server_address.parse::<IpAddr>() {
+                Ok(address) => address,
+                Err(_) => {
+                    last_failure =
+                        post_pair_stage_failure(POST_PAIR_TUNNEL_STAGE, "invalid_peer_address");
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = POST_PAIR_TUNNEL_STAGE,
+                        result = "error",
+                        operation = "tunnel_info",
+                        error_kind = "invalid_peer_address",
+                        "remote pairing tunnel advertised an invalid peer address"
+                    );
+                    continue;
+                }
+            };
+            let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), host_ip, peer_ip);
+            adapter.set_mss(usize::from(tunnel_info.mtu.saturating_sub(60)));
+            let commitment = async {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_RSD_STAGE,
+                        "session_expired",
+                    ));
+                }
+                let rsd_stream = match timeout(
+                    remaining,
+                    AdapterStream::connect(&mut adapter, tunnel_info.server_rsd_port),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_RSD_STAGE,
+                            io_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_RSD_STAGE,
+                            "rsd_connect_timeout",
+                        ));
+                    }
+                };
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_RSD_STAGE,
+                        "session_expired",
+                    ));
+                }
+                let handshake = match timeout(remaining, RsdHandshake::new(rsd_stream)).await {
+                    Ok(Ok(handshake)) => handshake,
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_RSD_STAGE,
+                            idevice_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_RSD_STAGE,
+                            "rsd_handshake_timeout",
+                        ));
+                    }
+                };
+                let tunnel_service_port = match handshake.services.get(TUNNEL_SERVICE_NAME) {
+                    Some(service) => service.port,
+                    None => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            "service_not_found",
+                        ));
+                    }
+                };
+                drop(handshake);
+                tracing::info!(
+                    candidate_index,
+                    address_index,
+                    address_family,
+                    stage = POST_PAIR_RSD_STAGE,
+                    result = "success",
+                    "remote pairing RSD handshake succeeded"
+                );
+
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_TUNNEL_SERVICE_STAGE,
+                        "session_expired",
+                    ));
+                }
+                let service_stream = match timeout(
+                    remaining,
+                    AdapterStream::connect(&mut adapter, tunnel_service_port),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            io_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            "service_connect_timeout",
+                        ));
+                    }
+                };
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_TUNNEL_SERVICE_STAGE,
+                        "session_expired",
+                    ));
+                }
+                let mut xpc = match timeout(remaining, RemoteXpcClient::new(service_stream)).await {
+                    Ok(Ok(xpc)) => xpc,
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            idevice_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            "remote_xpc_new_timeout",
+                        ));
+                    }
+                };
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_TUNNEL_SERVICE_STAGE,
+                        "session_expired",
+                    ));
+                }
+                match timeout(remaining, xpc.do_handshake()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            idevice_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            "remote_xpc_handshake_timeout",
+                        ));
+                    }
+                }
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_TUNNEL_SERVICE_STAGE,
+                        "session_expired",
+                    ));
+                }
+                match timeout(remaining, xpc.recv_root()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            idevice_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_TUNNEL_SERVICE_STAGE,
+                            "remote_xpc_root_timeout",
+                        ));
+                    }
+                }
+                tracing::info!(
+                    candidate_index,
+                    address_index,
+                    address_family,
+                    stage = POST_PAIR_TUNNEL_SERVICE_STAGE,
+                    result = "success",
+                    "remote pairing tunnel service RemoteXpc established"
+                );
+
+                let mut follow_up = RemotePairingClient::new(xpc, SERVICE_NAME);
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_COMMIT_STAGE,
+                        "session_expired",
+                    ));
+                }
+                match timeout(remaining, follow_up.attempt_pair_verify()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_COMMIT_STAGE,
+                            idevice_error_kind(&error),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(post_pair_stage_failure(
+                            POST_PAIR_COMMIT_STAGE,
+                            "attempt_pair_verify_timeout",
+                        ));
+                    }
+                }
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    return Err(post_pair_stage_failure(
+                        POST_PAIR_COMMIT_STAGE,
+                        "session_expired",
+                    ));
+                }
+                match timeout(remaining, follow_up.validate_pairing(pairing_file)).await {
+                    Ok(Ok(())) => {
+                        tracing::info!(
+                            candidate_index,
+                            address_index,
+                            address_family,
+                            stage = POST_PAIR_COMMIT_STAGE,
+                            result = "success",
+                            "remote pairing tunnel-service commitment succeeded"
+                        );
+                        Ok(())
+                    }
+                    Ok(Err(error)) => Err(post_pair_stage_failure(
+                        POST_PAIR_COMMIT_STAGE,
+                        idevice_error_kind(&error),
+                    )),
+                    Err(_) => Err(post_pair_stage_failure(
+                        POST_PAIR_COMMIT_STAGE,
+                        "validate_pairing_timeout",
+                    )),
+                }
+            }
+            .await;
+            match commitment {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_failure = error;
+                    tracing::warn!(
+                        candidate_index,
+                        address_index,
+                        address_family,
+                        stage = last_failure.stage,
+                        result = "error",
+                        error_kind = last_failure.error_kind,
+                        "remote pairing tunnel-service commitment failed"
+                    );
+                }
+            }
+        }
+    }
+    Err(last_failure)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -702,14 +1487,23 @@ fn authenticated_remote_pairing_endpoint(
 async fn discover_remote_pairing_endpoints(
     pairing_file: &RpPairingFile,
 ) -> Result<Vec<RemotePairingEndpoint>, RsdProbeFailure> {
+    discover_remote_pairing_endpoints_until(pairing_file, Instant::now() + REMOTE_DISCOVERY_TIMEOUT)
+        .await
+}
+
+async fn discover_remote_pairing_endpoints_until(
+    pairing_file: &RpPairingFile,
+    deadline: Instant,
+) -> Result<Vec<RemotePairingEndpoint>, RsdProbeFailure> {
     let alt_irk = pairing_file
         .alt_irk()
         .ok_or_else(|| probe_failure(RsdProbeStage::Discovery))?;
     let daemon = ServiceDaemon::new().map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
-    let receiver = daemon
-        .browse(REMOTE_PAIRING_SERVICE_TYPE)
-        .map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
-    let deadline = Instant::now() + REMOTE_DISCOVERY_TIMEOUT;
+    let daemon = MdnsShutdownGuard::new(daemon);
+    let receiver = match daemon.daemon.browse(REMOTE_PAIRING_SERVICE_TYPE) {
+        Ok(receiver) => receiver,
+        Err(_) => return Err(probe_failure(RsdProbeStage::Discovery)),
+    };
     let mut endpoints = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -744,7 +1538,6 @@ async fn discover_remote_pairing_endpoints(
             }
         }
     }
-    let _ = daemon.shutdown();
     if endpoints.is_empty() {
         Err(probe_failure(RsdProbeStage::Discovery))
     } else {
@@ -1071,6 +1864,22 @@ impl Drop for MdnsAdvertisement {
     }
 }
 
+struct MdnsShutdownGuard {
+    daemon: ServiceDaemon,
+}
+
+impl MdnsShutdownGuard {
+    fn new(daemon: ServiceDaemon) -> Self {
+        Self { daemon }
+    }
+}
+
+impl Drop for MdnsShutdownGuard {
+    fn drop(&mut self) {
+        let _ = self.daemon.shutdown();
+    }
+}
+
 struct PairingStore {
     state_dir: PathBuf,
 }
@@ -1101,21 +1910,19 @@ impl PairingStore {
 
     fn load_or_create(&self, sending_host: &str) -> Result<StoredPairingMaterial, PairingError> {
         self.ensure_state_dir()?;
-        let key = self.load_or_create_key()?;
         let path = self.state_dir.join(STATE_FILE);
         if !path.exists() {
             let mut pairing_file = RpPairingFile::generate(sending_host);
             pairing_file.identifier = Uuid::now_v7().to_string();
             let mut host_info = PairableHostInfo::generate(sending_host, SERVICE_MODEL);
             host_info.identifier = pairing_file.identifier().to_owned();
-            let material = StoredPairingMaterial {
+            return Ok(StoredPairingMaterial {
                 host_info,
                 pairing_file,
                 paired_peer_id: None,
-            };
-            self.save_with_key(&key, &material)?;
-            return Ok(material);
+            });
         }
+        let key = self.load_or_create_key()?;
         set_private_permissions(&path, false);
         self.load_encrypted(&key, sending_host)
     }
@@ -1259,6 +2066,69 @@ mod tests {
         std::env::temp_dir().join(format!("iphoneloadly-wireless-{name}-{}", Uuid::now_v7()))
     }
 
+    fn test_peer_device() -> PeerDevice {
+        PeerDevice {
+            account_id: "test-account".into(),
+            alt_irk: vec![0x11; 16],
+            model: "iPhone17,1".into(),
+            name: "Test iPhone".into(),
+            remotepairing_udid: "test-peer".into(),
+        }
+    }
+
+    fn test_commitment_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    async fn test_service_with_session(
+        state_dir: PathBuf,
+    ) -> (
+        WirelessPairingService,
+        Uuid,
+        Arc<Mutex<Option<MdnsAdvertisement>>>,
+    ) {
+        let service = WirelessPairingService::new(WirelessPairingConfig {
+            mode: WirelessPairingMode::Experimental,
+            pairing_port: DEFAULT_PAIRING_PORT,
+            interface: None,
+            state_dir,
+        });
+        let id = Uuid::now_v7();
+        let task = tokio::spawn(async {});
+        let resources = Arc::new(Mutex::new(Some(MdnsAdvertisement {
+            daemon: None,
+            fullname: String::new(),
+        })));
+        *service.session.lock().await = Some(SessionRuntime {
+            status: PairingSessionStatus {
+                id,
+                phase: PairingPhase::AwaitingCodeEntry,
+                expires_at: unix_seconds(SystemTime::now() + SESSION_LIFETIME),
+                public_message: String::new(),
+                setup_code: Some("123456".into()),
+            },
+            cancel: task.abort_handle(),
+            resources: resources.clone(),
+        });
+        (service, id, resources)
+    }
+
+    #[test]
+    fn fresh_pairing_material_is_not_persisted_until_saved() {
+        let dir = temp_state_dir("deferred-persistence");
+        let store = PairingStore::new(dir.clone());
+        let material = store
+            .load_or_create(SERVICE_NAME)
+            .expect("create in-memory pairing material");
+        assert!(dir.exists());
+        assert!(!dir.join(STATE_FILE).exists());
+        assert!(!dir.join(KEY_FILE).exists());
+        store.save(&material).expect("persist pairing material");
+        assert!(dir.join(STATE_FILE).exists());
+        assert!(dir.join(KEY_FILE).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn missing_or_unknown_mode_is_off() {
         assert_eq!(WirelessPairingMode::parse(None), WirelessPairingMode::Off);
@@ -1343,6 +2213,7 @@ mod tests {
             .load_or_create(SERVICE_NAME)
             .expect("create pairing state");
         let secret = material.pairing_file.private_key_bytes();
+        store.save(&material).expect("persist pairing state");
         let reloaded = store
             .load_or_create(SERVICE_NAME)
             .expect("reload pairing state");
@@ -1351,9 +2222,9 @@ mod tests {
             reloaded.pairing_file.identifier()
         );
         assert_eq!(material.host_info.alt_irk, reloaded.host_info.alt_irk);
-        store.save(&reloaded).expect("rewrite pairing state");
         let bytes = fs::read(dir.join(STATE_FILE)).expect("read encrypted state");
         assert!(!bytes.windows(secret.len()).any(|window| window == secret));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
@@ -1362,9 +2233,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_state_dir("permissions");
-        PairingStore::new(dir.clone())
+        let store = PairingStore::new(dir.clone());
+        let material = store
             .load_or_create(SERVICE_NAME)
             .expect("create private pairing state");
+        store
+            .save(&material)
+            .expect("persist private pairing state");
         assert_eq!(
             fs::metadata(&dir)
                 .expect("state directory metadata")
@@ -1383,7 +2258,7 @@ mod tests {
         );
         assert_eq!(
             fs::metadata(dir.join(KEY_FILE))
-                .expect("key file metadata")
+                .expect("state key metadata")
                 .permissions()
                 .mode()
                 & 0o777,
@@ -1396,7 +2271,8 @@ mod tests {
     fn corrupted_state_fails_closed() {
         let dir = temp_state_dir("corrupt");
         let store = PairingStore::new(dir.clone());
-        store.load_or_create(SERVICE_NAME).expect("create state");
+        let material = store.load_or_create(SERVICE_NAME).expect("create state");
+        store.save(&material).expect("persist state");
         fs::write(dir.join(STATE_FILE), b"not pairing state").expect("corrupt state");
         assert!(matches!(
             store.load_or_create(SERVICE_NAME),
@@ -1405,6 +2281,198 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn pairing_does_not_enter_verifying_before_commitment() {
+        let dir = temp_state_dir("commit-order");
+        let (service, id, resources) = test_service_with_session(dir.clone()).await;
+        let material = service
+            .store
+            .load_or_create(SERVICE_NAME)
+            .expect("create pairing material");
+        assert_eq!(
+            service
+                .status(id)
+                .await
+                .expect("pre-commit session status")
+                .phase,
+            PairingPhase::AwaitingCodeEntry
+        );
+        service
+            .finalize_new_pairing(
+                id,
+                material,
+                test_peer_device(),
+                resources,
+                test_commitment_deadline(),
+                Ok(()),
+            )
+            .await;
+        assert_eq!(
+            service
+                .status(id)
+                .await
+                .expect("final session status")
+                .phase,
+            PairingPhase::VerifyingTransport
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn successful_commitment_persists_final_pairing_state() {
+        let dir = temp_state_dir("commit-success");
+        let (service, id, resources) = test_service_with_session(dir.clone()).await;
+        let material = service
+            .store
+            .load_or_create(SERVICE_NAME)
+            .expect("create pairing material");
+        let expected_peer_id = fingerprint_peer("test-peer");
+        service
+            .finalize_new_pairing(
+                id,
+                material,
+                test_peer_device(),
+                resources,
+                test_commitment_deadline(),
+                Ok(()),
+            )
+            .await;
+        let saved = service
+            .store
+            .load_existing(SERVICE_NAME)
+            .expect("load committed pairing state");
+        assert_eq!(
+            saved.paired_peer_id.as_deref(),
+            Some(expected_peer_id.as_str())
+        );
+        assert_eq!(
+            service
+                .status(id)
+                .await
+                .expect("final session status")
+                .phase,
+            PairingPhase::VerifyingTransport
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expired_commitment_does_not_persist_final_pairing_state() {
+        let dir = temp_state_dir("commit-expired");
+        let (service, id, resources) = test_service_with_session(dir.clone()).await;
+        let material = service
+            .store
+            .load_or_create(SERVICE_NAME)
+            .expect("create pairing material");
+        service
+            .finalize_new_pairing(
+                id,
+                material,
+                test_peer_device(),
+                resources,
+                Instant::now() - Duration::from_secs(1),
+                Ok(()),
+            )
+            .await;
+        let status = service.status(id).await.expect("expired session status");
+        assert_eq!(status.phase, PairingPhase::Failed);
+        assert!(!dir.join(STATE_FILE).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn commitment_failure_prevents_verifying_transport_or_ready() {
+        let dir = temp_state_dir("commit-failure");
+        let (service, id, resources) = test_service_with_session(dir.clone()).await;
+        let material = service
+            .store
+            .load_or_create(SERVICE_NAME)
+            .expect("create pairing material");
+        service
+            .finalize_new_pairing(
+                id,
+                material,
+                test_peer_device(),
+                resources,
+                test_commitment_deadline(),
+                Err(post_pair_commit_failure("socket")),
+            )
+            .await;
+        let status = service.status(id).await.expect("failed session status");
+        assert_eq!(status.phase, PairingPhase::Failed);
+        assert_ne!(status.phase, PairingPhase::VerifyingTransport);
+        assert_ne!(status.phase, PairingPhase::Ready);
+        assert!(!dir.join(STATE_FILE).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn commitment_failure_preserves_previous_valid_state() {
+        let dir = temp_state_dir("commit-preserve");
+        let store = PairingStore::new(dir.clone());
+        let previous = store
+            .load_or_create(SERVICE_NAME)
+            .expect("create previous pairing state");
+        store
+            .save(&previous)
+            .expect("persist previous pairing state");
+        let before = fs::read(dir.join(STATE_FILE)).expect("read previous state");
+        let (service, id, resources) = test_service_with_session(dir.clone()).await;
+        let material = service
+            .store
+            .load_or_create(SERVICE_NAME)
+            .expect("load previous pairing state");
+        service
+            .finalize_new_pairing(
+                id,
+                material,
+                test_peer_device(),
+                resources,
+                test_commitment_deadline(),
+                Err(post_pair_commit_failure("socket")),
+            )
+            .await;
+        let after = fs::read(dir.join(STATE_FILE)).expect("read preserved state");
+        assert_eq!(after, before);
+        assert_eq!(
+            service
+                .status(id)
+                .await
+                .expect("failed session status")
+                .phase,
+            PairingPhase::Failed
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn post_pair_commit_reuses_new_pairing_file() {
+        let dir = temp_state_dir("commit-file-reuse");
+        let (service, id, resources) = test_service_with_session(dir.clone()).await;
+        let material = service
+            .store
+            .load_or_create(SERVICE_NAME)
+            .expect("create pairing material");
+        let expected_identifier = material.pairing_file.identifier().to_owned();
+        let expected_private_key = material.pairing_file.private_key_bytes();
+        service
+            .finalize_new_pairing(
+                id,
+                material,
+                test_peer_device(),
+                resources,
+                test_commitment_deadline(),
+                Ok(()),
+            )
+            .await;
+        let saved = service
+            .store
+            .load_existing(SERVICE_NAME)
+            .expect("load committed pairing state");
+        assert_eq!(saved.pairing_file.identifier(), expected_identifier);
+        assert_eq!(saved.pairing_file.private_key_bytes(), expected_private_key);
+        let _ = fs::remove_dir_all(dir);
+    }
     #[tokio::test]
     async fn rsd_probe_does_not_create_wireless_state() {
         let dir = temp_state_dir("rsd-empty");
@@ -1616,6 +2684,41 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn every_commitment_stage_failure_blocks_persistence_and_transport() {
+        for (name, stage) in [
+            ("bootstrap", POST_PAIR_BOOTSTRAP_STAGE),
+            ("tunnel", POST_PAIR_TUNNEL_STAGE),
+            ("rsd", POST_PAIR_RSD_STAGE),
+            ("tunnel-service", POST_PAIR_TUNNEL_SERVICE_STAGE),
+            ("commit", POST_PAIR_COMMIT_STAGE),
+        ] {
+            let dir = temp_state_dir(name);
+            let (service, id, resources) = test_service_with_session(dir.clone()).await;
+            let material = service
+                .store
+                .load_or_create(SERVICE_NAME)
+                .expect("create pairing material");
+            service
+                .finalize_new_pairing(
+                    id,
+                    material,
+                    test_peer_device(),
+                    resources,
+                    test_commitment_deadline(),
+                    Err(post_pair_stage_failure(stage, "test_failure")),
+                )
+                .await;
+            let status = service.status(id).await.expect("failed session status");
+            assert_eq!(status.phase, PairingPhase::Failed);
+            assert_ne!(status.phase, PairingPhase::VerifyingTransport);
+            assert_ne!(status.phase, PairingPhase::Ready);
+            assert!(!dir.join(STATE_FILE).exists());
+            assert!(!dir.join(KEY_FILE).exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
     #[test]
     fn validate_pairing_error_diagnostics_are_safe_categories() {
         let unexpected = idevice::IdeviceError::UnexpectedResponse(
@@ -1664,18 +2767,14 @@ mod tests {
     }
 
     #[test]
-    fn handshake_failure_detail_is_retained_outside_public_status() {
+    fn handshake_failure_detail_is_not_retained() {
+        let secret = "unexpected pair-setup state: expected 3, got Some(4)";
         let failure = PairingFailure::from_display(
             "rppairing_accept",
-            idevice::IdeviceError::UnexpectedResponse(
-                "unexpected pair-setup state: expected 3, got Some(4)".into(),
-            ),
+            idevice::IdeviceError::UnexpectedResponse(secret.into()),
         );
         assert_eq!(failure.stage, "rppairing_accept");
-        assert_eq!(
-            failure.detail,
-            "unexpected response from device: unexpected pair-setup state: expected 3, got Some(4)"
-        );
+        assert!(!format!("{failure:?}").contains(secret));
 
         let status = PairingSessionStatus {
             id: Uuid::now_v7(),
@@ -1685,7 +2784,7 @@ mod tests {
             setup_code: None,
         };
         let encoded = serde_json::to_string(&status).expect("serialize status");
-        assert!(!encoded.contains("unexpected pair-setup state"));
+        assert!(!encoded.contains(secret));
         assert!(!encoded.contains("rppairing_accept"));
     }
 }
