@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -83,15 +85,69 @@ struct RsdProbeFailureResponse {
     stage: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReadOnlyProbeSuccessResponse {
+    transport: &'static str,
+    service: &'static str,
+    status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReadOnlyProbeFailureResponse {
+    transport: &'static str,
+    service: &'static str,
+    status: &'static str,
+    stage: &'static str,
+}
+
 const SPIKE_AFC_PROBE_PATH: &str = "/api/spike/devices/{id}/afc-probe";
 const SPIKE_RSD_PROBE_PATH: &str = "/api/spike/remote-pairing/rsd-probe";
+const SPIKE_REMOTE_AFC_PROBE_PATH: &str = "/api/spike/remote-pairing/afc-probe";
+const SPIKE_INSTALLATION_PROXY_PROBE_PATH: &str =
+    "/api/spike/remote-pairing/installation-proxy-probe";
 
 fn spike_route_paths(spike_mode: bool) -> &'static [&'static str] {
     if spike_mode {
-        &[SPIKE_AFC_PROBE_PATH, SPIKE_RSD_PROBE_PATH]
+        &[
+            SPIKE_AFC_PROBE_PATH,
+            SPIKE_RSD_PROBE_PATH,
+            SPIKE_REMOTE_AFC_PROBE_PATH,
+            SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+        ]
     } else {
         &[]
     }
+}
+
+fn with_spike_routes(app: Router<AppState>, spike_mode: bool) -> Router<AppState> {
+    if spike_route_paths(spike_mode).is_empty() {
+        app
+    } else {
+        app.route(SPIKE_AFC_PROBE_PATH, get(spike_afc_probe))
+            .route(SPIKE_RSD_PROBE_PATH, get(spike_remote_pairing_rsd_probe))
+            .route(
+                SPIKE_REMOTE_AFC_PROBE_PATH,
+                get(spike_remote_pairing_afc_probe),
+            )
+            .route(
+                SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+                get(spike_remote_pairing_installation_proxy_probe),
+            )
+    }
+}
+
+fn operator_env_filter(explicit: Option<&str>) -> EnvFilter {
+    match explicit {
+        Some(filter) => EnvFilter::new(filter),
+        None => EnvFilter::from_default_env()
+            .add_directive("idevice=info".parse().expect("static tracing directive")),
+    }
+}
+
+// This cap governs configured tracing-subscriber output only. Direct writes and
+// panics remain outside the subscriber boundary.
+fn spike_target_allowed(spike_mode: bool, metadata: &tracing::Metadata<'_>) -> bool {
+    !spike_mode || metadata.target() == wireless_pairing::SPIKE_DIAGNOSTICS_TARGET
 }
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -523,12 +579,228 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::{
-        AfcProbeResponse, RsdProbeFailureResponse, RsdProbeSuccessResponse, SPIKE_RSD_PROBE_PATH,
-        StartAppleLoginRequest, device_id_for_udid, install_job_json, managed_app,
-        spike_route_paths,
+        AfcProbeResponse, AppState, DeviceSummary, DeviceTransport, InstalledAppSummary,
+        ReadOnlyProbeFailureResponse, ReadOnlyProbeSuccessResponse, Router,
+        RsdProbeFailureResponse, RsdProbeSuccessResponse, SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+        SPIKE_REMOTE_AFC_PROBE_PATH, SPIKE_RSD_PROBE_PATH, StartAppleLoginRequest, StatusCode,
+        TransportError, device_id_for_udid, install_job_json, managed_app, operator_env_filter,
+        spike_route_paths, spike_target_allowed, with_spike_routes,
     };
-    use crate::store::{ManagedAppIdentity, StoredJob};
+    use crate::{
+        github, signing, store,
+        store::{ManagedAppIdentity, StoredJob},
+        wireless_pairing,
+    };
+    use async_trait::async_trait;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+    };
+    use tracing::{
+        Event, Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{
+        Layer,
+        filter::filter_fn,
+        layer::{Context, SubscriberExt},
+        registry::LookupSpan,
+    };
     use uuid::Uuid;
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl Visit for CapturedEvent {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .push((field.name().to_owned(), value.to_owned()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
+
+    #[derive(Clone)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut captured = CapturedEvent {
+                target: event.metadata().target().to_owned(),
+                fields: Vec::new(),
+            };
+            event.record(&mut captured);
+            self.events.lock().expect("capture event").push(captured);
+        }
+    }
+
+    fn capture_tracing(spike_mode: bool, run: impl FnOnce()) -> Vec<CapturedEvent> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(operator_env_filter(Some("trace,idevice=trace")))
+            .with(
+                EventCapture {
+                    events: events.clone(),
+                }
+                .with_filter(filter_fn(move |metadata| {
+                    spike_target_allowed(spike_mode, metadata)
+                })),
+            );
+        tracing::subscriber::with_default(subscriber, run);
+        events.lock().expect("read captured events").clone()
+    }
+
+    fn emit_hostile_filter_sentinels() {
+        tracing::debug!(target: "idevice", sentinel = "idevice_debug");
+        tracing::error!(target: "idevice", sentinel = "idevice_error");
+        tracing::warn!(
+            target: "idevice::services::afc",
+            sentinel = "idevice_afc_warn"
+        );
+        tracing::debug!(
+            target: "idevice::services::afc::packet",
+            sentinel = "idevice_afc_packet_debug"
+        );
+        tracing::error!(
+            target: "idevice::remote_pairing::sentinel",
+            sentinel = "idevice_other"
+        );
+        tracing::error!(target: "jktcp", sentinel = "jktcp_root");
+        tracing::trace!(target: "jktcp::adapter", sentinel = "jktcp_adapter");
+        tracing::error!(target: "jktcp::other", sentinel = "jktcp_other");
+        tracing::error!(
+            target: "revision4_dependency_sentinel",
+            sentinel = "dependency_error"
+        );
+        tracing::error!(
+            target: "iphoneloadly_api",
+            sentinel = "default_application"
+        );
+        tracing::error!(
+            target: "iphoneloadly_api::wireless_pairing",
+            sentinel = "wireless_application"
+        );
+        tracing::error!(
+            target: "iphoneloadly_api::spike_diagnostics::child",
+            sentinel = "approved_target_descendant"
+        );
+        wireless_pairing::emit_spike_diagnostic_for_filter_test();
+    }
+
+    struct RejectingTransport;
+
+    #[async_trait]
+    impl DeviceTransport for RejectingTransport {
+        async fn list_network_devices(&self) -> Result<Vec<DeviceSummary>, TransportError> {
+            panic!("read-only RSD probe must not use classic device discovery")
+        }
+
+        async fn list_installed_apps(
+            &self,
+            _device_id: Uuid,
+        ) -> Result<Vec<InstalledAppSummary>, TransportError> {
+            panic!("read-only RSD probe must not use classic app lookup")
+        }
+
+        async fn probe_afc(&self, _device_id: Uuid) -> Result<(), TransportError> {
+            panic!("read-only RSD probe must not use classic AFC")
+        }
+
+        async fn install_ipa(
+            &self,
+            _signing: &signing::AppleSigningProvider,
+            _device_id: Uuid,
+            _ipa_path: PathBuf,
+            _progress: Box<dyn Fn(u8) + Send + Sync>,
+        ) -> Result<String, TransportError> {
+            panic!("read-only RSD probe must not install")
+        }
+    }
+
+    fn route_test_state(root: &Path) -> (AppState, Arc<wireless_pairing::WirelessPairingService>) {
+        std::fs::create_dir_all(root).expect("create route test directory");
+        let database =
+            store::initialize(&root.join("route-test.db")).expect("initialize route test database");
+        let wireless_pairing = Arc::new(wireless_pairing::WirelessPairingService::new(
+            wireless_pairing::WirelessPairingConfig {
+                mode: wireless_pairing::WirelessPairingMode::Experimental,
+                pairing_port: 52_345,
+                interface: None,
+                state_dir: root.join("wireless-pairing"),
+            },
+        ));
+        (
+            AppState {
+                signing: signing::AppleSigningProvider::new(None, root.join("signing")),
+                devices: Arc::new(RejectingTransport),
+                wireless_pairing: wireless_pairing.clone(),
+                apps_dir: root.join("apps"),
+                database: Arc::new(Mutex::new(database)),
+                app_mutation: Arc::new(tokio::sync::RwLock::new(())),
+                source_sync: Arc::new(tokio::sync::Mutex::new(())),
+                github: Arc::new(
+                    github::GitHubClient::new(env!("CARGO_PKG_VERSION"))
+                        .expect("create route test GitHub client"),
+                ),
+            },
+            wireless_pairing,
+        )
+    }
+
+    async fn exercise_probe_routes(
+        spike_mode: bool,
+    ) -> (Vec<(StatusCode, serde_json::Value)>, usize) {
+        let root =
+            std::env::temp_dir().join(format!("iphoneloadly-read-only-routes-{}", Uuid::now_v7()));
+        let (state, wireless_pairing) = route_test_state(&root);
+        let app = with_spike_routes(Router::new(), spike_mode).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route test listener");
+        let address = listener.local_addr().expect("route test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve route test router");
+        });
+
+        let client = reqwest::Client::new();
+        let mut responses = Vec::new();
+        for path in [
+            SPIKE_REMOTE_AFC_PROBE_PATH,
+            SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+        ] {
+            let response = client
+                .get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .expect("request read-only probe route");
+            let status = response.status();
+            let body = response.text().await.expect("read probe response body");
+            let json = if body.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(&body).expect("parse probe response")
+            };
+            responses.push((status, json));
+        }
+        let open_attempts = wireless_pairing.probe_open_attempts();
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(root);
+        (responses, open_attempts)
+    }
 
     #[test]
     fn device_id_is_stable_for_non_uuid_apple_udids() {
@@ -611,9 +883,144 @@ mod tests {
     }
 
     #[test]
-    fn rsd_probe_route_is_registered_only_in_spike_mode() {
-        assert!(!spike_route_paths(false).contains(&SPIKE_RSD_PROBE_PATH));
-        assert!(spike_route_paths(true).contains(&SPIKE_RSD_PROBE_PATH));
+    fn read_only_probe_responses_are_bounded() {
+        for service in ["afc", "installationProxy"] {
+            let success = serde_json::to_value(ReadOnlyProbeSuccessResponse {
+                transport: "rsd",
+                service,
+                status: "ok",
+            })
+            .expect("serialize read-only probe success");
+            assert_eq!(
+                success,
+                serde_json::json!({
+                    "transport": "rsd",
+                    "service": service,
+                    "status": "ok",
+                })
+            );
+
+            for stage in [
+                "discovery",
+                "validatePairing",
+                "tunnel",
+                "rsdHandshake",
+                "serviceLookup",
+                "serviceConnect",
+                "clientInit",
+                if service == "afc" {
+                    "afcQuery"
+                } else {
+                    "appLookup"
+                },
+                "cleanup",
+            ] {
+                let failure = serde_json::to_value(ReadOnlyProbeFailureResponse {
+                    transport: "rsd",
+                    service,
+                    status: "unavailable",
+                    stage,
+                })
+                .expect("serialize read-only probe failure");
+                assert_eq!(
+                    failure,
+                    serde_json::json!({
+                        "transport": "rsd",
+                        "service": service,
+                        "status": "unavailable",
+                        "stage": stage,
+                    })
+                );
+                let encoded = failure.to_string();
+                for sentinel in [
+                    "device-controlled-secret",
+                    "00008110-001A2B3C00000000",
+                    "127.0.0.1",
+                    "62000",
+                    "/private/var/mobile",
+                ] {
+                    assert!(!encoded.contains(sentinel));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rsd_probe_routes_are_registered_only_in_spike_mode() {
+        for path in [
+            SPIKE_RSD_PROBE_PATH,
+            SPIKE_REMOTE_AFC_PROBE_PATH,
+            SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+        ] {
+            assert!(!spike_route_paths(false).contains(&path));
+            assert!(spike_route_paths(true).contains(&path));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_probe_routes_are_spike_only_and_use_fresh_wireless_sessions() {
+        let (active, open_attempts) = exercise_probe_routes(true).await;
+        assert_eq!(open_attempts, 2);
+        assert_eq!(
+            active,
+            vec![
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "transport": "rsd",
+                        "service": "afc",
+                        "status": "unavailable",
+                        "stage": "discovery",
+                    }),
+                ),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "transport": "rsd",
+                        "service": "installationProxy",
+                        "status": "unavailable",
+                        "stage": "discovery",
+                    }),
+                ),
+            ]
+        );
+
+        let (inactive, open_attempts) = exercise_probe_routes(false).await;
+        assert_eq!(open_attempts, 0);
+        assert_eq!(
+            inactive
+                .into_iter()
+                .map(|(status, _)| status)
+                .collect::<Vec<_>>(),
+            [StatusCode::NOT_FOUND, StatusCode::NOT_FOUND]
+        );
+    }
+
+    #[test]
+    fn spike_subscriber_hard_filter_denies_every_nonapproved_target() {
+        let events = capture_tracing(true, emit_hostile_filter_sentinels);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target, wireless_pairing::SPIKE_DIAGNOSTICS_TARGET);
+        assert!(events[0].fields.iter().any(|(name, value)| {
+            name == "message" && value.contains("remote pairing read-only probe failed")
+        }));
+    }
+
+    #[test]
+    fn non_spike_subscriber_preserves_operator_filtered_targets() {
+        let events = capture_tracing(false, emit_hostile_filter_sentinels);
+        let targets = events
+            .iter()
+            .map(|event| event.target.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(targets.contains("idevice"));
+        assert!(targets.contains("idevice::services::afc"));
+        assert!(targets.contains("jktcp"));
+        assert!(targets.contains("jktcp::adapter"));
+        assert!(targets.contains("revision4_dependency_sentinel"));
+        assert!(targets.contains("iphoneloadly_api"));
+        assert!(targets.contains("iphoneloadly_api::wireless_pairing"));
+        assert!(targets.contains(wireless_pairing::SPIKE_DIAGNOSTICS_TARGET));
     }
 
     #[test]
@@ -1025,6 +1432,60 @@ async fn spike_remote_pairing_rsd_probe(State(state): State<AppState>) -> impl I
             StatusCode::SERVICE_UNAVAILABLE,
             Json(RsdProbeFailureResponse {
                 transport: "rsdCoreDevice",
+                status: "unavailable",
+                stage: failure.stage.as_str(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn spike_remote_pairing_afc_probe(State(state): State<AppState>) -> impl IntoResponse {
+    match state.wireless_pairing.probe_remote_pairing_afc().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ReadOnlyProbeSuccessResponse {
+                transport: "rsd",
+                service: "afc",
+                status: "ok",
+            }),
+        )
+            .into_response(),
+        Err(failure) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadOnlyProbeFailureResponse {
+                transport: "rsd",
+                service: "afc",
+                status: "unavailable",
+                stage: failure.stage.as_str(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn spike_remote_pairing_installation_proxy_probe(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state
+        .wireless_pairing
+        .probe_remote_pairing_installation_proxy()
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ReadOnlyProbeSuccessResponse {
+                transport: "rsd",
+                service: "installationProxy",
+                status: "ok",
+            }),
+        )
+            .into_response(),
+        Err(failure) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadOnlyProbeFailureResponse {
+                transport: "rsd",
+                service: "installationProxy",
                 status: "unavailable",
                 stage: failure.stage.as_str(),
             }),
@@ -1712,19 +2173,22 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
 
 #[tokio::main]
 async fn main() {
+    let spike_mode = std::env::args().any(|argument| argument == "--wireless-pairing-spike");
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("install rustls AWS-LC crypto provider");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("idevice=info".parse().expect("static tracing directive")),
+    tracing_subscriber::registry()
+        .with(operator_env_filter(None))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_filter(filter_fn(move |metadata| {
+                    spike_target_allowed(spike_mode, metadata)
+                })),
         )
-        .with_target(false)
         .init();
-
-    let spike_mode = std::env::args().any(|argument| argument == "--wireless-pairing-spike");
     let data_dir = if spike_mode {
         std::env::var("IPHONELOADLY_SPIKE_DATA_DIR")
             .map(PathBuf::from)
@@ -1855,12 +2319,7 @@ async fn main() {
             get(get_refresh_settings).put(update_refresh_settings),
         )
         .route("/api/installation-validity", get(installation_validity));
-    let app = if !spike_route_paths(spike_mode).is_empty() {
-        app.route(SPIKE_AFC_PROBE_PATH, get(spike_afc_probe))
-            .route(SPIKE_RSD_PROBE_PATH, get(spike_remote_pairing_rsd_probe))
-    } else {
-        app
-    };
+    let app = with_spike_routes(app, spike_mode);
     let app = app
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024usize))
         .with_state(state);

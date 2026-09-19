@@ -1,6 +1,8 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     fmt::Display,
-    fs,
+    fs, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,15 +12,18 @@ use std::{
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use idevice::{
-    RemoteXpcClient,
+    RemoteXpcClient, RsdService,
     provider::RsdProvider,
     remote_pairing::{
         PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, PeerDevice,
         RemotePairingClient, RpPairingFile, RpPairingSocket, RpPairingSocketProvider,
         connect_tls_psk_tunnel_native, errors::RemotePairingError,
     },
-    services::{core_device::AppServiceClient, rsd::RsdHandshake},
-    tcp::{adapter::Adapter, stream::AdapterStream},
+    services::{
+        afc::AfcClient, core_device::AppServiceClient, installation_proxy::InstallationProxyClient,
+        rsd::RsdHandshake,
+    },
+    tcp::{adapter::Adapter, handle::AdapterHandle, stream::AdapterStream},
 };
 use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize, Serializer};
@@ -46,6 +51,8 @@ const MDNS_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_PAIRING_SERVICE_TYPE: &str = "_remotepairing._tcp.local.";
 const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_ONLY_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+const READ_ONLY_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(60);
 const POST_PAIR_BOOTSTRAP_STAGE: &str = "post_pair_bootstrap";
 const POST_PAIR_TUNNEL_STAGE: &str = "post_pair_tunnel";
 const POST_PAIR_RSD_STAGE: &str = "post_pair_rsd";
@@ -57,6 +64,7 @@ const CORE_DEVICE_INFO_SERVICE_NAME: &str = "com.apple.coredevice.deviceinfo";
 const MOBILE_IMAGE_MOUNTER_SERVICE_NAME: &str = "com.apple.mobile.mobile_image_mounter.shim.remote";
 const INSTALLATION_PROXY_SERVICE_NAME: &str = "com.apple.mobile.installation_proxy.shim.remote";
 const AFC_SERVICE_NAME: &str = "com.apple.afc.shim.remote";
+pub(crate) const SPIKE_DIAGNOSTICS_TARGET: &str = "iphoneloadly_api::spike_diagnostics";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsdProbeStage {
@@ -82,6 +90,80 @@ impl RsdProbeStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsdProbeFailure {
     pub stage: RsdProbeStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadOnlyProbeService {
+    Afc,
+    InstallationProxy,
+}
+
+impl ReadOnlyProbeService {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Afc => "afc",
+            Self::InstallationProxy => "installationProxy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadOnlyProbeStage {
+    Discovery,
+    ValidatePairing,
+    Tunnel,
+    RsdHandshake,
+    ServiceLookup,
+    ServiceConnect,
+    ClientInit,
+    AfcQuery,
+    AppLookup,
+    Cleanup,
+}
+impl ReadOnlyProbeStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::ValidatePairing => "validatePairing",
+            Self::Tunnel => "tunnel",
+            Self::RsdHandshake => "rsdHandshake",
+            Self::ServiceLookup => "serviceLookup",
+            Self::ServiceConnect => "serviceConnect",
+            Self::ClientInit => "clientInit",
+            Self::AfcQuery => "afcQuery",
+            Self::AppLookup => "appLookup",
+            Self::Cleanup => "cleanup",
+        }
+    }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Discovery | Self::ValidatePairing | Self::Tunnel | Self::RsdHandshake => "setup",
+            Self::ServiceLookup => "service_lookup",
+            Self::ServiceConnect => "service_connect",
+            Self::ClientInit => "client_init",
+            Self::AfcQuery => "afc_query",
+            Self::AppLookup => "app_lookup",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+impl From<RsdProbeStage> for ReadOnlyProbeStage {
+    fn from(stage: RsdProbeStage) -> Self {
+        match stage {
+            RsdProbeStage::Discovery => Self::Discovery,
+            RsdProbeStage::ValidatePairing => Self::ValidatePairing,
+            RsdProbeStage::Tunnel => Self::Tunnel,
+            RsdProbeStage::RsdHandshake => Self::RsdHandshake,
+            RsdProbeStage::CoreDeviceService => Self::ServiceConnect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadOnlyProbeFailure {
+    pub(crate) stage: ReadOnlyProbeStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +396,52 @@ pub struct WirelessPairingService {
     store: Arc<PairingStore>,
     session: Arc<Mutex<Option<SessionRuntime>>>,
     start_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    probe_open_attempts: Arc<AtomicUsize>,
+}
+
+trait ClosableRsdProvider {
+    fn close_provider(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+}
+
+impl ClosableRsdProvider for AdapterHandle {
+    fn close_provider(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        self.close()
+    }
+}
+
+struct RemoteRsdSession<P> {
+    provider: Option<P>,
+    handshake: Option<RsdHandshake>,
+}
+
+impl<P> RemoteRsdSession<P> {
+    fn provider_mut(&mut self) -> &mut P {
+        self.provider
+            .as_mut()
+            .expect("request-owned RSD provider is available until cleanup")
+    }
+
+    fn handshake(&self) -> &RsdHandshake {
+        self.handshake
+            .as_ref()
+            .expect("request-owned RSD handshake completed before use")
+    }
+}
+
+impl<P: ClosableRsdProvider> RemoteRsdSession<P> {
+    async fn close(mut self) -> Result<(), io::Error> {
+        match self.provider.take() {
+            Some(mut provider) => provider.close_provider().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl<P> Drop for RemoteRsdSession<P> {
+    fn drop(&mut self) {
+        drop(self.provider.take());
+    }
 }
 
 struct SessionRuntime {
@@ -480,7 +608,14 @@ impl WirelessPairingService {
             config,
             session: Arc::new(Mutex::new(None)),
             start_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            probe_open_attempts: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_open_attempts(&self) -> usize {
+        self.probe_open_attempts.load(Ordering::SeqCst)
     }
 
     pub async fn start_wireless(&self) -> Result<PairingSessionStatus, PairingError> {
@@ -613,98 +748,214 @@ impl WirelessPairingService {
     }
 
     pub async fn probe_remote_pairing_rsd(&self) -> Result<(), RsdProbeFailure> {
-        let material = self
-            .store
-            .load_existing(SERVICE_NAME)
-            .map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
-        if material.paired_peer_id.is_none() {
-            return Err(probe_failure(RsdProbeStage::Discovery));
+        let mut session = RemoteRsdSession::open(self, None)
+            .await
+            .map_err(report_appservice_setup_failure)?;
+        report_parsed_rsd_service_summary(parsed_rsd_service_summary(session.handshake()));
+        let result = async {
+            let app_port = core_device_appservice_port(session.handshake())
+                .map_err(report_core_device_service_failure)?;
+            let app_stream = run_core_device_service_operation(
+                CoreDeviceServiceOperation::ServiceConnect,
+                true,
+                REMOTE_CONNECT_TIMEOUT,
+                session.provider_mut().connect_to_service_port(app_port),
+            )
+            .await
+            .map_err(report_core_device_service_failure)?;
+            let mut app_service = run_core_device_service_operation(
+                CoreDeviceServiceOperation::ClientInit,
+                true,
+                REMOTE_CONNECT_TIMEOUT,
+                AppServiceClient::<idevice::IdeviceSocket>::new(app_stream),
+            )
+            .await
+            .map_err(report_core_device_service_failure)?;
+            let _ = run_core_device_service_operation(
+                CoreDeviceServiceOperation::ListApps,
+                true,
+                REMOTE_CONNECT_TIMEOUT,
+                app_service.list_apps(false, false, false, false, false),
+            )
+            .await
+            .map_err(report_core_device_service_failure)?;
+            Ok(())
         }
-        let pairing_file = material.pairing_file;
-        if pairing_file
-            .alt_irk()
-            .is_none_or(|alt_irk| alt_irk.len() != 16)
-        {
-            return Err(probe_failure(RsdProbeStage::Discovery));
-        }
+        .await;
+        let _ = timeout(REMOTE_CONNECT_TIMEOUT, session.close()).await;
+        result
+    }
 
-        let endpoints = discover_remote_pairing_endpoints(&pairing_file).await?;
-        let (address, mut client) =
-            connect_and_validate_remote_pairing(&endpoints, &pairing_file).await?;
-        let listener_port = timeout(REMOTE_CONNECT_TIMEOUT, client.create_tcp_listener())
-            .await
-            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
-            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
-        let listener_stream = timeout(
-            REMOTE_CONNECT_TIMEOUT,
-            TcpStream::connect(SocketAddr::new(address, listener_port)),
+    pub(crate) async fn probe_remote_pairing_afc(&self) -> Result<(), ReadOnlyProbeFailure> {
+        let service = ReadOnlyProbeService::Afc;
+        let mut current_stage = ReadOnlyProbeStage::Discovery;
+        let mut primary_failure = None;
+        match timeout(
+            READ_ONLY_ENDPOINT_TIMEOUT,
+            self.probe_remote_pairing_afc_inner(&mut current_stage, &mut primary_failure),
         )
         .await
-        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
-        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
-        let encryption_key = client.encryption_key().to_owned();
-        let tunnel = timeout(
-            REMOTE_CONNECT_TIMEOUT,
-            connect_tls_psk_tunnel_native(listener_stream, &encryption_key),
-        )
-        .await
-        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
-        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
-        let tunnel_info = tunnel.info.clone();
-        if tunnel_info.server_rsd_port == 0 {
-            return Err(probe_failure(RsdProbeStage::Tunnel));
+        {
+            Ok(result) => result,
+            Err(_) => Err(read_only_endpoint_timeout_failure(
+                service,
+                current_stage,
+                primary_failure,
+            )),
         }
-        let host_ip = tunnel_info
-            .client_address
-            .parse::<IpAddr>()
-            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
-        let peer_ip = tunnel_info
-            .server_address
-            .parse::<IpAddr>()
-            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
-        let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), host_ip, peer_ip);
-        adapter.set_mss(usize::from(tunnel_info.mtu.saturating_sub(60)));
-        let mut provider = adapter.to_async_handle();
-        let rsd_stream = timeout(
-            REMOTE_CONNECT_TIMEOUT,
-            provider.connect(tunnel_info.server_rsd_port),
-        )
-        .await
-        .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
-        .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
-        let handshake = timeout(REMOTE_CONNECT_TIMEOUT, RsdHandshake::new(rsd_stream))
+    }
+
+    async fn probe_remote_pairing_afc_inner(
+        &self,
+        current_stage: &mut ReadOnlyProbeStage,
+        primary_failure: &mut Option<ReadOnlyProbeFailure>,
+    ) -> Result<(), ReadOnlyProbeFailure> {
+        let service = ReadOnlyProbeService::Afc;
+        let mut session = RemoteRsdSession::open(self, Some(current_stage))
             .await
-            .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
-            .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
-        report_parsed_rsd_service_summary(parsed_rsd_service_summary(&handshake));
-        let app_port =
-            core_device_appservice_port(&handshake).map_err(report_core_device_service_failure)?;
-        let app_stream = run_core_device_service_operation(
-            CoreDeviceServiceOperation::ServiceConnect,
-            true,
-            REMOTE_CONNECT_TIMEOUT,
-            provider.connect_to_service_port(app_port),
+            .map_err(|failure| {
+                let stage = ReadOnlyProbeStage::from(failure.stage);
+                *current_stage = stage;
+                read_only_probe_failure(service, stage, "setup", "error", "unavailable")
+            })?;
+        let primary = async {
+            *current_stage = ReadOnlyProbeStage::ServiceLookup;
+            let service_port = exact_rsd_service_port(session.handshake(), AFC_SERVICE_NAME)
+                .ok_or_else(|| {
+                    read_only_probe_failure(
+                        service,
+                        *current_stage,
+                        "service_lookup",
+                        "missing",
+                        "service_not_found",
+                    )
+                })?;
+
+            *current_stage = ReadOnlyProbeStage::ServiceConnect;
+            let stream = run_read_only_probe_step(
+                service,
+                *current_stage,
+                "service_connect",
+                REMOTE_CONNECT_TIMEOUT,
+                session.provider_mut().connect_to_service_port(service_port),
+            )
+            .await?;
+
+            *current_stage = ReadOnlyProbeStage::ClientInit;
+            let mut client = run_read_only_probe_step(
+                service,
+                *current_stage,
+                "client_init",
+                REMOTE_CONNECT_TIMEOUT,
+                <AfcClient as RsdService>::from_stream(stream),
+            )
+            .await?;
+
+            *current_stage = ReadOnlyProbeStage::AfcQuery;
+            let _ = run_read_only_probe_step(
+                service,
+                *current_stage,
+                "afc_query",
+                READ_ONLY_QUERY_TIMEOUT,
+                client.get_device_info(),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        *primary_failure = primary.as_ref().err().copied();
+
+        *current_stage = ReadOnlyProbeStage::Cleanup;
+        complete_read_only_probe(service, primary, session).await
+    }
+
+    pub(crate) async fn probe_remote_pairing_installation_proxy(
+        &self,
+    ) -> Result<(), ReadOnlyProbeFailure> {
+        let service = ReadOnlyProbeService::InstallationProxy;
+        let mut current_stage = ReadOnlyProbeStage::Discovery;
+        let mut primary_failure = None;
+        match timeout(
+            READ_ONLY_ENDPOINT_TIMEOUT,
+            self.probe_remote_pairing_installation_proxy_inner(
+                &mut current_stage,
+                &mut primary_failure,
+            ),
         )
         .await
-        .map_err(report_core_device_service_failure)?;
-        let mut app_service = run_core_device_service_operation(
-            CoreDeviceServiceOperation::ClientInit,
-            true,
-            REMOTE_CONNECT_TIMEOUT,
-            AppServiceClient::<idevice::IdeviceSocket>::new(app_stream),
-        )
-        .await
-        .map_err(report_core_device_service_failure)?;
-        let _ = run_core_device_service_operation(
-            CoreDeviceServiceOperation::ListApps,
-            true,
-            REMOTE_CONNECT_TIMEOUT,
-            app_service.list_apps(false, false, false, false, false),
-        )
-        .await
-        .map_err(report_core_device_service_failure)?;
-        let _ = provider.close().await;
-        Ok(())
+        {
+            Ok(result) => result,
+            Err(_) => Err(read_only_endpoint_timeout_failure(
+                service,
+                current_stage,
+                primary_failure,
+            )),
+        }
+    }
+
+    async fn probe_remote_pairing_installation_proxy_inner(
+        &self,
+        current_stage: &mut ReadOnlyProbeStage,
+        primary_failure: &mut Option<ReadOnlyProbeFailure>,
+    ) -> Result<(), ReadOnlyProbeFailure> {
+        let service = ReadOnlyProbeService::InstallationProxy;
+        let mut session = RemoteRsdSession::open(self, Some(current_stage))
+            .await
+            .map_err(|failure| {
+                let stage = ReadOnlyProbeStage::from(failure.stage);
+                *current_stage = stage;
+                read_only_probe_failure(service, stage, "setup", "error", "unavailable")
+            })?;
+        let primary = async {
+            *current_stage = ReadOnlyProbeStage::ServiceLookup;
+            let service_port =
+                exact_rsd_service_port(session.handshake(), INSTALLATION_PROXY_SERVICE_NAME)
+                    .ok_or_else(|| {
+                        read_only_probe_failure(
+                            service,
+                            *current_stage,
+                            "service_lookup",
+                            "missing",
+                            "service_not_found",
+                        )
+                    })?;
+
+            *current_stage = ReadOnlyProbeStage::ServiceConnect;
+            let stream = run_read_only_probe_step(
+                service,
+                *current_stage,
+                "service_connect",
+                REMOTE_CONNECT_TIMEOUT,
+                session.provider_mut().connect_to_service_port(service_port),
+            )
+            .await?;
+
+            *current_stage = ReadOnlyProbeStage::ClientInit;
+            let mut client = run_read_only_probe_step(
+                service,
+                *current_stage,
+                "client_init",
+                REMOTE_CONNECT_TIMEOUT,
+                <InstallationProxyClient as RsdService>::from_stream(stream),
+            )
+            .await?;
+
+            *current_stage = ReadOnlyProbeStage::AppLookup;
+            let _ = run_read_only_probe_step(
+                service,
+                *current_stage,
+                "app_lookup",
+                READ_ONLY_QUERY_TIMEOUT,
+                client.get_apps(Some("User"), None),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        *primary_failure = primary.as_ref().err().copied();
+
+        *current_stage = ReadOnlyProbeStage::Cleanup;
+        complete_read_only_probe(service, primary, session).await
     }
 
     #[allow(dead_code)]
@@ -1006,9 +1257,239 @@ impl WirelessPairingService {
     }
 }
 
+impl RemoteRsdSession<AdapterHandle> {
+    async fn open(
+        service: &WirelessPairingService,
+        mut progress: Option<&mut ReadOnlyProbeStage>,
+    ) -> Result<Self, RsdProbeFailure> {
+        #[cfg(test)]
+        service.probe_open_attempts.fetch_add(1, Ordering::SeqCst);
+        if let Some(progress) = progress.as_deref_mut() {
+            *progress = ReadOnlyProbeStage::Discovery;
+        }
+        let material = service
+            .store
+            .load_existing(SERVICE_NAME)
+            .map_err(|_| probe_failure(RsdProbeStage::Discovery))?;
+        if material.paired_peer_id.is_none() {
+            return Err(probe_failure(RsdProbeStage::Discovery));
+        }
+        let pairing_file = material.pairing_file;
+        if pairing_file
+            .alt_irk()
+            .is_none_or(|alt_irk| alt_irk.len() != 16)
+        {
+            return Err(probe_failure(RsdProbeStage::Discovery));
+        }
+
+        let endpoints = discover_remote_pairing_endpoints(&pairing_file).await?;
+        if let Some(progress) = progress.as_deref_mut() {
+            *progress = ReadOnlyProbeStage::ValidatePairing;
+        }
+        let (address, mut client) =
+            connect_and_validate_remote_pairing(&endpoints, &pairing_file).await?;
+        if let Some(progress) = progress.as_deref_mut() {
+            *progress = ReadOnlyProbeStage::Tunnel;
+        }
+        let listener_port = timeout(REMOTE_CONNECT_TIMEOUT, client.create_tcp_listener())
+            .await
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let listener_stream = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            TcpStream::connect(SocketAddr::new(address, listener_port)),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let encryption_key = client.encryption_key().to_owned();
+        let tunnel = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            connect_tls_psk_tunnel_native(listener_stream, &encryption_key),
+        )
+        .await
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?
+        .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let tunnel_info = tunnel.info.clone();
+        if tunnel_info.server_rsd_port == 0 {
+            return Err(probe_failure(RsdProbeStage::Tunnel));
+        }
+        let host_ip = tunnel_info
+            .client_address
+            .parse::<IpAddr>()
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let peer_ip = tunnel_info
+            .server_address
+            .parse::<IpAddr>()
+            .map_err(|_| probe_failure(RsdProbeStage::Tunnel))?;
+        let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), host_ip, peer_ip);
+        adapter.set_mss(usize::from(tunnel_info.mtu.saturating_sub(60)));
+        let mut session = Self {
+            provider: Some(adapter.to_async_handle()),
+            handshake: None,
+        };
+        if let Some(progress) = progress {
+            *progress = ReadOnlyProbeStage::RsdHandshake;
+        }
+
+        let handshake_result = async {
+            let rsd_stream = timeout(
+                REMOTE_CONNECT_TIMEOUT,
+                session.provider_mut().connect(tunnel_info.server_rsd_port),
+            )
+            .await
+            .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
+            .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
+            timeout(REMOTE_CONNECT_TIMEOUT, RsdHandshake::new(rsd_stream))
+                .await
+                .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
+                .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))
+        }
+        .await;
+
+        match handshake_result {
+            Ok(handshake) => {
+                session.handshake = Some(handshake);
+                Ok(session)
+            }
+            Err(failure) => {
+                let _ = timeout(REMOTE_CONNECT_TIMEOUT, session.close()).await;
+                Err(failure)
+            }
+        }
+    }
+}
+
+fn exact_rsd_service_port(handshake: &RsdHandshake, service_name: &str) -> Option<u16> {
+    handshake
+        .services
+        .get(service_name)
+        .and_then(|service| (service.port != 0).then_some(service.port))
+}
+
+fn read_only_probe_failure(
+    service: ReadOnlyProbeService,
+    stage: ReadOnlyProbeStage,
+    operation: &'static str,
+    result: &'static str,
+    error_kind: &'static str,
+) -> ReadOnlyProbeFailure {
+    tracing::warn!(
+        target: "iphoneloadly_api::spike_diagnostics",
+        transport = "rsd",
+        service = service.as_str(),
+        stage = stage.as_str(),
+        operation,
+        result,
+        error_kind,
+        "remote pairing read-only probe failed"
+    );
+    ReadOnlyProbeFailure { stage }
+}
+
+fn read_only_endpoint_timeout_failure(
+    service: ReadOnlyProbeService,
+    current_stage: ReadOnlyProbeStage,
+    primary_failure: Option<ReadOnlyProbeFailure>,
+) -> ReadOnlyProbeFailure {
+    primary_failure.unwrap_or_else(|| {
+        read_only_probe_failure(
+            service,
+            current_stage,
+            current_stage.operation(),
+            "timeout",
+            "timeout",
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn emit_spike_diagnostic_for_filter_test() {
+    let _ = read_only_probe_failure(
+        ReadOnlyProbeService::Afc,
+        ReadOnlyProbeStage::ServiceLookup,
+        "service_lookup",
+        "missing",
+        "service_not_found",
+    );
+}
+
+async fn run_read_only_probe_step<T>(
+    service: ReadOnlyProbeService,
+    stage: ReadOnlyProbeStage,
+    operation: &'static str,
+    timeout_duration: Duration,
+    future: impl Future<Output = Result<T, idevice::IdeviceError>>,
+) -> Result<T, ReadOnlyProbeFailure> {
+    match timeout(timeout_duration, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(read_only_probe_failure(
+            service,
+            stage,
+            operation,
+            "error",
+            idevice_error_kind(&error),
+        )),
+        Err(_) => Err(read_only_probe_failure(
+            service, stage, operation, "timeout", "timeout",
+        )),
+    }
+}
+
+async fn complete_read_only_probe<P: ClosableRsdProvider>(
+    service: ReadOnlyProbeService,
+    primary: Result<(), ReadOnlyProbeFailure>,
+    session: RemoteRsdSession<P>,
+) -> Result<(), ReadOnlyProbeFailure> {
+    complete_read_only_probe_with_timeout(service, primary, session, REMOTE_CONNECT_TIMEOUT).await
+}
+
+async fn complete_read_only_probe_with_timeout<P: ClosableRsdProvider>(
+    service: ReadOnlyProbeService,
+    primary: Result<(), ReadOnlyProbeFailure>,
+    session: RemoteRsdSession<P>,
+    cleanup_timeout: Duration,
+) -> Result<(), ReadOnlyProbeFailure> {
+    let cleanup_failure = match timeout(cleanup_timeout, session.close()).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(read_only_probe_failure(
+            service,
+            ReadOnlyProbeStage::Cleanup,
+            "cleanup",
+            "error",
+            io_error_kind(&error),
+        )),
+        Err(_) => Some(read_only_probe_failure(
+            service,
+            ReadOnlyProbeStage::Cleanup,
+            "cleanup",
+            "timeout",
+            "timeout",
+        )),
+    };
+
+    match primary {
+        Err(failure) => Err(failure),
+        Ok(()) => cleanup_failure.map_or(Ok(()), Err),
+    }
+}
+
 fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
-    tracing::debug!(stage = stage.as_str(), "remote pairing RSD probe failed");
     RsdProbeFailure { stage }
+}
+
+fn report_appservice_setup_failure(failure: RsdProbeFailure) -> RsdProbeFailure {
+    tracing::debug!(
+        target: "iphoneloadly_api::spike_diagnostics",
+        transport = "rsd",
+        service = "appService",
+        stage = failure.stage.as_str(),
+        operation = "setup",
+        result = "error",
+        error_kind = "unavailable",
+        "remote pairing RSD probe failed"
+    );
+    failure
 }
 
 fn parsed_rsd_service_summary(handshake: &RsdHandshake) -> ParsedRsdServiceSummary {
@@ -1034,10 +1515,13 @@ fn parsed_rsd_service_summary(handshake: &RsdHandshake) -> ParsedRsdServiceSumma
 
 fn report_parsed_rsd_service_summary(summary: ParsedRsdServiceSummary) {
     tracing::warn!(
+        target: "iphoneloadly_api::spike_diagnostics",
+        transport = "rsd",
+        service = "appService",
         stage = RsdProbeStage::CoreDeviceService.as_str(),
         operation = "service_summary",
         result = "observed",
-        source = "parsed_rsd_services",
+        error_kind = "none",
         parsed_appservice_present = summary.parsed_appservice_present,
         parsed_deviceinfo_present = summary.parsed_deviceinfo_present,
         parsed_untrusted_tunnelservice_present = summary.parsed_untrusted_tunnelservice_present,
@@ -1078,6 +1562,9 @@ async fn run_core_device_service_operation<T>(
 
 fn report_core_device_service_failure(failure: CoreDeviceServiceFailure) -> RsdProbeFailure {
     tracing::warn!(
+        target: "iphoneloadly_api::spike_diagnostics",
+        transport = "rsd",
+        service = "appService",
         stage = RsdProbeStage::CoreDeviceService.as_str(),
         operation = failure.operation.as_str(),
         result = failure.result,
@@ -2254,7 +2741,10 @@ mod tests {
     use super::*;
     use std::{
         collections::{BTreeMap, BTreeSet},
-        sync::{Arc as StdArc, Mutex as StdMutex},
+        sync::{
+            Arc as StdArc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::{
@@ -2270,6 +2760,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct CapturedEvent {
         level: tracing::Level,
+        target: String,
         fields: BTreeMap<String, String>,
     }
 
@@ -2302,6 +2793,7 @@ mod tests {
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
             let mut captured = CapturedEvent {
                 level: *event.metadata().level(),
+                target: event.metadata().target().to_owned(),
                 fields: BTreeMap::new(),
             };
             event.record(&mut captured);
@@ -2353,6 +2845,210 @@ mod tests {
             summary.parsed_installation_proxy_present,
             summary.parsed_afc_present,
         ]
+    }
+
+    async fn read_framed_plist(stream: &mut tokio::io::DuplexStream) -> plist::Dictionary {
+        let length = stream.read_u32().await.expect("read plist length");
+        let mut body = vec![0; length as usize];
+        stream.read_exact(&mut body).await.expect("read plist body");
+        plist::from_bytes::<plist::Value>(&body)
+            .expect("parse plist")
+            .into_dictionary()
+            .expect("plist dictionary")
+    }
+
+    async fn write_framed_plist(stream: &mut tokio::io::DuplexStream, value: plist::Value) {
+        let mut body = Vec::new();
+        value
+            .to_writer_xml(&mut body)
+            .expect("serialize plist response");
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .expect("write plist length");
+        stream.write_all(&body).await.expect("write plist body");
+    }
+
+    async fn serve_rsd_checkin(stream: &mut tokio::io::DuplexStream) {
+        let request = read_framed_plist(stream).await;
+        assert_eq!(
+            request.get("Request").and_then(plist::Value::as_string),
+            Some("RSDCheckin")
+        );
+        assert_eq!(
+            request
+                .get("ProtocolVersion")
+                .and_then(plist::Value::as_string),
+            Some("2")
+        );
+        for request_name in ["RSDCheckin", "StartService"] {
+            write_framed_plist(
+                stream,
+                plist::Value::Dictionary(
+                    [(
+                        "Request".to_owned(),
+                        plist::Value::String(request_name.to_owned()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            )
+            .await;
+        }
+    }
+
+    async fn assert_stream_closed_after_one_query(stream: &mut tokio::io::DuplexStream) {
+        let mut extra = [0; 1];
+        let read = timeout(Duration::from_secs(1), stream.read(&mut extra))
+            .await
+            .expect("client closes after one query")
+            .expect("read post-query EOF");
+        assert_eq!(read, 0, "probe sent more than one request");
+    }
+
+    async fn run_afc_fixture(
+        response_payload: Option<Vec<u8>>,
+    ) -> (Result<idevice::afc::DeviceInfo, idevice::IdeviceError>, u64) {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let client = async move {
+            let mut client =
+                <AfcClient as RsdService>::from_stream(Box::new(client_stream)).await?;
+            client.get_device_info().await
+        };
+        let server = async move {
+            serve_rsd_checkin(&mut server_stream).await;
+            let mut request = [0; idevice::afc::packet::AfcPacketHeader::LEN as usize];
+            server_stream
+                .read_exact(&mut request)
+                .await
+                .expect("read AFC request");
+            let magic = u64::from_le_bytes(request[0..8].try_into().unwrap());
+            let entire_len = u64::from_le_bytes(request[8..16].try_into().unwrap());
+            let header_payload_len = u64::from_le_bytes(request[16..24].try_into().unwrap());
+            let opcode = u64::from_le_bytes(request[32..40].try_into().unwrap());
+            assert_eq!(magic, idevice::afc::MAGIC);
+            assert_eq!(entire_len, idevice::afc::packet::AfcPacketHeader::LEN);
+            assert_eq!(
+                header_payload_len,
+                idevice::afc::packet::AfcPacketHeader::LEN
+            );
+
+            if let Some(payload) = response_payload {
+                let packet = idevice::afc::packet::AfcPacket {
+                    header: idevice::afc::packet::AfcPacketHeader {
+                        magic: idevice::afc::MAGIC,
+                        entire_len: idevice::afc::packet::AfcPacketHeader::LEN
+                            + payload.len() as u64,
+                        header_payload_len: idevice::afc::packet::AfcPacketHeader::LEN,
+                        packet_num: 0,
+                        operation: idevice::afc::opcode::AfcOpcode::Data,
+                    },
+                    header_payload: Vec::new(),
+                    payload,
+                };
+                server_stream
+                    .write_all(&packet.serialize())
+                    .await
+                    .expect("write AFC response");
+                assert_stream_closed_after_one_query(&mut server_stream).await;
+            }
+            opcode
+        };
+        let (result, opcode) = tokio::join!(client, server);
+        (result, opcode)
+    }
+
+    enum PlistFixtureReply {
+        Value(plist::Value),
+        Incomplete,
+    }
+
+    async fn run_installation_proxy_fixture(
+        reply: PlistFixtureReply,
+    ) -> (
+        Result<std::collections::HashMap<String, plist::Value>, idevice::IdeviceError>,
+        plist::Dictionary,
+    ) {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let client = async move {
+            let mut client =
+                <InstallationProxyClient as RsdService>::from_stream(Box::new(client_stream))
+                    .await?;
+            client.get_apps(Some("User"), None).await
+        };
+        let server = async move {
+            serve_rsd_checkin(&mut server_stream).await;
+            let request = read_framed_plist(&mut server_stream).await;
+            match reply {
+                PlistFixtureReply::Value(value) => {
+                    write_framed_plist(&mut server_stream, value).await;
+                    assert_stream_closed_after_one_query(&mut server_stream).await;
+                }
+                PlistFixtureReply::Incomplete => {
+                    server_stream
+                        .write_all(&8_u32.to_be_bytes())
+                        .await
+                        .expect("write truncated plist length");
+                    server_stream
+                        .write_all(b"trunc")
+                        .await
+                        .expect("write truncated plist");
+                }
+            }
+            request
+        };
+        tokio::join!(client, server)
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestCloseOutcome {
+        Success,
+        Error,
+        Pending,
+    }
+
+    struct TestCloseProvider {
+        outcome: TestCloseOutcome,
+        close_calls: StdArc<AtomicUsize>,
+        drops: StdArc<AtomicUsize>,
+    }
+
+    impl ClosableRsdProvider for TestCloseProvider {
+        fn close_provider(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+            let outcome = self.outcome;
+            let close_calls = self.close_calls.clone();
+            async move {
+                close_calls.fetch_add(1, Ordering::SeqCst);
+                match outcome {
+                    TestCloseOutcome::Success => Ok(()),
+                    TestCloseOutcome::Error => {
+                        Err(std::io::Error::other("synthetic close failure"))
+                    }
+                    TestCloseOutcome::Pending => std::future::pending().await,
+                }
+            }
+        }
+    }
+
+    impl Drop for TestCloseProvider {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn test_remote_session(
+        outcome: TestCloseOutcome,
+        close_calls: StdArc<AtomicUsize>,
+        drops: StdArc<AtomicUsize>,
+    ) -> RemoteRsdSession<TestCloseProvider> {
+        RemoteRsdSession {
+            provider: Some(TestCloseProvider {
+                outcome,
+                close_calls,
+                drops,
+            }),
+            handshake: None,
+        }
     }
 
     fn temp_state_dir(name: &str) -> PathBuf {
@@ -2919,6 +3615,7 @@ mod tests {
         assert_eq!(
             summary.keys().map(String::as_str).collect::<BTreeSet<_>>(),
             [
+                "error_kind",
                 "message",
                 "operation",
                 "parsed_afc_present",
@@ -2928,8 +3625,9 @@ mod tests {
                 "parsed_installation_proxy_present",
                 "parsed_untrusted_tunnelservice_present",
                 "result",
-                "source",
+                "service",
                 "stage",
+                "transport",
             ]
             .into_iter()
             .collect()
@@ -2947,10 +3645,13 @@ mod tests {
             Some("service_summary")
         );
         assert_eq!(summary.get("result").map(String::as_str), Some("observed"));
+        assert_eq!(summary.get("transport").map(String::as_str), Some("rsd"));
         assert_eq!(
-            summary.get("source").map(String::as_str),
-            Some("parsed_rsd_services")
+            summary.get("service").map(String::as_str),
+            Some("appService")
         );
+        assert_eq!(summary.get("error_kind").map(String::as_str), Some("none"));
+        assert_eq!(events[0].target, "iphoneloadly_api::spike_diagnostics");
         for (field, expected) in [
             ("parsed_appservice_present", "false"),
             ("parsed_deviceinfo_present", "true"),
@@ -3632,5 +4333,362 @@ mod tests {
         let encoded = serde_json::to_string(&status).expect("serialize status");
         assert!(!encoded.contains(secret));
         assert!(!encoded.contains("rppairing_accept"));
+    }
+    #[test]
+    fn read_only_service_lookup_requires_exact_nonzero_entries() {
+        for (service_name, near_match) in [
+            (AFC_SERVICE_NAME, "com.apple.afc.shim.remote.unexpected"),
+            (
+                INSTALLATION_PROXY_SERVICE_NAME,
+                "com.apple.mobile.installation_proxy.shim.remote.unexpected",
+            ),
+        ] {
+            let mut handshake = test_rsd_handshake();
+            handshake
+                .services
+                .insert(near_match.to_owned(), test_rsd_service("", 62_000));
+            assert_eq!(exact_rsd_service_port(&handshake, service_name), None);
+
+            handshake
+                .services
+                .insert(service_name.to_owned(), test_rsd_service("", 0));
+            assert_eq!(exact_rsd_service_port(&handshake, service_name), None);
+
+            handshake
+                .services
+                .insert(service_name.to_owned(), test_rsd_service("", 62_001));
+            assert_eq!(
+                exact_rsd_service_port(&handshake, service_name),
+                Some(62_001)
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_probe_stages_are_static_and_service_specific() {
+        assert_eq!(
+            [
+                ReadOnlyProbeStage::Discovery.as_str(),
+                ReadOnlyProbeStage::ValidatePairing.as_str(),
+                ReadOnlyProbeStage::Tunnel.as_str(),
+                ReadOnlyProbeStage::RsdHandshake.as_str(),
+                ReadOnlyProbeStage::ServiceLookup.as_str(),
+                ReadOnlyProbeStage::ServiceConnect.as_str(),
+                ReadOnlyProbeStage::ClientInit.as_str(),
+                ReadOnlyProbeStage::AfcQuery.as_str(),
+                ReadOnlyProbeStage::AppLookup.as_str(),
+                ReadOnlyProbeStage::Cleanup.as_str(),
+            ],
+            [
+                "discovery",
+                "validatePairing",
+                "tunnel",
+                "rsdHandshake",
+                "serviceLookup",
+                "serviceConnect",
+                "clientInit",
+                "afcQuery",
+                "appLookup",
+                "cleanup",
+            ]
+        );
+    }
+    #[test]
+    fn read_only_probe_preserves_existing_setup_stages() {
+        for (setup, read_only) in [
+            (RsdProbeStage::Discovery, ReadOnlyProbeStage::Discovery),
+            (
+                RsdProbeStage::ValidatePairing,
+                ReadOnlyProbeStage::ValidatePairing,
+            ),
+            (RsdProbeStage::Tunnel, ReadOnlyProbeStage::Tunnel),
+            (
+                RsdProbeStage::RsdHandshake,
+                ReadOnlyProbeStage::RsdHandshake,
+            ),
+        ] {
+            assert_eq!(ReadOnlyProbeStage::from(setup), read_only);
+        }
+    }
+
+    #[tokio::test]
+    async fn afc_probe_performs_only_get_device_info_and_validates_fields() {
+        fn payload(fields: &[(&str, &str)]) -> Vec<u8> {
+            let mut payload = Vec::new();
+            for (key, value) in fields {
+                payload.extend_from_slice(key.as_bytes());
+                payload.push(0);
+                payload.extend_from_slice(value.as_bytes());
+                payload.push(0);
+            }
+            payload
+        }
+
+        let valid = payload(&[
+            ("Model", "iPhone17,1"),
+            ("FSTotalBytes", "1000"),
+            ("FSFreeBytes", "500"),
+            ("FSBlockSize", "4096"),
+        ]);
+        let (result, opcode) = run_afc_fixture(Some(valid)).await;
+        assert!(result.is_ok());
+        assert_eq!(opcode, idevice::afc::opcode::AfcOpcode::GetDevInfo as u64);
+
+        let missing = payload(&[
+            ("Model", "iPhone17,1"),
+            ("FSTotalBytes", "1000"),
+            ("FSFreeBytes", "500"),
+        ]);
+        assert!(run_afc_fixture(Some(missing)).await.0.is_err());
+
+        let invalid = payload(&[
+            ("Model", "iPhone17,1"),
+            ("FSTotalBytes", "not-a-number"),
+            ("FSFreeBytes", "500"),
+            ("FSBlockSize", "4096"),
+        ]);
+        assert!(run_afc_fixture(Some(invalid)).await.0.is_err());
+        assert!(run_afc_fixture(None).await.0.is_err());
+    }
+
+    #[tokio::test]
+    async fn installation_proxy_probe_uses_user_lookup_and_accepts_empty_result() {
+        fn response(lookup_result: plist::Value) -> plist::Value {
+            plist::Value::Dictionary(
+                [("LookupResult".to_owned(), lookup_result)]
+                    .into_iter()
+                    .collect(),
+            )
+        }
+
+        let empty = response(plist::Value::Dictionary(plist::Dictionary::new()));
+        let (result, request) =
+            run_installation_proxy_fixture(PlistFixtureReply::Value(empty)).await;
+        assert_eq!(result.expect("empty lookup result is valid").len(), 0);
+        assert_eq!(
+            request.get("Command").and_then(plist::Value::as_string),
+            Some("Lookup")
+        );
+        let options = request
+            .get("ClientOptions")
+            .and_then(plist::Value::as_dictionary)
+            .expect("lookup client options");
+        assert_eq!(
+            options
+                .get("ApplicationType")
+                .and_then(plist::Value::as_string),
+            Some("User")
+        );
+        assert!(!options.contains_key("BundleIDs"));
+
+        let nonempty = response(plist::Value::Dictionary(
+            [(
+                "com.example.application".to_owned(),
+                plist::Value::Dictionary(plist::Dictionary::new()),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        assert_eq!(
+            run_installation_proxy_fixture(PlistFixtureReply::Value(nonempty))
+                .await
+                .0
+                .expect("nonempty lookup result")
+                .len(),
+            1
+        );
+
+        let missing = plist::Value::Dictionary(plist::Dictionary::new());
+        assert!(
+            run_installation_proxy_fixture(PlistFixtureReply::Value(missing))
+                .await
+                .0
+                .is_err()
+        );
+        let wrong_type = response(plist::Value::String("not-a-dictionary".into()));
+        assert!(
+            run_installation_proxy_fixture(PlistFixtureReply::Value(wrong_type))
+                .await
+                .0
+                .is_err()
+        );
+        assert!(
+            run_installation_proxy_fixture(PlistFixtureReply::Incomplete)
+                .await
+                .0
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_step_timeouts_map_to_the_active_stage() {
+        for (service, stage) in [
+            (
+                ReadOnlyProbeService::Afc,
+                ReadOnlyProbeStage::ServiceConnect,
+            ),
+            (ReadOnlyProbeService::Afc, ReadOnlyProbeStage::ClientInit),
+            (ReadOnlyProbeService::Afc, ReadOnlyProbeStage::AfcQuery),
+            (
+                ReadOnlyProbeService::InstallationProxy,
+                ReadOnlyProbeStage::ServiceConnect,
+            ),
+            (
+                ReadOnlyProbeService::InstallationProxy,
+                ReadOnlyProbeStage::ClientInit,
+            ),
+            (
+                ReadOnlyProbeService::InstallationProxy,
+                ReadOnlyProbeStage::AppLookup,
+            ),
+        ] {
+            let failure = run_read_only_probe_step(
+                service,
+                stage,
+                stage.operation(),
+                Duration::from_millis(1),
+                std::future::pending::<Result<(), idevice::IdeviceError>>(),
+            )
+            .await
+            .expect_err("pending operation must time out");
+            assert_eq!(failure.stage, stage);
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_is_bounded_and_preserves_primary_failures() {
+        let close_calls = StdArc::new(AtomicUsize::new(0));
+        let drops = StdArc::new(AtomicUsize::new(0));
+        complete_read_only_probe_with_timeout(
+            ReadOnlyProbeService::Afc,
+            Ok(()),
+            test_remote_session(
+                TestCloseOutcome::Success,
+                close_calls.clone(),
+                drops.clone(),
+            ),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("successful cleanup");
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let cleanup_failure = complete_read_only_probe_with_timeout(
+            ReadOnlyProbeService::Afc,
+            Ok(()),
+            test_remote_session(TestCloseOutcome::Error, close_calls.clone(), drops.clone()),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("cleanup failure must be public");
+        assert_eq!(cleanup_failure.stage, ReadOnlyProbeStage::Cleanup);
+
+        let primary = ReadOnlyProbeFailure {
+            stage: ReadOnlyProbeStage::AfcQuery,
+        };
+        let preserved = complete_read_only_probe_with_timeout(
+            ReadOnlyProbeService::Afc,
+            Err(primary),
+            test_remote_session(TestCloseOutcome::Error, close_calls.clone(), drops.clone()),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("primary failure must win");
+        assert_eq!(preserved, primary);
+
+        let outer_timeout = timeout(
+            Duration::from_millis(1),
+            complete_read_only_probe_with_timeout(
+                ReadOnlyProbeService::Afc,
+                Err(primary),
+                test_remote_session(
+                    TestCloseOutcome::Pending,
+                    close_calls.clone(),
+                    drops.clone(),
+                ),
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+        assert!(outer_timeout.is_err());
+        assert_eq!(
+            read_only_endpoint_timeout_failure(
+                ReadOnlyProbeService::Afc,
+                ReadOnlyProbeStage::Cleanup,
+                Some(primary),
+            ),
+            primary
+        );
+
+        let timeout_failure = complete_read_only_probe_with_timeout(
+            ReadOnlyProbeService::InstallationProxy,
+            Ok(()),
+            test_remote_session(
+                TestCloseOutcome::Pending,
+                close_calls.clone(),
+                drops.clone(),
+            ),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("pending cleanup must time out");
+        assert_eq!(timeout_failure.stage, ReadOnlyProbeStage::Cleanup);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(drops.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_the_only_request_owned_provider() {
+        let close_calls = StdArc::new(AtomicUsize::new(0));
+        let drops = StdArc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(
+            test_remote_session(
+                TestCloseOutcome::Pending,
+                close_calls.clone(),
+                drops.clone(),
+            )
+            .close(),
+        );
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn approved_reporter_uses_only_bounded_static_fields() {
+        let secret = "device-controlled-secret";
+        let (_, events) = capture_events(|| {
+            read_only_probe_failure(
+                ReadOnlyProbeService::Afc,
+                ReadOnlyProbeStage::ClientInit,
+                "client_init",
+                "error",
+                "unexpected_response",
+            )
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target, SPIKE_DIAGNOSTICS_TARGET);
+        assert_eq!(
+            events[0]
+                .fields
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "error_kind",
+                "message",
+                "operation",
+                "result",
+                "service",
+                "stage",
+                "transport",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!format!("{:?}", events[0]).contains(secret));
     }
 }
