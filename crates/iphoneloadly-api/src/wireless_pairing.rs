@@ -14,8 +14,8 @@ use idevice::{
     provider::RsdProvider,
     remote_pairing::{
         PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, PeerDevice,
-        RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
-        errors::RemotePairingError,
+        RemotePairingClient, RpPairingFile, RpPairingSocket, RpPairingSocketProvider,
+        connect_tls_psk_tunnel_native, errors::RemotePairingError,
     },
     services::{core_device::AppServiceClient, rsd::RsdHandshake},
     tcp::{adapter::Adapter, stream::AdapterStream},
@@ -267,6 +267,134 @@ struct PostPairCommitFailure {
 impl PostPairCommitFailure {
     const fn new(stage: &'static str, error_kind: &'static str) -> Self {
         Self { stage, error_kind }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstablishedPairingVerificationStage {
+    AttemptPairVerify,
+    ValidatePairing,
+}
+
+impl EstablishedPairingVerificationStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AttemptPairVerify => "attempt_pair_verify",
+            Self::ValidatePairing => "validate_pairing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EstablishedPairingVerificationFailure {
+    stage: EstablishedPairingVerificationStage,
+    result: &'static str,
+    error_kind: &'static str,
+    remote_pairing_subcode: Option<i32>,
+}
+
+impl EstablishedPairingVerificationFailure {
+    fn from_error(
+        stage: EstablishedPairingVerificationStage,
+        error: &idevice::IdeviceError,
+    ) -> Self {
+        Self {
+            stage,
+            result: "error",
+            error_kind: idevice_error_kind(error),
+            remote_pairing_subcode: remote_pairing_subcode(error),
+        }
+    }
+
+    const fn timeout(stage: EstablishedPairingVerificationStage) -> Self {
+        let error_kind = match stage {
+            EstablishedPairingVerificationStage::AttemptPairVerify => "attempt_pair_verify_timeout",
+            EstablishedPairingVerificationStage::ValidatePairing => "validate_pairing_timeout",
+        };
+        Self {
+            stage,
+            result: "timeout",
+            error_kind,
+            remote_pairing_subcode: None,
+        }
+    }
+
+    const fn expired(stage: EstablishedPairingVerificationStage) -> Self {
+        Self {
+            stage,
+            result: "timeout",
+            error_kind: "session_expired",
+            remote_pairing_subcode: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EstablishedPairingVerificationTiming {
+    Deadline(Instant),
+    PerStep(Duration),
+}
+
+impl EstablishedPairingVerificationTiming {
+    fn timeout_for(
+        self,
+        stage: EstablishedPairingVerificationStage,
+    ) -> Result<Duration, EstablishedPairingVerificationFailure> {
+        match self {
+            Self::Deadline(deadline) => {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REMOTE_CONNECT_TIMEOUT);
+                if remaining.is_zero() {
+                    Err(EstablishedPairingVerificationFailure::expired(stage))
+                } else {
+                    Ok(remaining)
+                }
+            }
+            Self::PerStep(duration) => Ok(duration),
+        }
+    }
+}
+
+async fn verify_established_pairing<R: RpPairingSocketProvider>(
+    client: &mut RemotePairingClient<R>,
+    pairing_file: &RpPairingFile,
+    timing: EstablishedPairingVerificationTiming,
+) -> Result<(), EstablishedPairingVerificationFailure> {
+    let attempt_stage = EstablishedPairingVerificationStage::AttemptPairVerify;
+    let attempt_timeout = timing.timeout_for(attempt_stage)?;
+    match timeout(attempt_timeout, client.attempt_pair_verify()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(EstablishedPairingVerificationFailure::from_error(
+                attempt_stage,
+                &error,
+            ));
+        }
+        Err(_) => {
+            return Err(EstablishedPairingVerificationFailure::timeout(
+                attempt_stage,
+            ));
+        }
+    }
+
+    let validation_stage = EstablishedPairingVerificationStage::ValidatePairing;
+    let validation_timeout = timing.timeout_for(validation_stage)?;
+    let mut verification_file = pairing_file.clone();
+    match timeout(
+        validation_timeout,
+        client.validate_pairing(&mut verification_file),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(EstablishedPairingVerificationFailure::from_error(
+            validation_stage,
+            &error,
+        )),
+        Err(_) => Err(EstablishedPairingVerificationFailure::timeout(
+            validation_stage,
+        )),
     }
 }
 
@@ -907,96 +1035,30 @@ async fn commit_remote_pairing_endpoints(
             };
 
             let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), SERVICE_NAME);
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .min(REMOTE_CONNECT_TIMEOUT);
-            if remaining.is_zero() {
-                return Err(post_pair_stage_failure(
-                    POST_PAIR_BOOTSTRAP_STAGE,
-                    "session_expired",
-                ));
-            }
-            match timeout(remaining, client.attempt_pair_verify()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    last_failure = post_pair_stage_failure(
-                        POST_PAIR_BOOTSTRAP_STAGE,
-                        idevice_error_kind(&error),
-                    );
-                    tracing::warn!(
-                        candidate_index,
-                        address_index,
-                        address_family,
-                        stage = POST_PAIR_BOOTSTRAP_STAGE,
-                        result = "error",
-                        operation = "attempt_pair_verify",
-                        error_kind = idevice_error_kind(&error),
-                        "remote pairing bootstrap verification failed"
-                    );
-                    continue;
+            if let Err(failure) = verify_established_pairing(
+                &mut client,
+                pairing_file,
+                EstablishedPairingVerificationTiming::Deadline(deadline),
+            )
+            .await
+            {
+                last_failure =
+                    post_pair_stage_failure(POST_PAIR_BOOTSTRAP_STAGE, failure.error_kind);
+                if failure.error_kind == "session_expired" {
+                    return Err(last_failure);
                 }
-                Err(_) => {
-                    last_failure = post_pair_stage_failure(
-                        POST_PAIR_BOOTSTRAP_STAGE,
-                        "attempt_pair_verify_timeout",
-                    );
-                    tracing::warn!(
-                        candidate_index,
-                        address_index,
-                        address_family,
-                        stage = POST_PAIR_BOOTSTRAP_STAGE,
-                        result = "timeout",
-                        operation = "attempt_pair_verify",
-                        "remote pairing bootstrap verification timed out"
-                    );
-                    continue;
-                }
-            }
-
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .min(REMOTE_CONNECT_TIMEOUT);
-            if remaining.is_zero() {
-                return Err(post_pair_stage_failure(
-                    POST_PAIR_BOOTSTRAP_STAGE,
-                    "session_expired",
-                ));
-            }
-            match timeout(remaining, client.validate_pairing(pairing_file)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    last_failure = post_pair_stage_failure(
-                        POST_PAIR_BOOTSTRAP_STAGE,
-                        idevice_error_kind(&error),
-                    );
-                    tracing::warn!(
-                        candidate_index,
-                        address_index,
-                        address_family,
-                        stage = POST_PAIR_BOOTSTRAP_STAGE,
-                        result = "error",
-                        operation = "validate_pairing",
-                        error_kind = idevice_error_kind(&error),
-                        "remote pairing bootstrap validation failed"
-                    );
-                    continue;
-                }
-                Err(_) => {
-                    last_failure = post_pair_stage_failure(
-                        POST_PAIR_BOOTSTRAP_STAGE,
-                        "validate_pairing_timeout",
-                    );
-                    tracing::warn!(
-                        candidate_index,
-                        address_index,
-                        address_family,
-                        stage = POST_PAIR_BOOTSTRAP_STAGE,
-                        result = "timeout",
-                        operation = "validate_pairing",
-                        "remote pairing bootstrap validation timed out"
-                    );
-                    continue;
-                }
+                tracing::warn!(
+                    candidate_index,
+                    address_index,
+                    address_family,
+                    stage = POST_PAIR_BOOTSTRAP_STAGE,
+                    operation = failure.stage.as_str(),
+                    result = failure.result,
+                    error_kind = failure.error_kind,
+                    remote_pairing_subcode = ?failure.remote_pairing_subcode,
+                    "remote pairing bootstrap verification failed"
+                );
+                continue;
             }
             tracing::info!(
                 candidate_index,
@@ -1385,41 +1447,14 @@ async fn commit_remote_pairing_endpoints(
                 );
 
                 let mut follow_up = RemotePairingClient::new(xpc, SERVICE_NAME);
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(REMOTE_CONNECT_TIMEOUT);
-                if remaining.is_zero() {
-                    return Err(post_pair_stage_failure(
-                        POST_PAIR_COMMIT_STAGE,
-                        "session_expired",
-                    ));
-                }
-                match timeout(remaining, follow_up.attempt_pair_verify()).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return Err(post_pair_stage_failure(
-                            POST_PAIR_COMMIT_STAGE,
-                            idevice_error_kind(&error),
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(post_pair_stage_failure(
-                            POST_PAIR_COMMIT_STAGE,
-                            "attempt_pair_verify_timeout",
-                        ));
-                    }
-                }
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(REMOTE_CONNECT_TIMEOUT);
-                if remaining.is_zero() {
-                    return Err(post_pair_stage_failure(
-                        POST_PAIR_COMMIT_STAGE,
-                        "session_expired",
-                    ));
-                }
-                match timeout(remaining, follow_up.validate_pairing(pairing_file)).await {
-                    Ok(Ok(())) => {
+                match verify_established_pairing(
+                    &mut follow_up,
+                    pairing_file,
+                    EstablishedPairingVerificationTiming::Deadline(deadline),
+                )
+                .await
+                {
+                    Ok(()) => {
                         tracing::info!(
                             candidate_index,
                             address_index,
@@ -1430,13 +1465,9 @@ async fn commit_remote_pairing_endpoints(
                         );
                         Ok(())
                     }
-                    Ok(Err(error)) => Err(post_pair_stage_failure(
+                    Err(failure) => Err(post_pair_stage_failure(
                         POST_PAIR_COMMIT_STAGE,
-                        idevice_error_kind(&error),
-                    )),
-                    Err(_) => Err(post_pair_stage_failure(
-                        POST_PAIR_COMMIT_STAGE,
-                        "validate_pairing_timeout",
+                        failure.error_kind,
                     )),
                 }
             }
@@ -1577,9 +1608,10 @@ async fn connect_and_validate_remote_pairing_with_timeout(
                         candidate_index,
                         address_index,
                         address_family,
-                        stage = "validate_pairing",
+                        stage = "tcp_connect",
                         result = "tcp_connect_error",
                         error_kind = io_error_kind(&error),
+                        os_error = ?error.raw_os_error(),
                         "remote pairing candidate TCP connection failed"
                     );
                     continue;
@@ -1589,7 +1621,7 @@ async fn connect_and_validate_remote_pairing_with_timeout(
                         candidate_index,
                         address_index,
                         address_family,
-                        stage = "validate_pairing",
+                        stage = "tcp_connect",
                         result = "tcp_connect_timeout",
                         "remote pairing candidate TCP connection timed out"
                     );
@@ -1598,39 +1630,34 @@ async fn connect_and_validate_remote_pairing_with_timeout(
             };
 
             let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), SERVICE_NAME);
-            let mut pairing_file = pairing_file.clone();
-            match timeout(timeout_duration, client.validate_pairing(&mut pairing_file)).await {
-                Ok(Ok(())) => {
+            match verify_established_pairing(
+                &mut client,
+                pairing_file,
+                EstablishedPairingVerificationTiming::PerStep(timeout_duration),
+            )
+            .await
+            {
+                Ok(()) => {
                     tracing::info!(
                         candidate_index,
                         address_index,
                         address_family,
                         stage = "validate_pairing",
                         result = "validate_pairing_success",
-                        "remote pairing validation succeeded"
+                        "remote pairing established verification succeeded"
                     );
                     return Ok((*address, client));
                 }
-                Ok(Err(error)) => {
+                Err(failure) => {
                     tracing::warn!(
                         candidate_index,
                         address_index,
                         address_family,
-                        stage = "validate_pairing",
-                        result = "validate_pairing_error",
-                        error_kind = idevice_error_kind(&error),
-                        remote_pairing_subcode = ?remote_pairing_subcode(&error),
-                        "remote pairing validation failed"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        candidate_index,
-                        address_index,
-                        address_family,
-                        stage = "validate_pairing",
-                        result = "validate_pairing_timeout",
-                        "remote pairing validation timed out"
+                        stage = failure.stage.as_str(),
+                        result = failure.result,
+                        error_kind = failure.error_kind,
+                        remote_pairing_subcode = ?failure.remote_pairing_subcode,
+                        "remote pairing established verification failed"
                     );
                 }
             }
@@ -2206,13 +2233,15 @@ mod tests {
     }
 
     #[test]
-    fn persistence_round_trip_is_encrypted_and_secret_free_on_disk() {
+    fn persistence_round_trip_preserves_verification_inputs_without_plaintext_secrets() {
         let dir = temp_state_dir("round-trip");
         let store = PairingStore::new(dir.clone());
-        let material = store
+        let mut material = store
             .load_or_create(SERVICE_NAME)
             .expect("create pairing state");
-        let secret = material.pairing_file.private_key_bytes();
+        material.pairing_file.alt_irk = Some(vec![0x42; 16]);
+        let private_key = material.pairing_file.private_key_bytes();
+        let public_key = material.pairing_file.public_key_bytes();
         store.save(&material).expect("persist pairing state");
         let reloaded = store
             .load_or_create(SERVICE_NAME)
@@ -2221,9 +2250,30 @@ mod tests {
             material.pairing_file.identifier(),
             reloaded.pairing_file.identifier()
         );
+        assert_eq!(
+            material.pairing_file.private_key_bytes(),
+            reloaded.pairing_file.private_key_bytes()
+        );
+        assert_eq!(
+            material.pairing_file.public_key_bytes(),
+            reloaded.pairing_file.public_key_bytes()
+        );
+        assert_eq!(
+            material.pairing_file.alt_irk(),
+            reloaded.pairing_file.alt_irk()
+        );
         assert_eq!(material.host_info.alt_irk, reloaded.host_info.alt_irk);
         let bytes = fs::read(dir.join(STATE_FILE)).expect("read encrypted state");
-        assert!(!bytes.windows(secret.len()).any(|window| window == secret));
+        assert!(
+            !bytes
+                .windows(private_key.len())
+                .any(|window| window == private_key)
+        );
+        assert!(
+            !bytes
+                .windows(public_key.len())
+                .any(|window| window == public_key)
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2532,156 +2582,388 @@ mod tests {
         assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
     }
 
-    #[tokio::test]
-    async fn validate_pairing_error_remains_public_validate_pairing() {
+    async fn read_pairing_frame(stream: &mut TcpStream) -> serde_json::Value {
+        let mut magic = [0u8; 9];
+        stream
+            .read_exact(&mut magic)
+            .await
+            .expect("read frame magic");
+        assert_eq!(magic, *b"RPPairing");
+        let mut length = [0u8; 2];
+        stream
+            .read_exact(&mut length)
+            .await
+            .expect("read frame length");
+        let mut payload = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        serde_json::from_slice(&payload).expect("decode pairing frame")
+    }
+
+    async fn write_pairing_frame(stream: &mut TcpStream, response: serde_json::Value) {
+        let payload = serde_json::to_vec(&response).expect("serialize pairing response");
+        stream
+            .write_all(b"RPPairing")
+            .await
+            .expect("write frame magic");
+        stream
+            .write_all(&(payload.len() as u16).to_be_bytes())
+            .await
+            .expect("write frame length");
+        stream
+            .write_all(&payload)
+            .await
+            .expect("write frame payload");
+        stream.flush().await.expect("flush pairing response");
+    }
+
+    fn assert_attempt_pair_verify_request(request: &serde_json::Value) {
+        assert_eq!(request["originatedBy"], "host");
+        assert_eq!(request["sequenceNumber"], 0);
+        assert_eq!(
+            request["message"]["plain"]["_0"]["request"]["_0"]["handshake"]["_0"]["hostOptions"]["attemptPairVerify"],
+            true
+        );
+        assert_eq!(
+            request["message"]["plain"]["_0"]["request"]["_0"]["handshake"]["_0"]["wireProtocolVersion"],
+            19
+        );
+    }
+
+    fn assert_validate_pairing_request(
+        request: &serde_json::Value,
+        sequence_number: u64,
+        start_new_session: bool,
+    ) {
+        assert_eq!(request["originatedBy"], "host");
+        assert_eq!(request["sequenceNumber"], sequence_number);
+        let pairing_data = &request["message"]["plain"]["_0"]["event"]["_0"]["pairingData"]["_0"];
+        assert_eq!(pairing_data["kind"], "verifyManualPairing");
+        assert_eq!(pairing_data["startNewSession"], start_new_session);
+        assert!(pairing_data["data"].as_str().is_some());
+    }
+
+    fn attempt_pair_verify_response() -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "plain": {
+                    "_0": {
+                        "response": {
+                            "_1": {
+                                "handshake": {
+                                    "_0": {
+                                        "wireProtocolVersion": 19
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "originatedBy": "device",
+            "sequenceNumber": 0
+        })
+    }
+
+    fn validation_response(tlv: Vec<u8>) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "plain": {
+                    "_0": {
+                        "event": {
+                            "_0": {
+                                "pairingData": {
+                                    "_0": {
+                                        "data": BASE64.encode(tlv)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "originatedBy": "device",
+            "sequenceNumber": 0
+        })
+    }
+
+    async fn serve_successful_established_verification(listener: TcpListener) -> Vec<&'static str> {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("accept verification connection");
+
+        let attempt = read_pairing_frame(&mut stream).await;
+        assert_attempt_pair_verify_request(&attempt);
+        write_pairing_frame(&mut stream, attempt_pair_verify_response()).await;
+
+        let validation_start = read_pairing_frame(&mut stream).await;
+        assert_validate_pairing_request(&validation_start, 1, true);
+        let mut peer_public_key = Vec::with_capacity(34);
+        peer_public_key.extend([0x03, 32]);
+        peer_public_key.extend([0u8; 32]);
+        write_pairing_frame(&mut stream, validation_response(peer_public_key)).await;
+
+        let validation_finish = read_pairing_frame(&mut stream).await;
+        assert_validate_pairing_request(&validation_finish, 2, false);
+        write_pairing_frame(&mut stream, validation_response(Vec::new())).await;
+
+        vec![
+            "attempt_pair_verify",
+            "validate_pairing_start",
+            "validate_pairing_finish",
+        ]
+    }
+
+    async fn spawn_successful_verification_peer()
+    -> (u16, tokio::task::JoinHandle<Vec<&'static str>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("bind validation listener");
+            .expect("bind verification listener");
         let port = listener
             .local_addr()
-            .expect("validation listener address")
+            .expect("verification listener address")
             .port();
-        let accept_task = tokio::spawn(async move {
-            let _ = listener
-                .accept()
-                .await
-                .expect("accept validation connection");
-        });
+        let server_task =
+            tokio::spawn(async move { serve_successful_established_verification(listener).await });
+        (port, server_task)
+    }
+
+    async fn successful_fresh_sequence(pairing_file: &RpPairingFile) -> Vec<&'static str> {
+        let (port, server_task) = spawn_successful_verification_peer().await;
+        let stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect fresh verification client");
+        let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), SERVICE_NAME);
+        let result = verify_established_pairing(
+            &mut client,
+            pairing_file,
+            EstablishedPairingVerificationTiming::Deadline(Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
+        assert!(result.is_ok());
+        server_task.await.expect("fresh verification server task")
+    }
+
+    async fn successful_restart_sequence(pairing_file: &RpPairingFile) -> Vec<&'static str> {
+        let (port, server_task) = spawn_successful_verification_peer().await;
         let endpoint = RemotePairingEndpoint {
             addresses: vec!["127.0.0.1".parse().expect("parse loopback")],
             port,
         };
-        let pairing_file = RpPairingFile::generate(SERVICE_NAME);
-        let failure = connect_and_validate_remote_pairing_with_timeout(
+        let result = connect_and_validate_remote_pairing_with_timeout(
             &[endpoint],
-            &pairing_file,
+            pairing_file,
             Duration::from_secs(1),
         )
-        .await
-        .expect_err("server without a protocol response must fail validation");
-        accept_task.await.expect("validation accept task");
-        assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
+        .await;
+        assert!(result.is_ok());
+        server_task.await.expect("restart verification server task")
     }
 
     #[tokio::test]
-    async fn validate_pairing_timeout_remains_public_validate_pairing() {
+    async fn attempt_rejection_prevents_validation_and_key_regeneration() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("bind validation listener");
+            .expect("bind rejection listener");
         let port = listener
             .local_addr()
-            .expect("validation listener address")
-            .port();
-        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
-        let accept_task = tokio::spawn(async move {
-            let (_stream, _) = listener
-                .accept()
-                .await
-                .expect("accept validation connection");
-            let _ = release_receiver.await;
-        });
-        let endpoint = RemotePairingEndpoint {
-            addresses: vec!["127.0.0.1".parse().expect("parse loopback")],
-            port,
-        };
-        let pairing_file = RpPairingFile::generate(SERVICE_NAME);
-        let failure = connect_and_validate_remote_pairing_with_timeout(
-            &[endpoint],
-            &pairing_file,
-            Duration::from_millis(250),
-        )
-        .await
-        .expect_err("silent validation server must time out");
-        let _ = release_sender.send(());
-        accept_task.await.expect("validation accept task");
-        assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
-    }
-
-    #[tokio::test]
-    async fn successful_validate_pairing_proceeds() {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind validation listener");
-        let port = listener
-            .local_addr()
-            .expect("validation listener address")
+            .expect("rejection listener address")
             .port();
         let server_task = tokio::spawn(async move {
             let (mut stream, _) = listener
                 .accept()
                 .await
-                .expect("accept validation connection");
-            for frame_index in 0..2 {
-                let mut magic = [0u8; 9];
-                stream
-                    .read_exact(&mut magic)
-                    .await
-                    .expect("read frame magic");
-                assert_eq!(magic, *b"RPPairing");
-                let mut length = [0u8; 2];
-                stream
-                    .read_exact(&mut length)
-                    .await
-                    .expect("read frame length");
-                let mut request = vec![0u8; u16::from_be_bytes(length) as usize];
-                stream
-                    .read_exact(&mut request)
-                    .await
-                    .expect("read frame payload");
-                let mut tlv = Vec::new();
-                if frame_index == 0 {
-                    tlv.extend([0x03, 32]);
-                    tlv.extend([0u8; 32]);
-                }
-                let response = serde_json::json!({
+                .expect("accept rejection connection");
+            let attempt = read_pairing_frame(&mut stream).await;
+            assert_attempt_pair_verify_request(&attempt);
+            write_pairing_frame(
+                &mut stream,
+                serde_json::json!({
                     "message": {
                         "plain": {
                             "_0": {
-                                "event": {
-                                    "_0": {
-                                        "pairingData": {
-                                            "_0": {
-                                                "data": BASE64.encode(tlv)
-                                            }
-                                        }
-                                    }
-                                }
+                                "response": {}
                             }
                         }
                     },
                     "originatedBy": "device",
                     "sequenceNumber": 0
-                });
-                let payload = serde_json::to_vec(&response).expect("serialize validation response");
-                stream
-                    .write_all(b"RPPairing")
-                    .await
-                    .expect("write frame magic");
-                stream
-                    .write_all(&(payload.len() as u16).to_be_bytes())
-                    .await
-                    .expect("write frame length");
-                stream
-                    .write_all(&payload)
-                    .await
-                    .expect("write frame payload");
-                stream.flush().await.expect("flush validation response");
+                }),
+            )
+            .await;
+            let mut next_byte = [0u8; 1];
+            match timeout(Duration::from_millis(100), stream.read(&mut next_byte)).await {
+                Err(_) | Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!("rejected prerequisite must not reach validation or tunneling"),
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         });
         let endpoint = RemotePairingEndpoint {
             addresses: vec!["127.0.0.1".parse().expect("parse loopback")],
             port,
         };
-        let pairing_file = RpPairingFile::generate(SERVICE_NAME);
-        let result = connect_and_validate_remote_pairing_with_timeout(
+        let mut pairing_file = RpPairingFile::generate(SERVICE_NAME);
+        pairing_file.alt_irk = Some(vec![0x11; 16]);
+        let identifier = pairing_file.identifier().to_owned();
+        let private_key = pairing_file.private_key_bytes();
+        let public_key = pairing_file.public_key_bytes();
+        let alt_irk = pairing_file.alt_irk().map(<[u8]>::to_vec);
+
+        let failure = connect_and_validate_remote_pairing_with_timeout(
             &[endpoint],
             &pairing_file,
             Duration::from_secs(1),
         )
-        .await;
-        server_task.await.expect("validation server task");
-        assert!(result.is_ok());
+        .await
+        .expect_err("rejected prerequisite must fail closed");
+
+        server_task.await.expect("rejection server task");
+        assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
+        assert_eq!(pairing_file.identifier(), identifier);
+        assert_eq!(pairing_file.private_key_bytes(), private_key);
+        assert_eq!(pairing_file.public_key_bytes(), public_key);
+        assert_eq!(pairing_file.alt_irk(), alt_irk.as_deref());
+    }
+
+    #[tokio::test]
+    async fn validation_rejection_does_not_fallback_to_pairing_or_tunneling() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind validation rejection listener");
+        let port = listener
+            .local_addr()
+            .expect("validation rejection listener address")
+            .port();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept validation rejection connection");
+            let attempt = read_pairing_frame(&mut stream).await;
+            assert_attempt_pair_verify_request(&attempt);
+            write_pairing_frame(&mut stream, attempt_pair_verify_response()).await;
+
+            let validation = read_pairing_frame(&mut stream).await;
+            assert_validate_pairing_request(&validation, 1, true);
+            write_pairing_frame(&mut stream, validation_response(Vec::new())).await;
+
+            let mut next_byte = [0u8; 1];
+            match timeout(Duration::from_millis(100), stream.read(&mut next_byte)).await {
+                Err(_) | Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => {
+                    panic!("failed validation must not reach pairing fallback or tunneling")
+                }
+            }
+        });
+        let endpoint = RemotePairingEndpoint {
+            addresses: vec!["127.0.0.1".parse().expect("parse loopback")],
+            port,
+        };
+        let mut pairing_file = RpPairingFile::generate(SERVICE_NAME);
+        pairing_file.alt_irk = Some(vec![0x44; 16]);
+        let identifier = pairing_file.identifier().to_owned();
+        let private_key = pairing_file.private_key_bytes();
+        let public_key = pairing_file.public_key_bytes();
+        let alt_irk = pairing_file.alt_irk().map(<[u8]>::to_vec);
+
+        let failure = connect_and_validate_remote_pairing_with_timeout(
+            &[endpoint],
+            &pairing_file,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("failed validation must fail closed");
+
+        server_task.await.expect("validation rejection server task");
+        assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
+        assert_eq!(pairing_file.identifier(), identifier);
+        assert_eq!(pairing_file.private_key_bytes(), private_key);
+        assert_eq!(pairing_file.public_key_bytes(), public_key);
+        assert_eq!(pairing_file.alt_irk(), alt_irk.as_deref());
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_prevents_validation_and_key_regeneration() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind timeout listener");
+        let port = listener
+            .local_addr()
+            .expect("timeout listener address")
+            .port();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept timeout connection");
+            let attempt = read_pairing_frame(&mut stream).await;
+            assert_attempt_pair_verify_request(&attempt);
+            let mut next_byte = [0u8; 1];
+            let read = timeout(Duration::from_millis(200), stream.read(&mut next_byte)).await;
+            assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))));
+        });
+        let endpoint = RemotePairingEndpoint {
+            addresses: vec!["127.0.0.1".parse().expect("parse loopback")],
+            port,
+        };
+        let mut pairing_file = RpPairingFile::generate(SERVICE_NAME);
+        pairing_file.alt_irk = Some(vec![0x22; 16]);
+        let identifier = pairing_file.identifier().to_owned();
+        let private_key = pairing_file.private_key_bytes();
+        let public_key = pairing_file.public_key_bytes();
+        let alt_irk = pairing_file.alt_irk().map(<[u8]>::to_vec);
+
+        let failure = connect_and_validate_remote_pairing_with_timeout(
+            &[endpoint],
+            &pairing_file,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("silent prerequisite must time out");
+
+        server_task.await.expect("timeout server task");
+        assert_eq!(failure.stage, RsdProbeStage::ValidatePairing);
+        assert_eq!(pairing_file.identifier(), identifier);
+        assert_eq!(pairing_file.private_key_bytes(), private_key);
+        assert_eq!(pairing_file.public_key_bytes(), public_key);
+        assert_eq!(pairing_file.alt_irk(), alt_irk.as_deref());
+    }
+
+    #[tokio::test]
+    async fn fresh_and_reloaded_pairing_use_identical_established_sequence() {
+        let mut fresh = RpPairingFile::generate(SERVICE_NAME);
+        fresh.alt_irk = Some(vec![0x33; 16]);
+        let reloaded = RpPairingFile::from_bytes(&fresh.to_bytes()).expect("reload pairing file");
+        assert_eq!(fresh.identifier(), reloaded.identifier());
+        assert_eq!(fresh.private_key_bytes(), reloaded.private_key_bytes());
+        assert_eq!(fresh.public_key_bytes(), reloaded.public_key_bytes());
+        assert_eq!(fresh.alt_irk(), reloaded.alt_irk());
+
+        let fresh_sequence = successful_fresh_sequence(&fresh).await;
+        let reloaded_sequence = successful_restart_sequence(&reloaded).await;
+
+        assert_eq!(
+            fresh_sequence,
+            vec![
+                "attempt_pair_verify",
+                "validate_pairing_start",
+                "validate_pairing_finish"
+            ]
+        );
+        assert_eq!(reloaded_sequence, fresh_sequence);
+    }
+
+    #[test]
+    fn established_verification_diagnostics_exclude_device_error_text() {
+        let secret = "device-supplied-secret-value";
+        let error = idevice::IdeviceError::UnexpectedResponse(secret.to_owned());
+        let failure = EstablishedPairingVerificationFailure::from_error(
+            EstablishedPairingVerificationStage::AttemptPairVerify,
+            &error,
+        );
+        let rendered = format!("{failure:?}");
+        assert_eq!(failure.stage.as_str(), "attempt_pair_verify");
+        assert_eq!(failure.result, "error");
+        assert!(!rendered.contains(secret));
     }
 
     #[tokio::test]
