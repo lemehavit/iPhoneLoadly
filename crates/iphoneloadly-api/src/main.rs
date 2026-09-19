@@ -588,24 +588,26 @@ mod tests {
     }
     #[test]
     fn rsd_probe_failure_response_is_non_secret() {
-        let value = serde_json::to_value(RsdProbeFailureResponse {
-            transport: "rsdCoreDevice",
-            status: "unavailable",
-            stage: "validatePairing",
-        })
-        .expect("serialize RSD probe failure response");
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "transport": "rsdCoreDevice",
-                "status": "unavailable",
-                "stage": "validatePairing",
+        for stage in ["validatePairing", "coreDeviceService"] {
+            let value = serde_json::to_value(RsdProbeFailureResponse {
+                transport: "rsdCoreDevice",
+                status: "unavailable",
+                stage,
             })
-        );
-        let encoded = value.to_string();
-        assert!(!encoded.contains("auth"));
-        assert!(!encoded.contains("key"));
-        assert!(!encoded.contains("secret"));
+            .expect("serialize RSD probe failure response");
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "transport": "rsdCoreDevice",
+                    "status": "unavailable",
+                    "stage": stage,
+                })
+            );
+            let encoded = value.to_string();
+            assert!(!encoded.contains("auth"));
+            assert!(!encoded.contains("key"));
+            assert!(!encoded.contains("secret"));
+        }
     }
 
     #[test]

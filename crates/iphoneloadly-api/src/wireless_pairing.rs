@@ -52,6 +52,7 @@ const POST_PAIR_RSD_STAGE: &str = "post_pair_rsd";
 const POST_PAIR_TUNNEL_SERVICE_STAGE: &str = "post_pair_tunnel_service";
 const POST_PAIR_COMMIT_STAGE: &str = "post_pair_commit";
 const TUNNEL_SERVICE_NAME: &str = "com.apple.internal.dt.coredevice.untrusted.tunnelservice";
+const CORE_DEVICE_APP_SERVICE_NAME: &str = "com.apple.coredevice.appservice";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsdProbeStage {
@@ -77,6 +78,66 @@ impl RsdProbeStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsdProbeFailure {
     pub stage: RsdProbeStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreDeviceServiceOperation {
+    ServiceLookup,
+    ServiceConnect,
+    ClientInit,
+    ListApps,
+}
+
+impl CoreDeviceServiceOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServiceLookup => "service_lookup",
+            Self::ServiceConnect => "service_connect",
+            Self::ClientInit => "client_init",
+            Self::ListApps => "list_apps",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoreDeviceServiceFailure {
+    operation: CoreDeviceServiceOperation,
+    result: &'static str,
+    error_kind: &'static str,
+    appservice_present: bool,
+}
+
+impl CoreDeviceServiceFailure {
+    const fn missing_service() -> Self {
+        Self {
+            operation: CoreDeviceServiceOperation::ServiceLookup,
+            result: "missing",
+            error_kind: "service_not_found",
+            appservice_present: false,
+        }
+    }
+
+    const fn timeout(operation: CoreDeviceServiceOperation, appservice_present: bool) -> Self {
+        Self {
+            operation,
+            result: "timeout",
+            error_kind: "timeout",
+            appservice_present,
+        }
+    }
+
+    fn from_error(
+        operation: CoreDeviceServiceOperation,
+        appservice_present: bool,
+        error: &idevice::IdeviceError,
+    ) -> Self {
+        Self {
+            operation,
+            result: "error",
+            error_kind: core_device_error_kind(error),
+            appservice_present,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,32 +662,32 @@ impl WirelessPairingService {
             .await
             .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?
             .map_err(|_| probe_failure(RsdProbeStage::RsdHandshake))?;
-        let app_port = handshake
-            .services
-            .get("com.apple.coredevice.appservice")
-            .map(|service| service.port)
-            .ok_or_else(|| probe_failure(RsdProbeStage::CoreDeviceService))?;
-        let app_stream = timeout(
+        let app_port =
+            core_device_appservice_port(&handshake).map_err(report_core_device_service_failure)?;
+        let app_stream = run_core_device_service_operation(
+            CoreDeviceServiceOperation::ServiceConnect,
+            true,
             REMOTE_CONNECT_TIMEOUT,
             provider.connect_to_service_port(app_port),
         )
         .await
-        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?
-        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?;
-        let mut app_service = timeout(
+        .map_err(report_core_device_service_failure)?;
+        let mut app_service = run_core_device_service_operation(
+            CoreDeviceServiceOperation::ClientInit,
+            true,
             REMOTE_CONNECT_TIMEOUT,
             AppServiceClient::<idevice::IdeviceSocket>::new(app_stream),
         )
         .await
-        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?
-        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?;
-        timeout(
+        .map_err(report_core_device_service_failure)?;
+        let _ = run_core_device_service_operation(
+            CoreDeviceServiceOperation::ListApps,
+            true,
             REMOTE_CONNECT_TIMEOUT,
             app_service.list_apps(false, false, false, false, false),
         )
         .await
-        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?
-        .map_err(|_| probe_failure(RsdProbeStage::CoreDeviceService))?;
+        .map_err(report_core_device_service_failure)?;
         let _ = provider.close().await;
         Ok(())
     }
@@ -933,6 +994,48 @@ impl WirelessPairingService {
 fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
     tracing::debug!(stage = stage.as_str(), "remote pairing RSD probe failed");
     RsdProbeFailure { stage }
+}
+
+fn core_device_appservice_port(handshake: &RsdHandshake) -> Result<u16, CoreDeviceServiceFailure> {
+    handshake
+        .services
+        .get(CORE_DEVICE_APP_SERVICE_NAME)
+        .map(|service| service.port)
+        .ok_or_else(CoreDeviceServiceFailure::missing_service)
+}
+
+async fn run_core_device_service_operation<T>(
+    operation: CoreDeviceServiceOperation,
+    appservice_present: bool,
+    timeout_duration: Duration,
+    future: impl Future<Output = Result<T, idevice::IdeviceError>>,
+) -> Result<T, CoreDeviceServiceFailure> {
+    match timeout(timeout_duration, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(CoreDeviceServiceFailure::from_error(
+            operation,
+            appservice_present,
+            &error,
+        )),
+        Err(_) => Err(CoreDeviceServiceFailure::timeout(
+            operation,
+            appservice_present,
+        )),
+    }
+}
+
+fn report_core_device_service_failure(failure: CoreDeviceServiceFailure) -> RsdProbeFailure {
+    tracing::warn!(
+        stage = RsdProbeStage::CoreDeviceService.as_str(),
+        operation = failure.operation.as_str(),
+        result = failure.result,
+        error_kind = failure.error_kind,
+        appservice_present = failure.appservice_present,
+        "remote pairing CoreDevice service probe failed"
+    );
+    RsdProbeFailure {
+        stage: RsdProbeStage::CoreDeviceService,
+    }
 }
 
 #[cfg(test)]
@@ -1685,6 +1788,16 @@ fn io_error_kind(error: &std::io::Error) -> &'static str {
 
 // UnexpectedResponse and PairingRejected can carry device text or payload-derived data.
 // Keep diagnostics to safe variant categories and the library-defined RemotePairing subcode.
+fn core_device_error_kind(error: &idevice::IdeviceError) -> &'static str {
+    match error {
+        idevice::IdeviceError::Socket(error) => io_error_kind(error),
+        idevice::IdeviceError::ServiceNotFound => "service_not_found",
+        idevice::IdeviceError::Xpc(_) => "xpc",
+        idevice::IdeviceError::CoreDevice(_) => "core_device",
+        _ => idevice_error_kind(error),
+    }
+}
+
 fn idevice_error_kind(error: &idevice::IdeviceError) -> &'static str {
     match error {
         idevice::IdeviceError::Socket(_) => "socket",
@@ -2539,6 +2652,111 @@ mod tests {
             .expect_err("empty pairing state must fail closed");
         assert_eq!(failure.stage, RsdProbeStage::Discovery);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn core_device_service_lookup_requires_exact_appservice_name() {
+        let mut handshake = RsdHandshake {
+            services: std::collections::HashMap::new(),
+            protocol_version: 0,
+            properties: std::collections::HashMap::new(),
+            uuid: String::new(),
+        };
+        handshake.services.insert(
+            format!("{CORE_DEVICE_APP_SERVICE_NAME}.unexpected"),
+            idevice::services::rsd::RsdService {
+                entitlement: String::new(),
+                port: 62_078,
+                uses_remote_xpc: true,
+                features: None,
+                service_version: None,
+            },
+        );
+
+        let missing = core_device_appservice_port(&handshake)
+            .expect_err("near-match must not satisfy exact AppService lookup");
+        assert_eq!(missing.operation, CoreDeviceServiceOperation::ServiceLookup);
+        assert_eq!(missing.operation.as_str(), "service_lookup");
+        assert_eq!(missing.result, "missing");
+        assert_eq!(missing.error_kind, "service_not_found");
+        assert!(!missing.appservice_present);
+
+        handshake.services.insert(
+            CORE_DEVICE_APP_SERVICE_NAME.to_owned(),
+            idevice::services::rsd::RsdService {
+                entitlement: String::new(),
+                port: 62_079,
+                uses_remote_xpc: true,
+                features: None,
+                service_version: None,
+            },
+        );
+        assert_eq!(
+            core_device_appservice_port(&handshake).expect("exact AppService name"),
+            62_079
+        );
+    }
+
+    #[tokio::test]
+    async fn core_device_service_failures_are_classified_and_secret_free() {
+        let connect_timeout = run_core_device_service_operation(
+            CoreDeviceServiceOperation::ServiceConnect,
+            true,
+            Duration::from_millis(1),
+            std::future::pending::<Result<(), idevice::IdeviceError>>(),
+        )
+        .await
+        .expect_err("pending service connection must time out");
+        assert_eq!(
+            connect_timeout.operation,
+            CoreDeviceServiceOperation::ServiceConnect
+        );
+        assert_eq!(connect_timeout.operation.as_str(), "service_connect");
+        assert_eq!(connect_timeout.result, "timeout");
+        assert_eq!(connect_timeout.error_kind, "timeout");
+        assert!(connect_timeout.appservice_present);
+
+        let secret = "device-controlled-secret";
+        let client_init = run_core_device_service_operation(
+            CoreDeviceServiceOperation::ClientInit,
+            true,
+            Duration::from_secs(1),
+            std::future::ready(Err::<(), _>(idevice::IdeviceError::UnexpectedResponse(
+                secret.to_owned(),
+            ))),
+        )
+        .await
+        .expect_err("client initialization error must fail closed");
+        assert_eq!(
+            client_init.operation,
+            CoreDeviceServiceOperation::ClientInit
+        );
+        assert_eq!(client_init.operation.as_str(), "client_init");
+        assert_eq!(client_init.result, "error");
+        assert_eq!(client_init.error_kind, "unexpected_response");
+
+        let list_error: idevice::IdeviceError =
+            idevice::services::core_device::CoreDeviceError::DeviceError(secret.to_owned()).into();
+        let list_apps = run_core_device_service_operation(
+            CoreDeviceServiceOperation::ListApps,
+            true,
+            Duration::from_secs(1),
+            std::future::ready(Err::<(), _>(list_error)),
+        )
+        .await
+        .expect_err("list_apps error must fail closed");
+        assert_eq!(list_apps.operation, CoreDeviceServiceOperation::ListApps);
+        assert_eq!(list_apps.operation.as_str(), "list_apps");
+        assert_eq!(list_apps.result, "error");
+        assert_eq!(list_apps.error_kind, "core_device");
+        assert!(list_apps.appservice_present);
+
+        let rendered = format!("{connect_timeout:?}{client_init:?}{list_apps:?}");
+        assert!(!rendered.contains(secret));
+        assert_eq!(
+            report_core_device_service_failure(list_apps).stage,
+            RsdProbeStage::CoreDeviceService
+        );
     }
 
     #[test]
