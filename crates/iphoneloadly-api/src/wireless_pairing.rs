@@ -1,6 +1,7 @@
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
+    collections::VecDeque,
     fmt::Display,
     fs, io,
     net::{IpAddr, SocketAddr},
@@ -12,7 +13,7 @@ use std::{
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use idevice::{
-    RemoteXpcClient, RsdService,
+    IdeviceError, RemoteXpcClient, RsdService,
     provider::RsdProvider,
     remote_pairing::{
         PAIRABLE_HOST_SERVICE_TYPE, PairableHost, PairableHostInfo, PeerDevice,
@@ -20,7 +21,15 @@ use idevice::{
         connect_tls_psk_tunnel_native, errors::RemotePairingError,
     },
     services::{
-        afc::AfcClient, core_device::AppServiceClient, installation_proxy::InstallationProxyClient,
+        afc::{
+            AfcClient, MAGIC,
+            errors::AfcError,
+            opcode::{AfcFopenMode, AfcOpcode},
+            packet::{AfcPacket, AfcPacketHeader},
+        },
+        core_device::AppServiceClient,
+        installation_proxy::{InstallationProxyClient, InstallationProxyError},
+        lockdown::LockdownClient,
         rsd::RsdHandshake,
     },
     tcp::{adapter::Adapter, handle::AdapterHandle, stream::AdapterStream},
@@ -31,6 +40,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     sync::Mutex,
     task::AbortHandle,
@@ -64,6 +74,7 @@ const CORE_DEVICE_INFO_SERVICE_NAME: &str = "com.apple.coredevice.deviceinfo";
 const MOBILE_IMAGE_MOUNTER_SERVICE_NAME: &str = "com.apple.mobile.mobile_image_mounter.shim.remote";
 const INSTALLATION_PROXY_SERVICE_NAME: &str = "com.apple.mobile.installation_proxy.shim.remote";
 const AFC_SERVICE_NAME: &str = "com.apple.afc.shim.remote";
+const LOCKDOWN_REMOTE_TRUSTED_SERVICE_NAME: &str = "com.apple.mobile.lockdown.remote.trusted";
 pub(crate) const SPIKE_DIAGNOSTICS_TARGET: &str = "iphoneloadly_api::spike_diagnostics";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +177,144 @@ pub(crate) struct ReadOnlyProbeFailure {
     pub(crate) stage: ReadOnlyProbeStage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RsdIdentityFailure {
+    HandshakeIdentity,
+    ServiceLookup,
+    ServiceConnect,
+    ClientInit,
+    LockdownIdentity,
+    DeviceName,
+    IdentityMismatch,
+}
+
+impl RsdIdentityFailure {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::HandshakeIdentity => "handshake_identity",
+            Self::ServiceLookup => "lockdown_service_lookup",
+            Self::ServiceConnect => "lockdown_service_connect",
+            Self::ClientInit => "lockdown_client_init",
+            Self::LockdownIdentity => "lockdown_identity",
+            Self::DeviceName => "device_name",
+            Self::IdentityMismatch => "identity_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RsdInstallOutcome {
+    NotStarted,
+    Installed,
+    NotInstalled,
+    OutcomeUnknown,
+}
+
+impl RsdInstallOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "notStarted",
+            Self::Installed => "installed",
+            Self::NotInstalled => "notInstalled",
+            Self::OutcomeUnknown => "outcomeUnknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RsdInstallStage {
+    Discovery,
+    ValidatePairing,
+    Tunnel,
+    RsdHandshake,
+    Identity,
+    AccountPreflight,
+    Signing,
+    AlreadyInstalled,
+    Staging,
+    Install,
+    Verification,
+    Cleanup,
+    SessionCleanup,
+    Complete,
+}
+
+impl RsdInstallStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::ValidatePairing => "validatePairing",
+            Self::Tunnel => "tunnel",
+            Self::RsdHandshake => "rsdHandshake",
+            Self::Identity => "identity",
+            Self::AccountPreflight => "accountPreflight",
+            Self::Signing => "signing",
+            Self::AlreadyInstalled => "alreadyInstalled",
+            Self::Staging => "staging",
+            Self::Install => "install",
+            Self::Verification => "verification",
+            Self::Cleanup => "cleanup",
+            Self::SessionCleanup => "sessionCleanup",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+impl From<RsdProbeStage> for RsdInstallStage {
+    fn from(value: RsdProbeStage) -> Self {
+        match value {
+            RsdProbeStage::Discovery => Self::Discovery,
+            RsdProbeStage::ValidatePairing => Self::ValidatePairing,
+            RsdProbeStage::Tunnel => Self::Tunnel,
+            RsdProbeStage::RsdHandshake => Self::RsdHandshake,
+            RsdProbeStage::CoreDeviceService => Self::RsdHandshake,
+        }
+    }
+}
+
+impl From<ReadOnlyProbeStage> for RsdInstallStage {
+    fn from(value: ReadOnlyProbeStage) -> Self {
+        match value {
+            ReadOnlyProbeStage::Discovery => Self::Discovery,
+            ReadOnlyProbeStage::ValidatePairing => Self::ValidatePairing,
+            ReadOnlyProbeStage::Tunnel => Self::Tunnel,
+            ReadOnlyProbeStage::RsdHandshake
+            | ReadOnlyProbeStage::ServiceLookup
+            | ReadOnlyProbeStage::ServiceConnect
+            | ReadOnlyProbeStage::ClientInit => Self::RsdHandshake,
+            ReadOnlyProbeStage::AfcQuery => Self::Staging,
+            ReadOnlyProbeStage::AppLookup => Self::AlreadyInstalled,
+            ReadOnlyProbeStage::Cleanup => Self::SessionCleanup,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RsdStagingCleanup {
+    NotNeeded,
+
+    Succeeded,
+    Failed,
+}
+
+impl RsdStagingCleanup {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "notNeeded",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+pub(crate) struct RsdInstallReport {
+    pub(crate) outcome: RsdInstallOutcome,
+    pub(crate) stage: RsdInstallStage,
+    pub(crate) cleanup: RsdStagingCleanup,
+    pub(crate) install_command_count: u8,
+    pub(crate) error_kind: &'static str,
+    pub(crate) bundle_id: Option<String>,
+    pub(crate) certificate_pressure: bool,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoreDeviceServiceOperation {
     ServiceLookup,
@@ -983,6 +1132,50 @@ impl WirelessPairingService {
         .await
     }
 
+    pub(crate) async fn install_remote_pairing_first_app(
+        &self,
+        signing: &crate::signing::AppleSigningProvider,
+        ipa_path: PathBuf,
+    ) -> RsdInstallReport {
+        let deadline = tokio::time::Instant::now() + RSD_INSTALL_TIMEOUT;
+        let mut current_stage = ReadOnlyProbeStage::Discovery;
+        let mut session = match tokio::time::timeout_at(
+            deadline,
+            RemoteRsdSession::open(self, Some(&mut current_stage)),
+        )
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(failure)) => {
+                return rsd_install_failure(
+                    RsdInstallStage::from(failure.stage),
+                    "session_open",
+                    false,
+                    None,
+                );
+            }
+            Err(_) => {
+                return rsd_install_failure(
+                    RsdInstallStage::from(current_stage),
+                    "timeout",
+                    false,
+                    None,
+                );
+            }
+        };
+
+        let mut report = execute_rsd_first_install(&mut session, signing, ipa_path, deadline).await;
+        if !matches!(
+            timeout(RSD_INSTALL_CLEANUP_TIMEOUT, session.close()).await,
+            Ok(Ok(()))
+        ) && report.error_kind.is_empty()
+        {
+            report.stage = RsdInstallStage::SessionCleanup;
+            report.error_kind = "session_cleanup";
+        }
+        report
+    }
+
     #[allow(dead_code)]
     fn load_pairing_material(&self) -> Result<StoredPairingMaterial, PairingError> {
         self.store.load_or_create(SERVICE_NAME)
@@ -1282,6 +1475,392 @@ impl WirelessPairingService {
     }
 }
 
+const RSD_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const RSD_INSTALL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const RSD_INSTALL_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
+const RSD_INSTALL_FILE_LIMIT: usize = 20_000;
+const RSD_INSTALL_BYTE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+const RSD_INSTALL_TRANSFER_CHUNK: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadPlanFailure {
+    SourceNotDirectory,
+    SourceSymlink,
+    UnsupportedFileType,
+    NonUnicodePath,
+    UnsafePath,
+    TooManyEntries,
+    TooManyBytes,
+    LocalIo,
+}
+
+impl UploadPlanFailure {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::SourceNotDirectory => "source_not_directory",
+            Self::SourceSymlink => "source_symlink",
+            Self::UnsupportedFileType => "unsupported_file_type",
+            Self::NonUnicodePath => "non_unicode_path",
+            Self::UnsafePath => "unsafe_path",
+            Self::TooManyEntries => "entry_limit",
+            Self::TooManyBytes => "byte_limit",
+            Self::LocalIo => "local_io",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+    version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadEntryKind {
+    Directory {
+        identity: FileIdentity,
+    },
+    File {
+        size: u64,
+        identity: FileIdentity,
+        digest: [u8; 32],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UploadEntry {
+    local_path: PathBuf,
+    remote_relative_path: String,
+    kind: UploadEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedBundleUploadPlan {
+    canonical_root: PathBuf,
+    entries: Vec<UploadEntry>,
+    byte_count: u64,
+}
+
+fn safe_remote_relative_path(path: &Path) -> Result<String, UploadPlanFailure> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(UploadPlanFailure::UnsafePath);
+        };
+        let Some(component) = component.to_str() else {
+            return Err(UploadPlanFailure::NonUnicodePath);
+        };
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains('/')
+            || component.contains('\\')
+            || component.contains('\0')
+        {
+            return Err(UploadPlanFailure::UnsafePath);
+        }
+        parts.push(component);
+    }
+    if parts.is_empty() {
+        return Err(UploadPlanFailure::UnsafePath);
+    }
+    Ok(parts.join("/"))
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+        version: (metadata.mtime() as u64).rotate_left(32) ^ metadata.mtime_nsec() as u64,
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+    Some(FileIdentity {
+        volume: metadata.creation_time(),
+        file: metadata.file_attributes() as u64,
+        version: metadata.last_write_time(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
+#[cfg(unix)]
+fn harden_signed_path(path: &Path, directory: bool) -> Result<(), UploadPlanFailure> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if directory { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|_| UploadPlanFailure::LocalIo)
+}
+
+#[cfg(not(unix))]
+fn harden_signed_path(_path: &Path, _directory: bool) -> Result<(), UploadPlanFailure> {
+    Ok(())
+}
+
+fn ensure_canonical_descendant(
+    path: &Path,
+    canonical_root: &Path,
+) -> Result<PathBuf, UploadPlanFailure> {
+    let canonical_path = fs::canonicalize(path).map_err(|_| UploadPlanFailure::LocalIo)?;
+    if canonical_path == canonical_root || canonical_path.starts_with(canonical_root) {
+        Ok(canonical_path)
+    } else {
+        Err(UploadPlanFailure::UnsafePath)
+    }
+}
+
+fn validate_upload_bounds(entry_count: usize, byte_count: u64) -> Result<(), UploadPlanFailure> {
+    if entry_count > RSD_INSTALL_FILE_LIMIT {
+        return Err(UploadPlanFailure::TooManyEntries);
+    }
+    if byte_count > RSD_INSTALL_BYTE_LIMIT {
+        return Err(UploadPlanFailure::TooManyBytes);
+    }
+    Ok(())
+}
+
+fn hash_planned_file(
+    path: &Path,
+    size: u64,
+    identity: FileIdentity,
+) -> Result<[u8; 32], UploadPlanFailure> {
+    let mut file = fs::File::open(path).map_err(|_| UploadPlanFailure::LocalIo)?;
+    let opened_metadata = file.metadata().map_err(|_| UploadPlanFailure::LocalIo)?;
+    if !opened_metadata.is_file()
+        || opened_metadata.len() != size
+        || file_identity(&opened_metadata) != Some(identity)
+    {
+        return Err(UploadPlanFailure::LocalIo);
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; RSD_INSTALL_TRANSFER_CHUNK];
+    loop {
+        let count =
+            std::io::Read::read(&mut file, &mut buffer).map_err(|_| UploadPlanFailure::LocalIo)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let final_metadata = file.metadata().map_err(|_| UploadPlanFailure::LocalIo)?;
+    if final_metadata.len() != size || file_identity(&final_metadata) != Some(identity) {
+        return Err(UploadPlanFailure::LocalIo);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn plan_signed_bundle(root: &Path) -> Result<SignedBundleUploadPlan, UploadPlanFailure> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| UploadPlanFailure::LocalIo)?;
+    if root_metadata.file_type().is_symlink() {
+        return Err(UploadPlanFailure::SourceSymlink);
+    }
+    if !root_metadata.is_dir() {
+        return Err(UploadPlanFailure::SourceNotDirectory);
+    }
+    harden_signed_path(root, true)?;
+    let canonical_root = fs::canonicalize(root).map_err(|_| UploadPlanFailure::LocalIo)?;
+
+    let mut pending = VecDeque::from([root.to_path_buf()]);
+    let mut entries = Vec::new();
+    let mut byte_count = 0_u64;
+    while let Some(directory) = pending.pop_front() {
+        let directory_metadata =
+            fs::symlink_metadata(&directory).map_err(|_| UploadPlanFailure::LocalIo)?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            return Err(UploadPlanFailure::SourceSymlink);
+        }
+        harden_signed_path(&directory, true)?;
+        ensure_canonical_descendant(&directory, &canonical_root)?;
+        let children = fs::read_dir(&directory).map_err(|_| UploadPlanFailure::LocalIo)?;
+        for child in children {
+            let child = child.map_err(|_| UploadPlanFailure::LocalIo)?;
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|_| UploadPlanFailure::LocalIo)?;
+            if metadata.file_type().is_symlink() {
+                return Err(UploadPlanFailure::SourceSymlink);
+            }
+            ensure_canonical_descendant(&path, &canonical_root)?;
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| UploadPlanFailure::UnsafePath)?;
+            let remote_relative_path = safe_remote_relative_path(relative)?;
+            let kind = if metadata.is_dir() {
+                harden_signed_path(&path, true)?;
+                let identity = file_identity(&metadata).ok_or(UploadPlanFailure::LocalIo)?;
+                pending.push_back(path.clone());
+                UploadEntryKind::Directory { identity }
+            } else if metadata.is_file() {
+                harden_signed_path(&path, false)?;
+                let size = metadata.len();
+                byte_count = byte_count
+                    .checked_add(size)
+                    .ok_or(UploadPlanFailure::TooManyBytes)?;
+                validate_upload_bounds(entries.len(), byte_count)?;
+                let identity = file_identity(&metadata).ok_or(UploadPlanFailure::LocalIo)?;
+                let digest = hash_planned_file(&path, size, identity)?;
+                UploadEntryKind::File {
+                    size,
+                    identity,
+                    digest,
+                }
+            } else {
+                return Err(UploadPlanFailure::UnsupportedFileType);
+            };
+            entries.push(UploadEntry {
+                local_path: path,
+                remote_relative_path,
+                kind,
+            });
+            validate_upload_bounds(entries.len(), byte_count)?;
+        }
+    }
+    entries.sort_by(|left, right| left.remote_relative_path.cmp(&right.remote_relative_path));
+    Ok(SignedBundleUploadPlan {
+        canonical_root,
+        entries,
+        byte_count,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskStagingPath {
+    root: String,
+    app: String,
+}
+
+impl TaskStagingPath {
+    fn new(task_id: Uuid) -> Self {
+        let root = format!("PublicStaging/iphoneloadly-spike-{task_id}");
+        let app = format!("{root}/Signed.app");
+        Self { root, app }
+    }
+
+    fn is_exact_task_root(&self, candidate: &str) -> bool {
+        candidate == self.root
+            && candidate
+                .strip_prefix("PublicStaging/iphoneloadly-spike-")
+                .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+    }
+}
+
+struct TaskAfcClient {
+    inner: AfcClient,
+    packet_number: u64,
+}
+
+impl TaskAfcClient {
+    fn new(inner: AfcClient) -> Self {
+        Self {
+            inner,
+            packet_number: 0,
+        }
+    }
+
+    async fn request(
+        &mut self,
+        operation: AfcOpcode,
+        header_payload: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<AfcPacket, IdeviceError> {
+        let header_payload_len = AfcPacketHeader::LEN + header_payload.len() as u64;
+        let packet = AfcPacket {
+            header: AfcPacketHeader {
+                magic: MAGIC,
+                entire_len: header_payload_len + payload.len() as u64,
+                header_payload_len,
+                packet_num: self.packet_number,
+                operation,
+            },
+            header_payload,
+            payload,
+        };
+        self.packet_number = self.packet_number.wrapping_add(1);
+        self.inner.send(packet).await?;
+        self.inner.read().await
+    }
+
+    async fn path_request(
+        &mut self,
+        operation: AfcOpcode,
+        path: &str,
+    ) -> Result<AfcPacket, IdeviceError> {
+        self.request(operation, path.as_bytes().to_vec(), Vec::new())
+            .await
+    }
+
+    async fn path_exists(&mut self, path: &str) -> Result<bool, IdeviceError> {
+        match self.path_request(AfcOpcode::GetFileInfo, path).await {
+            Ok(_) => Ok(true),
+            Err(IdeviceError::Afc(AfcError::ObjectNotFound)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn is_directory(&mut self, path: &str) -> Result<bool, IdeviceError> {
+        let response = self.path_request(AfcOpcode::GetFileInfo, path).await?;
+        let fields: Vec<&[u8]> = response
+            .payload
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .collect();
+        Ok(fields
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|pair| pair[0] == b"st_ifmt" && pair[1] == b"S_IFDIR"))
+    }
+
+    async fn make_directory(&mut self, path: &str) -> Result<(), IdeviceError> {
+        self.path_request(AfcOpcode::MakeDir, path).await?;
+        Ok(())
+    }
+
+    async fn remove_all(&mut self, path: &str) -> Result<(), IdeviceError> {
+        self.path_request(AfcOpcode::RemovePathAndContents, path)
+            .await?;
+        Ok(())
+    }
+
+    async fn open_for_write(&mut self, path: &str) -> Result<u64, IdeviceError> {
+        let mut header_payload = (AfcFopenMode::Wr as u64).to_le_bytes().to_vec();
+        header_payload.extend_from_slice(path.as_bytes());
+        let response = self
+            .request(AfcOpcode::FileOpen, header_payload, Vec::new())
+            .await?;
+        let descriptor = response.header_payload.get(..8).ok_or_else(|| {
+            IdeviceError::UnexpectedResponse("AFC FileOpen response was incomplete".into())
+        })?;
+        Ok(u64::from_le_bytes(descriptor.try_into().map_err(|_| {
+            IdeviceError::UnexpectedResponse("AFC FileOpen descriptor was invalid".into())
+        })?))
+    }
+
+    async fn write(&mut self, descriptor: u64, bytes: Vec<u8>) -> Result<(), IdeviceError> {
+        self.request(AfcOpcode::Write, descriptor.to_le_bytes().to_vec(), bytes)
+            .await?;
+        Ok(())
+    }
+
+    async fn close(&mut self, descriptor: u64) -> Result<(), IdeviceError> {
+        self.request(
+            AfcOpcode::FileClose,
+            descriptor.to_le_bytes().to_vec(),
+            Vec::new(),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 impl RemoteRsdSession<AdapterHandle> {
     async fn open(
         service: &WirelessPairingService,
@@ -1383,6 +1962,86 @@ impl RemoteRsdSession<AdapterHandle> {
             }
         }
     }
+
+    async fn verified_signing_identity(
+        &mut self,
+    ) -> Result<crate::signing::SigningDeviceIdentity, RsdIdentityFailure> {
+        let handshake_identity = self.handshake().properties.get("UniqueDeviceID").cloned();
+        let lockdown_port =
+            exact_rsd_service_port(self.handshake(), LOCKDOWN_REMOTE_TRUSTED_SERVICE_NAME)
+                .ok_or(RsdIdentityFailure::ServiceLookup)?;
+        let lockdown_stream = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            self.provider_mut().connect_to_service_port(lockdown_port),
+        )
+        .await
+        .map_err(|_| RsdIdentityFailure::ServiceConnect)?
+        .map_err(|_| RsdIdentityFailure::ServiceConnect)?;
+        let mut lockdown = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            <LockdownClient as RsdService>::from_stream(lockdown_stream),
+        )
+        .await
+        .map_err(|_| RsdIdentityFailure::ClientInit)?
+        .map_err(|_| RsdIdentityFailure::ClientInit)?;
+        let lockdown_identity = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            lockdown.get_value(Some("UniqueDeviceID"), None),
+        )
+        .await
+        .map_err(|_| RsdIdentityFailure::LockdownIdentity)?
+        .map_err(|_| RsdIdentityFailure::LockdownIdentity)?;
+        let device_name = timeout(
+            REMOTE_CONNECT_TIMEOUT,
+            lockdown.get_value(Some("DeviceName"), None),
+        )
+        .await
+        .map_err(|_| RsdIdentityFailure::DeviceName)?
+        .map_err(|_| RsdIdentityFailure::DeviceName)?;
+        validate_rsd_identity(
+            handshake_identity.as_ref(),
+            Some(&lockdown_identity),
+            Some(&device_name),
+        )
+    }
+
+    async fn task_afc_client(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<TaskAfcClient, ()> {
+        let port = exact_rsd_service_port(self.handshake(), AFC_SERVICE_NAME).ok_or(())?;
+        let stream =
+            tokio::time::timeout_at(deadline, self.provider_mut().connect_to_service_port(port))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+        let client =
+            tokio::time::timeout_at(deadline, <AfcClient as RsdService>::from_stream(stream))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+        Ok(TaskAfcClient::new(client))
+    }
+
+    async fn installation_proxy_client(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<InstallationProxyClient, ()> {
+        let service_name = InstallationProxyClient::rsd_service_name();
+        let port = exact_rsd_service_port(self.handshake(), service_name.as_ref()).ok_or(())?;
+        let stream =
+            tokio::time::timeout_at(deadline, self.provider_mut().connect_to_service_port(port))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+        tokio::time::timeout_at(
+            deadline,
+            <InstallationProxyClient as RsdService>::from_stream(stream),
+        )
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+    }
 }
 
 fn exact_rsd_service_port(handshake: &RsdHandshake, service_name: &str) -> Option<u16> {
@@ -1390,6 +2049,550 @@ fn exact_rsd_service_port(handshake: &RsdHandshake, service_name: &str) -> Optio
         .services
         .get(service_name)
         .and_then(|service| (service.port != 0).then_some(service.port))
+}
+
+fn validate_rsd_identity(
+    handshake_identity: Option<&plist::Value>,
+    lockdown_identity: Option<&plist::Value>,
+    device_name: Option<&plist::Value>,
+) -> Result<crate::signing::SigningDeviceIdentity, RsdIdentityFailure> {
+    let handshake_identity = handshake_identity
+        .and_then(plist::Value::as_string)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+        .ok_or(RsdIdentityFailure::HandshakeIdentity)?;
+    let lockdown_identity = lockdown_identity
+        .and_then(plist::Value::as_string)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+        .ok_or(RsdIdentityFailure::LockdownIdentity)?;
+    if handshake_identity != lockdown_identity {
+        return Err(RsdIdentityFailure::IdentityMismatch);
+    }
+    let device_name = device_name
+        .and_then(plist::Value::as_string)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+        .ok_or(RsdIdentityFailure::DeviceName)?;
+    crate::signing::SigningDeviceIdentity::new(device_name.to_owned(), lockdown_identity.to_owned())
+        .map_err(|_| RsdIdentityFailure::DeviceName)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SpikeInstallMutation {
+    Install {
+        package_path: String,
+        options: plist::Value,
+    },
+}
+
+fn installation_proxy_install_mutation(staging_app: &str) -> SpikeInstallMutation {
+    let mut options = plist::Dictionary::new();
+    options.insert(
+        "PackageType".into(),
+        plist::Value::String("Developer".into()),
+    );
+    SpikeInstallMutation::Install {
+        package_path: staging_app.to_owned(),
+        options: plist::Value::Dictionary(options),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallCommandFailure {
+    Definitive,
+    PossiblyAccepted,
+}
+
+async fn installed_bundle_lookup(
+    client: &mut InstallationProxyClient,
+    bundle_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, ()> {
+    let applications = tokio::time::timeout_at(
+        deadline,
+        client.get_apps(None, Some(vec![bundle_id.to_owned()])),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    Ok(applications.contains_key(bundle_id))
+}
+
+async fn send_one_install_command(
+    client: &mut InstallationProxyClient,
+    staging_app: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), InstallCommandFailure> {
+    let mutation = installation_proxy_install_mutation(staging_app);
+    let result = match mutation {
+        SpikeInstallMutation::Install {
+            package_path,
+            options,
+        } => tokio::time::timeout_at(deadline, client.install(package_path, Some(options))).await,
+    };
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(IdeviceError::InstallationProxy(InstallationProxyError::OperationFailed(_)))) => {
+            Err(InstallCommandFailure::Definitive)
+        }
+        Ok(Err(_)) | Err(_) => Err(InstallCommandFailure::PossiblyAccepted),
+    }
+}
+
+fn outcome_after_install_failure(
+    failure: InstallCommandFailure,
+    lookup: Result<bool, ()>,
+) -> RsdInstallOutcome {
+    match (failure, lookup) {
+        (_, Ok(true)) => RsdInstallOutcome::Installed,
+        (InstallCommandFailure::Definitive, Ok(false) | Err(())) => RsdInstallOutcome::NotInstalled,
+        (InstallCommandFailure::PossiblyAccepted, Ok(false) | Err(())) => {
+            RsdInstallOutcome::OutcomeUnknown
+        }
+    }
+}
+fn open_verified_upload_file(
+    path: &Path,
+    canonical_root: &Path,
+    size: u64,
+    identity: FileIdentity,
+) -> Result<fs::File, &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "source_changed")?;
+    ensure_canonical_descendant(path, canonical_root).map_err(|_| "source_changed")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != size
+        || file_identity(&metadata) != Some(identity)
+    {
+        return Err("source_changed");
+    }
+    let file = fs::File::open(path).map_err(|_| "source_changed")?;
+    let opened_metadata = file.metadata().map_err(|_| "source_changed")?;
+    if !opened_metadata.is_file()
+        || opened_metadata.len() != size
+        || file_identity(&opened_metadata) != Some(identity)
+    {
+        return Err("source_changed");
+    }
+    Ok(file)
+}
+
+async fn stage_signed_bundle(
+    client: &mut TaskAfcClient,
+    staging: &TaskStagingPath,
+    plan: &SignedBundleUploadPlan,
+    root_created: &mut bool,
+) -> Result<(), &'static str> {
+    if !client
+        .is_directory("PublicStaging")
+        .await
+        .map_err(|_| "public_staging_query")?
+    {
+        return Err("public_staging_invalid");
+    }
+    if client
+        .path_exists(&staging.root)
+        .await
+        .map_err(|_| "staging_precheck")?
+    {
+        return Err("staging_root_exists");
+    }
+    *root_created = true;
+    client
+        .make_directory(&staging.root)
+        .await
+        .map_err(|_| "staging_root_create")?;
+    client
+        .make_directory(&staging.app)
+        .await
+        .map_err(|_| "staging_app_create")?;
+
+    for entry in &plan.entries {
+        let remote_path = format!("{}/{}", staging.app, entry.remote_relative_path);
+        match entry.kind {
+            UploadEntryKind::Directory { identity } => {
+                let metadata =
+                    fs::symlink_metadata(&entry.local_path).map_err(|_| "source_changed")?;
+                ensure_canonical_descendant(&entry.local_path, &plan.canonical_root)
+                    .map_err(|_| "source_changed")?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || file_identity(&metadata) != Some(identity)
+                {
+                    return Err("source_changed");
+                }
+                client
+                    .make_directory(&remote_path)
+                    .await
+                    .map_err(|_| "staging_directory_create")?;
+            }
+            UploadEntryKind::File {
+                size,
+                identity,
+                digest,
+            } => {
+                let local_file = open_verified_upload_file(
+                    &entry.local_path,
+                    &plan.canonical_root,
+                    size,
+                    identity,
+                )?;
+                let descriptor = client
+                    .open_for_write(&remote_path)
+                    .await
+                    .map_err(|_| "staging_file_open")?;
+                let write_result = async {
+                    let mut file = tokio::fs::File::from_std(local_file);
+                    let mut written = 0_u64;
+                    let mut actual_digest = Sha256::new();
+                    let mut buffer = vec![0_u8; RSD_INSTALL_TRANSFER_CHUNK];
+                    loop {
+                        let count = file.read(&mut buffer).await.map_err(|_| "source_read")?;
+                        if count == 0 {
+                            break;
+                        }
+                        written = written.checked_add(count as u64).ok_or("source_changed")?;
+                        if written > size {
+                            return Err("source_changed");
+                        }
+                        actual_digest.update(&buffer[..count]);
+                        client
+                            .write(descriptor, buffer[..count].to_vec())
+                            .await
+                            .map_err(|_| "staging_file_write")?;
+                    }
+                    let final_metadata = file.metadata().await.map_err(|_| "source_changed")?;
+                    if written != size
+                        || final_metadata.len() != size
+                        || file_identity(&final_metadata) != Some(identity)
+                        || <[u8; 32]>::from(actual_digest.finalize()) != digest
+                    {
+                        return Err("source_changed");
+                    }
+                    Ok(())
+                }
+                .await;
+                let close_result = client.close(descriptor).await;
+                write_result?;
+                close_result.map_err(|_| "staging_file_close")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn clean_exact_task_staging(
+    session: &mut RemoteRsdSession<AdapterHandle>,
+    staging: &TaskStagingPath,
+    root_created: bool,
+) -> RsdStagingCleanup {
+    if !root_created {
+        return RsdStagingCleanup::NotNeeded;
+    }
+    if !staging.is_exact_task_root(&staging.root) {
+        return RsdStagingCleanup::Failed;
+    }
+    let deadline = tokio::time::Instant::now() + RSD_INSTALL_CLEANUP_TIMEOUT;
+    let mut client = match session.task_afc_client(deadline).await {
+        Ok(client) => client,
+        Err(()) => return RsdStagingCleanup::Failed,
+    };
+    match tokio::time::timeout_at(deadline, client.remove_all(&staging.root)).await {
+        Ok(Ok(())) => RsdStagingCleanup::Succeeded,
+        Ok(Err(IdeviceError::Afc(AfcError::ObjectNotFound))) => RsdStagingCleanup::Succeeded,
+        Ok(Err(_)) | Err(_) => RsdStagingCleanup::Failed,
+    }
+}
+
+fn rsd_install_failure(
+    stage: RsdInstallStage,
+    error_kind: &'static str,
+    certificate_pressure: bool,
+    bundle_id: Option<String>,
+) -> RsdInstallReport {
+    RsdInstallReport {
+        outcome: RsdInstallOutcome::NotStarted,
+        stage,
+        cleanup: RsdStagingCleanup::NotNeeded,
+        install_command_count: 0,
+        error_kind,
+        bundle_id,
+        certificate_pressure,
+    }
+}
+
+fn signing_error_kind(error: &crate::signing::SigningError) -> &'static str {
+    match error {
+        crate::signing::SigningError::NotReady => "signing_not_ready",
+        crate::signing::SigningError::DeviceRegistrationRequired => "device_registration_required",
+        crate::signing::SigningError::DeveloperTeamFailed => "account_preflight",
+        crate::signing::SigningError::SignedMetadataFailed => "signed_metadata",
+        _ => "signing_failed",
+    }
+}
+
+async fn execute_rsd_first_install(
+    session: &mut RemoteRsdSession<AdapterHandle>,
+    signing: &crate::signing::AppleSigningProvider,
+    ipa_path: PathBuf,
+    deadline: tokio::time::Instant,
+) -> RsdInstallReport {
+    let identity =
+        match tokio::time::timeout_at(deadline, session.verified_signing_identity()).await {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(failure)) => {
+                return rsd_install_failure(RsdInstallStage::Identity, failure.kind(), false, None);
+            }
+            Err(_) => {
+                return rsd_install_failure(RsdInstallStage::Identity, "timeout", false, None);
+            }
+        };
+    let preflight = match tokio::time::timeout_at(deadline, signing.account_preflight(&identity))
+        .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => {
+            return rsd_install_failure(
+                RsdInstallStage::AccountPreflight,
+                signing_error_kind(&error),
+                false,
+                None,
+            );
+        }
+        Err(_) => {
+            return rsd_install_failure(RsdInstallStage::AccountPreflight, "timeout", false, None);
+        }
+    };
+    let certificate_pressure = preflight
+        .development_certificate_capacity
+        .is_some_and(|capacity| preflight.development_certificate_count >= capacity)
+        && !preflight.machine_certificate_present;
+    if preflight.device_registration == crate::signing::DeviceRegistrationState::NewRequired {
+        return rsd_install_failure(
+            RsdInstallStage::AccountPreflight,
+            "device_registration_required",
+            certificate_pressure,
+            None,
+        );
+    }
+
+    let artifact = match tokio::time::timeout_at(
+        deadline,
+        signing.sign_for_device(
+            &identity,
+            ipa_path,
+            crate::signing::DeviceRegistrationPolicy::RequireExisting,
+            |_| {},
+        ),
+    )
+    .await
+    {
+        Ok(Ok(artifact)) => artifact,
+        Ok(Err(error)) => {
+            return rsd_install_failure(
+                RsdInstallStage::Signing,
+                signing_error_kind(&error),
+                certificate_pressure,
+                None,
+            );
+        }
+        Err(_) => {
+            return rsd_install_failure(
+                RsdInstallStage::Signing,
+                "timeout",
+                certificate_pressure,
+                None,
+            );
+        }
+    };
+    let bundle_id = artifact.bundle_id().to_owned();
+
+    let mut installation_proxy = match session.installation_proxy_client(deadline).await {
+        Ok(client) => client,
+        Err(()) => {
+            return rsd_install_failure(
+                RsdInstallStage::AlreadyInstalled,
+                "installation_proxy",
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
+    };
+    match installed_bundle_lookup(&mut installation_proxy, &bundle_id, deadline).await {
+        Ok(true) => {
+            return rsd_install_failure(
+                RsdInstallStage::AlreadyInstalled,
+                "app_already_installed",
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
+        Ok(false) => {}
+        Err(()) => {
+            return rsd_install_failure(
+                RsdInstallStage::AlreadyInstalled,
+                "installed_app_lookup",
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
+    }
+    drop(installation_proxy);
+
+    let artifact_path = artifact.app_bundle_path().to_path_buf();
+    let plan = match tokio::task::spawn_blocking(move || plan_signed_bundle(&artifact_path)).await {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(failure)) => {
+            return rsd_install_failure(
+                RsdInstallStage::Staging,
+                failure.kind(),
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
+        Err(_) => {
+            return rsd_install_failure(
+                RsdInstallStage::Staging,
+                "local_task",
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return rsd_install_failure(
+            RsdInstallStage::Staging,
+            "timeout",
+            certificate_pressure,
+            Some(bundle_id),
+        );
+    }
+    let staging = TaskStagingPath::new(Uuid::new_v4());
+    let mut afc = match session.task_afc_client(deadline).await {
+        Ok(client) => client,
+        Err(()) => {
+            return rsd_install_failure(
+                RsdInstallStage::Staging,
+                "afc_service",
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
+    };
+    let mut root_created = false;
+    let staging_result = tokio::time::timeout_at(
+        deadline,
+        stage_signed_bundle(&mut afc, &staging, &plan, &mut root_created),
+    )
+    .await;
+    drop(afc);
+
+    let mut report = match staging_result {
+        Ok(Ok(())) => {
+            let verification_deadline = deadline
+                .checked_sub(RSD_INSTALL_CLEANUP_TIMEOUT)
+                .unwrap_or(deadline);
+            let install_deadline = verification_deadline
+                .checked_sub(RSD_INSTALL_VERIFICATION_TIMEOUT)
+                .unwrap_or(verification_deadline);
+            if tokio::time::Instant::now() >= install_deadline {
+                let mut report = rsd_install_failure(
+                    RsdInstallStage::Install,
+                    "timeout",
+                    certificate_pressure,
+                    Some(bundle_id.clone()),
+                );
+                report.outcome = RsdInstallOutcome::NotInstalled;
+                report.cleanup = clean_exact_task_staging(session, &staging, root_created).await;
+                return report;
+            }
+            let mut client = match session.installation_proxy_client(install_deadline).await {
+                Ok(client) => client,
+                Err(()) => {
+                    let mut report = rsd_install_failure(
+                        RsdInstallStage::Install,
+                        "installation_proxy",
+                        certificate_pressure,
+                        Some(bundle_id.clone()),
+                    );
+                    report.outcome = RsdInstallOutcome::NotInstalled;
+                    report.cleanup =
+                        clean_exact_task_staging(session, &staging, root_created).await;
+                    return report;
+                }
+            };
+            let install_result =
+                send_one_install_command(&mut client, &staging.app, install_deadline).await;
+            drop(client);
+            let mut report = RsdInstallReport {
+                outcome: RsdInstallOutcome::Installed,
+                stage: RsdInstallStage::Complete,
+                cleanup: RsdStagingCleanup::NotNeeded,
+                install_command_count: 1,
+                error_kind: "",
+                bundle_id: Some(bundle_id.clone()),
+                certificate_pressure,
+            };
+            if let Err(install_failure) = install_result {
+                let lookup = match session
+                    .installation_proxy_client(verification_deadline)
+                    .await
+                {
+                    Ok(mut verification_client) => {
+                        installed_bundle_lookup(
+                            &mut verification_client,
+                            &bundle_id,
+                            verification_deadline,
+                        )
+                        .await
+                    }
+                    Err(()) => Err(()),
+                };
+                report.outcome = outcome_after_install_failure(install_failure, lookup);
+                match report.outcome {
+                    RsdInstallOutcome::Installed => {
+                        report.stage = RsdInstallStage::Complete;
+                        report.error_kind = "";
+                    }
+                    RsdInstallOutcome::NotInstalled => {
+                        report.stage = RsdInstallStage::Verification;
+                        report.error_kind = "install_rejected";
+                    }
+                    RsdInstallOutcome::OutcomeUnknown => {
+                        report.stage = RsdInstallStage::Verification;
+                        report.error_kind = "install_result_ambiguous";
+                    }
+                    RsdInstallOutcome::NotStarted => unreachable!("install command was sent"),
+                }
+            }
+            report
+        }
+        Ok(Err(error_kind)) => {
+            let mut report = rsd_install_failure(
+                RsdInstallStage::Staging,
+                error_kind,
+                certificate_pressure,
+                Some(bundle_id.clone()),
+            );
+            report.outcome = RsdInstallOutcome::NotInstalled;
+            report
+        }
+        Err(_) => {
+            let mut report = rsd_install_failure(
+                RsdInstallStage::Staging,
+                "timeout",
+                certificate_pressure,
+                Some(bundle_id.clone()),
+            );
+            report.outcome = RsdInstallOutcome::NotInstalled;
+            report
+        }
+    };
+
+    report.cleanup = clean_exact_task_staging(session, &staging, root_created).await;
+    if report.cleanup == RsdStagingCleanup::Failed && report.error_kind.is_empty() {
+        report.stage = RsdInstallStage::Cleanup;
+        report.error_kind = "staging_cleanup";
+    }
+    report
 }
 
 fn read_only_probe_failure(
@@ -2804,6 +4007,173 @@ mod tests {
         let result = tracing::subscriber::with_default(subscriber, run);
         let captured = events.lock().expect("read captured tracing events").clone();
         (result, captured)
+    }
+
+    #[test]
+    fn rsd_identity_requires_matching_bounded_lockdown_values() {
+        let handshake = plist::Value::String("device-identity".into());
+        let lockdown = plist::Value::String("device-identity".into());
+        let name = plist::Value::String("Test iPhone".into());
+        assert!(validate_rsd_identity(Some(&handshake), Some(&lockdown), Some(&name)).is_ok());
+
+        assert_eq!(
+            validate_rsd_identity(None, Some(&lockdown), Some(&name)).err(),
+            Some(RsdIdentityFailure::HandshakeIdentity)
+        );
+        assert_eq!(
+            validate_rsd_identity(
+                Some(&handshake),
+                Some(&plist::Value::Integer(1_u64.into())),
+                Some(&name),
+            )
+            .err(),
+            Some(RsdIdentityFailure::LockdownIdentity)
+        );
+        assert_eq!(
+            validate_rsd_identity(
+                Some(&handshake),
+                Some(&plist::Value::String("other-device".into())),
+                Some(&name),
+            )
+            .err(),
+            Some(RsdIdentityFailure::IdentityMismatch)
+        );
+        assert_eq!(
+            validate_rsd_identity(
+                Some(&handshake),
+                Some(&lockdown),
+                Some(&plist::Value::String(String::new())),
+            )
+            .err(),
+            Some(RsdIdentityFailure::DeviceName)
+        );
+    }
+
+    #[test]
+    fn task_staging_path_is_fixed_unique_and_cleanup_scoped() {
+        let first =
+            TaskStagingPath::new(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let second =
+            TaskStagingPath::new(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        assert_eq!(
+            first.root,
+            "PublicStaging/iphoneloadly-spike-00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(first.app, format!("{}/Signed.app", first.root));
+        assert_ne!(first.root, second.root);
+        assert!(first.is_exact_task_root(&first.root));
+        assert!(!first.is_exact_task_root("PublicStaging"));
+        assert!(!first.is_exact_task_root("PublicStaging/iphoneloadly-spike-../../escape"));
+    }
+
+    #[test]
+    fn upload_paths_and_resource_bounds_reject_unsafe_or_oversized_trees() {
+        assert_eq!(
+            safe_remote_relative_path(Path::new("Frameworks/Library.dylib")).unwrap(),
+            "Frameworks/Library.dylib"
+        );
+        assert_eq!(
+            safe_remote_relative_path(Path::new("../escape")),
+            Err(UploadPlanFailure::UnsafePath)
+        );
+        assert!(validate_upload_bounds(RSD_INSTALL_FILE_LIMIT, RSD_INSTALL_BYTE_LIMIT).is_ok());
+        assert_eq!(
+            validate_upload_bounds(RSD_INSTALL_FILE_LIMIT + 1, 0),
+            Err(UploadPlanFailure::TooManyEntries)
+        );
+        assert_eq!(
+            validate_upload_bounds(0, RSD_INSTALL_BYTE_LIMIT + 1),
+            Err(UploadPlanFailure::TooManyBytes)
+        );
+    }
+
+    #[test]
+    fn upload_plan_rejects_a_replaced_file_before_follow_open() {
+        let root = temp_state_dir("upload-replacement").join("Signed.app");
+        fs::create_dir_all(&root).expect("create signed tree");
+        let executable = root.join("Executable");
+        fs::write(&executable, b"original").expect("write original file");
+        let plan = plan_signed_bundle(&root).expect("plan signed tree");
+        let entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.remote_relative_path == "Executable")
+            .expect("planned executable");
+        let UploadEntryKind::File { size, identity, .. } = entry.kind else {
+            panic!("executable must be a file");
+        };
+        assert!(
+            open_verified_upload_file(&entry.local_path, &plan.canonical_root, size, identity)
+                .is_ok()
+        );
+
+        fs::rename(&executable, root.join("Original")).expect("move original");
+        fs::write(&executable, b"replaced").expect("write replacement");
+        assert_eq!(
+            open_verified_upload_file(&entry.local_path, &plan.canonical_root, size, identity)
+                .err(),
+            Some("source_changed")
+        );
+        fs::remove_dir_all(root.parent().expect("test root")).expect("remove upload test tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_plan_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_state_dir("upload-symlink").join("Signed.app");
+        fs::create_dir_all(&root).expect("create signed tree");
+        fs::write(root.join("Target"), b"target").expect("write target");
+        symlink(root.join("Target"), root.join("Link")).expect("create symlink");
+        assert_eq!(
+            plan_signed_bundle(&root),
+            Err(UploadPlanFailure::SourceSymlink)
+        );
+        fs::remove_dir_all(root.parent().expect("test root")).expect("remove upload test tree");
+    }
+
+    #[test]
+    fn spike_install_mutation_is_install_only_and_developer_typed() {
+        let mutation =
+            installation_proxy_install_mutation("PublicStaging/iphoneloadly-spike-task/Signed.app");
+        let SpikeInstallMutation::Install {
+            package_path,
+            options,
+        } = mutation;
+        assert_eq!(
+            package_path,
+            "PublicStaging/iphoneloadly-spike-task/Signed.app"
+        );
+        assert_eq!(
+            options
+                .as_dictionary()
+                .and_then(|value| value.get("PackageType"))
+                .and_then(plist::Value::as_string),
+            Some("Developer")
+        );
+    }
+
+    #[test]
+    fn possible_install_acceptance_is_classified_without_retry() {
+        assert_eq!(
+            outcome_after_install_failure(InstallCommandFailure::PossiblyAccepted, Ok(true)),
+            RsdInstallOutcome::Installed
+        );
+        assert_eq!(
+            outcome_after_install_failure(InstallCommandFailure::PossiblyAccepted, Ok(false)),
+            RsdInstallOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            outcome_after_install_failure(InstallCommandFailure::PossiblyAccepted, Err(())),
+            RsdInstallOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            outcome_after_install_failure(InstallCommandFailure::Definitive, Ok(false)),
+            RsdInstallOutcome::NotInstalled
+        );
+        let failure = rsd_install_failure(RsdInstallStage::Install, "send_failed", false, None);
+        assert_eq!(failure.install_command_count, 0);
     }
 
     fn test_rsd_handshake() -> RsdHandshake {

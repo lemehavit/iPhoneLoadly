@@ -17,6 +17,7 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
@@ -39,6 +40,7 @@ pub(crate) struct AppState {
     pub(crate) apps_dir: PathBuf,
     pub(crate) database: Arc<Mutex<rusqlite::Connection>>,
     pub(crate) app_mutation: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) spike_install_mutation: Arc<tokio::sync::Mutex<()>>,
     pub(crate) source_sync: Arc<tokio::sync::Mutex<()>>,
     pub(crate) github: Arc<github::GitHubClient>,
 }
@@ -100,11 +102,36 @@ struct ReadOnlyProbeFailureResponse {
     stage: &'static str,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpikeRsdInstallRequest {
+    app_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpikeRsdInstallResponse {
+    transport: &'static str,
+    outcome: &'static str,
+    stage: &'static str,
+    cleanup: &'static str,
+    install_command_count: u8,
+    error_kind: Option<&'static str>,
+    bundle_id: Option<String>,
+    certificate_pressure: bool,
+}
+
 const SPIKE_AFC_PROBE_PATH: &str = "/api/spike/devices/{id}/afc-probe";
 const SPIKE_RSD_PROBE_PATH: &str = "/api/spike/remote-pairing/rsd-probe";
+
+enum SpikeInstallExecution {
+    AppNotFound,
+    Report(wireless_pairing::RsdInstallReport),
+}
 const SPIKE_REMOTE_AFC_PROBE_PATH: &str = "/api/spike/remote-pairing/afc-probe";
 const SPIKE_INSTALLATION_PROXY_PROBE_PATH: &str =
     "/api/spike/remote-pairing/installation-proxy-probe";
+const SPIKE_RSD_INSTALL_PATH: &str = "/api/spike/remote-pairing/install";
 
 fn spike_route_paths(spike_mode: bool) -> &'static [&'static str] {
     if spike_mode {
@@ -113,6 +140,7 @@ fn spike_route_paths(spike_mode: bool) -> &'static [&'static str] {
             SPIKE_RSD_PROBE_PATH,
             SPIKE_REMOTE_AFC_PROBE_PATH,
             SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+            SPIKE_RSD_INSTALL_PATH,
         ]
     } else {
         &[]
@@ -132,6 +160,10 @@ fn with_spike_routes(app: Router<AppState>, spike_mode: bool) -> Router<AppState
             .route(
                 SPIKE_INSTALLATION_PROXY_PROBE_PATH,
                 get(spike_remote_pairing_installation_proxy_probe),
+            )
+            .route(
+                SPIKE_RSD_INSTALL_PATH,
+                post(spike_remote_pairing_install).layer(DefaultBodyLimit::max(1024)),
             )
     }
 }
@@ -582,9 +614,10 @@ mod tests {
         AfcProbeResponse, AppState, DeviceSummary, DeviceTransport, InstalledAppSummary,
         ReadOnlyProbeFailureResponse, ReadOnlyProbeSuccessResponse, Router,
         RsdProbeFailureResponse, RsdProbeSuccessResponse, SPIKE_INSTALLATION_PROXY_PROBE_PATH,
-        SPIKE_REMOTE_AFC_PROBE_PATH, SPIKE_RSD_PROBE_PATH, StartAppleLoginRequest, StatusCode,
-        TransportError, device_id_for_udid, install_job_json, managed_app, operator_env_filter,
-        spike_route_paths, spike_target_allowed, with_spike_routes,
+        SPIKE_REMOTE_AFC_PROBE_PATH, SPIKE_RSD_INSTALL_PATH, SPIKE_RSD_PROBE_PATH,
+        StartAppleLoginRequest, StatusCode, TransportError, device_id_for_udid, install_job_json,
+        managed_app, operator_env_filter, spike_route_paths, spike_target_allowed,
+        with_spike_routes,
     };
     use crate::{
         github, signing, store,
@@ -747,6 +780,7 @@ mod tests {
                 apps_dir: root.join("apps"),
                 database: Arc::new(Mutex::new(database)),
                 app_mutation: Arc::new(tokio::sync::RwLock::new(())),
+                spike_install_mutation: Arc::new(tokio::sync::Mutex::new(())),
                 source_sync: Arc::new(tokio::sync::Mutex::new(())),
                 github: Arc::new(
                     github::GitHubClient::new(env!("CARGO_PKG_VERSION"))
@@ -950,6 +984,7 @@ mod tests {
             SPIKE_RSD_PROBE_PATH,
             SPIKE_REMOTE_AFC_PROBE_PATH,
             SPIKE_INSTALLATION_PROXY_PROBE_PATH,
+            SPIKE_RSD_INSTALL_PATH,
         ] {
             assert!(!spike_route_paths(false).contains(&path));
             assert!(spike_route_paths(true).contains(&path));
@@ -993,6 +1028,147 @@ mod tests {
                 .collect::<Vec<_>>(),
             [StatusCode::NOT_FOUND, StatusCode::NOT_FOUND]
         );
+    }
+
+    #[tokio::test]
+    async fn install_route_is_guarded_spike_only_and_resolves_server_app_id() {
+        let root =
+            std::env::temp_dir().join(format!("iphoneloadly-install-route-{}", Uuid::now_v7()));
+        let (state, wireless_pairing) = route_test_state(&root);
+        let install_admission = state.spike_install_mutation.clone();
+        let app_id = Uuid::now_v7();
+        let ipa_path = root.join("selected.ipa");
+        std::fs::write(&ipa_path, b"server-selected-ipa").expect("write server app");
+        store::insert_app(
+            &state.database.lock().expect("lock database"),
+            app_id,
+            "test-hash",
+            &ipa_path.to_string_lossy(),
+            19,
+            "com.example.selected",
+            "Selected",
+            Some("1"),
+        )
+        .expect("insert server app");
+        let app = with_spike_routes(Router::new(), true).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind install route listener");
+        let address = listener.local_addr().expect("install route address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve install route router");
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}{SPIKE_RSD_INSTALL_PATH}");
+
+        let missing_action = client
+            .post(&url)
+            .json(&serde_json::json!({"appId": app_id}))
+            .send()
+            .await
+            .expect("request without action header");
+        assert_eq!(missing_action.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-iphoneloadly-action", "1")
+            .body(vec![b'x'; 1025])
+            .send()
+            .await
+            .expect("request oversized install body");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let arbitrary_path = client
+            .post(&url)
+            .header("x-iphoneloadly-action", "1")
+            .json(&serde_json::json!({
+                "appId": app_id,
+                "ipaPath": "C:\\untrusted\\arbitrary.ipa"
+            }))
+            .send()
+            .await
+            .expect("request arbitrary path");
+        assert_eq!(arbitrary_path.status(), StatusCode::BAD_REQUEST);
+
+        let unknown_app = client
+            .post(&url)
+            .header("x-iphoneloadly-action", "1")
+            .json(&serde_json::json!({"appId": Uuid::now_v7()}))
+            .send()
+            .await
+            .expect("request unknown app");
+        assert_eq!(unknown_app.status(), StatusCode::NOT_FOUND);
+
+        let single_flight = install_admission
+            .clone()
+            .try_lock_owned()
+            .expect("reserve install single-flight");
+        let busy = client
+            .post(&url)
+            .header("x-iphoneloadly-action", "1")
+            .json(&serde_json::json!({"appId": app_id}))
+            .send()
+            .await
+            .expect("request busy install route");
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        drop(single_flight);
+
+        let selected_app = client
+            .post(&url)
+            .header("x-iphoneloadly-action", "1")
+            .json(&serde_json::json!({"appId": app_id}))
+            .send()
+            .await
+            .expect("request selected server app");
+        assert_eq!(selected_app.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            selected_app
+                .json::<serde_json::Value>()
+                .await
+                .expect("parse selected app response"),
+            serde_json::json!({
+                "transport": "rsd",
+                "outcome": "notStarted",
+                "stage": "discovery",
+                "cleanup": "notNeeded",
+                "installCommandCount": 0,
+                "errorKind": "session_open",
+                "bundleId": null,
+                "certificatePressure": false,
+            })
+        );
+        assert_eq!(wireless_pairing.probe_open_attempts(), 1);
+        server.abort();
+        let _ = server.await;
+
+        let (inactive_state, inactive_wireless_pairing) = route_test_state(&root.join("inactive"));
+        let inactive_app = with_spike_routes(Router::new(), false).with_state(inactive_state);
+        let inactive_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind inactive install route listener");
+        let inactive_address = inactive_listener
+            .local_addr()
+            .expect("inactive install route address");
+        let inactive_server = tokio::spawn(async move {
+            axum::serve(inactive_listener, inactive_app)
+                .await
+                .expect("serve inactive install router");
+        });
+        let inactive_response = client
+            .post(format!("http://{inactive_address}{SPIKE_RSD_INSTALL_PATH}"))
+            .header("x-iphoneloadly-action", "1")
+            .json(&serde_json::json!({"appId": app_id}))
+            .send()
+            .await
+            .expect("request inactive install route");
+        assert_eq!(inactive_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(inactive_wireless_pairing.probe_open_attempts(), 0);
+        inactive_server.abort();
+        let _ = inactive_server.await;
+        std::fs::remove_dir_all(root).expect("remove install route root");
     }
 
     #[test]
@@ -1505,6 +1681,138 @@ async fn spike_remote_pairing_installation_proxy_probe(
             .into_response(),
     }
 }
+
+async fn run_spike_remote_pairing_install(
+    state: AppState,
+    app_id: Uuid,
+    _single_flight: tokio::sync::OwnedMutexGuard<()>,
+) -> SpikeInstallExecution {
+    let _mutation = state.app_mutation.read().await;
+    let ipa_path = state
+        .database
+        .lock()
+        .map_err(|_| ())
+        .and_then(|database| store::app_path(&database, app_id).map_err(|_| ()))
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let Some(ipa_path) = ipa_path else {
+        return SpikeInstallExecution::AppNotFound;
+    };
+    SpikeInstallExecution::Report(
+        state
+            .wireless_pairing
+            .install_remote_pairing_first_app(&state.signing, ipa_path)
+            .await,
+    )
+}
+
+async fn spike_remote_pairing_install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if !sources::action_allowed(&headers) {
+        return sources::action_required();
+    }
+    if body.len() > 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"message":"Invalid installation request."})),
+        )
+            .into_response();
+    }
+    let request: SpikeRsdInstallRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message":"Invalid installation request."})),
+            )
+                .into_response();
+        }
+    };
+    let single_flight = match state.spike_install_mutation.clone().try_lock_owned() {
+        Ok(single_flight) => single_flight,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"message":"An RSD installation is already in progress."})),
+            )
+                .into_response();
+        }
+    };
+    let execution = match tokio::spawn(run_spike_remote_pairing_install(
+        state,
+        request.app_id,
+        single_flight,
+    ))
+    .await
+    {
+        Ok(execution) => execution,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message":"Installation request failed."})),
+            )
+                .into_response();
+        }
+    };
+    let report = match execution {
+        SpikeInstallExecution::AppNotFound => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"message":"Uploaded IPA was not found."})),
+            )
+                .into_response();
+        }
+        SpikeInstallExecution::Report(report) => report,
+    };
+    let status = if report.error_kind.is_empty() {
+        StatusCode::OK
+    } else if matches!(
+        report.error_kind,
+        "device_registration_required" | "app_already_installed" | "signing_not_ready"
+    ) {
+        StatusCode::CONFLICT
+    } else if report.outcome == wireless_pairing::RsdInstallOutcome::NotStarted {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    let result = if report.error_kind.is_empty() {
+        "ok"
+    } else {
+        "error"
+    };
+    tracing::warn!(
+        target: wireless_pairing::SPIKE_DIAGNOSTICS_TARGET,
+        transport = "rsd",
+        stage = report.stage.as_str(),
+        result,
+        error_kind = report.error_kind,
+        install_command_count = report.install_command_count,
+        cleanup = report.cleanup.as_str(),
+        certificate_pressure = report.certificate_pressure,
+        "remote pairing first-install spike completed"
+    );
+    (
+        status,
+        Json(SpikeRsdInstallResponse {
+            transport: "rsd",
+            outcome: report.outcome.as_str(),
+            stage: report.stage.as_str(),
+            cleanup: report.cleanup.as_str(),
+            install_command_count: report.install_command_count,
+            error_kind: (!report.error_kind.is_empty()).then_some(report.error_kind),
+            bundle_id: report.bundle_id,
+            certificate_pressure: report.certificate_pressure,
+        }),
+    )
+        .into_response()
+}
+
 async fn list_managed_installations(State(state): State<AppState>) -> impl IntoResponse {
     match state
         .database
@@ -2262,6 +2570,7 @@ async fn main() {
         apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
         app_mutation: Arc::new(tokio::sync::RwLock::new(())),
+        spike_install_mutation: Arc::new(tokio::sync::Mutex::new(())),
         source_sync: Arc::new(tokio::sync::Mutex::new(())),
         github: Arc::new(github),
     };

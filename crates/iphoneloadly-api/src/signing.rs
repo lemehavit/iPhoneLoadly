@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    path::PathBuf,
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +14,9 @@ use idevice::provider::TcpProvider;
 use isideload::{
     anisette::remote_v3::RemoteV3AnisetteProvider,
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
-    dev::{developer_session::DeveloperSession, devices::DevicesApi},
+    dev::{
+        certificates::CertificatesApi, developer_session::DeveloperSession, devices::DevicesApi,
+    },
     sideload::{
         SideloaderBuilder, builder::MaxCertsBehavior, install::install_app as install_signed_app,
         sideloader::Sideloader,
@@ -166,6 +168,8 @@ pub enum SigningError {
     DeviceInfoFailed,
     #[error("developer team lookup failed")]
     DeveloperTeamFailed,
+    #[error("device registration requires explicit authorization")]
+    DeviceRegistrationRequired,
     #[error("device registration failed")]
     DeviceRegistrationFailed,
     #[error("IPA signing failed")]
@@ -176,6 +180,284 @@ pub enum SigningError {
     DeviceInstallFailed,
     #[error("encrypted credential storage failed")]
     CredentialStorage,
+}
+
+pub struct SigningDeviceIdentity {
+    name: String,
+    udid: String,
+}
+
+impl SigningDeviceIdentity {
+    pub fn new(name: String, udid: String) -> Result<Self, SigningError> {
+        if name.trim().is_empty() || udid.trim().is_empty() || name.len() > 256 || udid.len() > 256
+        {
+            return Err(SigningError::DeviceInfoFailed);
+        }
+        Ok(Self { name, udid })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceRegistrationState {
+    AlreadyPresent,
+    NewRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceRegistrationPolicy {
+    RequireExisting,
+    Ensure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppleAccountPreflight {
+    pub device_registration: DeviceRegistrationState,
+    pub development_certificate_count: usize,
+    pub development_certificate_capacity: Option<usize>,
+    pub machine_certificate_present: bool,
+}
+
+pub struct SignedAppArtifact {
+    app_bundle_path: Option<PathBuf>,
+    cleanup_root: Option<PathBuf>,
+    bundle_id: String,
+}
+
+impl SignedAppArtifact {
+    pub fn app_bundle_path(&self) -> &Path {
+        self.app_bundle_path
+            .as_deref()
+            .expect("owned signed app path is present until drop")
+    }
+
+    pub fn bundle_id(&self) -> &str {
+        &self.bundle_id
+    }
+}
+
+impl Drop for SignedAppArtifact {
+    fn drop(&mut self) {
+        self.app_bundle_path.take();
+        if let Some(path) = self.cleanup_root.take() {
+            remove_signed_artifact_path(&path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restrict_signed_artifact_path(path: &Path, directory: bool) -> Result<(), SigningError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if directory { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|_| SigningError::SignedMetadataFailed)?;
+    let actual = std::fs::metadata(path)
+        .map_err(|_| SigningError::SignedMetadataFailed)?
+        .permissions()
+        .mode()
+        & 0o777;
+    (actual == mode)
+        .then_some(())
+        .ok_or(SigningError::SignedMetadataFailed)
+}
+
+#[cfg(not(unix))]
+fn restrict_signed_artifact_path(_path: &Path, _directory: bool) -> Result<(), SigningError> {
+    Ok(())
+}
+
+fn remove_signed_artifact_path(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        let _ = std::fs::remove_file(path);
+    } else if metadata.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(unix)]
+fn quarantine_signed_app(
+    source: &Path,
+    artifact_storage: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf), SigningError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let source_parent = source.parent().ok_or(SigningError::SignedMetadataFailed)?;
+    let parent_metadata =
+        std::fs::symlink_metadata(source_parent).map_err(|_| SigningError::SignedMetadataFailed)?;
+    let trusted_metadata = std::fs::symlink_metadata(artifact_storage)
+        .map_err(|_| SigningError::SignedMetadataFailed)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != trusted_metadata.uid()
+    {
+        return Err(SigningError::SignedMetadataFailed);
+    }
+    restrict_signed_artifact_path(source_parent, true)?;
+    let canonical_parent =
+        std::fs::canonicalize(source_parent).map_err(|_| SigningError::SignedMetadataFailed)?;
+    let quarantine = source_parent.join(format!(".iphoneloadly-owned-{}", Uuid::now_v7()));
+    std::fs::create_dir(&quarantine).map_err(|_| SigningError::SignedMetadataFailed)?;
+    restrict_signed_artifact_path(&quarantine, true)?;
+    let canonical_quarantine =
+        std::fs::canonicalize(&quarantine).map_err(|_| SigningError::SignedMetadataFailed)?;
+    if canonical_quarantine.parent() != Some(canonical_parent.as_path()) {
+        remove_signed_artifact_path(&quarantine);
+        return Err(SigningError::SignedMetadataFailed);
+    }
+    let owned_path = quarantine.join("Signed.app");
+    if std::fs::rename(source, &owned_path).is_err() {
+        remove_signed_artifact_path(&quarantine);
+        return Err(SigningError::SignedMetadataFailed);
+    }
+    Ok((owned_path, quarantine, canonical_quarantine))
+}
+
+#[cfg(not(unix))]
+fn quarantine_signed_app(
+    _source: &Path,
+    _artifact_storage: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf), SigningError> {
+    Err(SigningError::SignedMetadataFailed)
+}
+
+fn validate_private_signed_tree(root: &Path) -> Result<(), SigningError> {
+    const MAX_ENTRIES: usize = 20_000;
+    const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|_| SigningError::SignedMetadataFailed)?;
+    let mut pending = VecDeque::from([root.to_path_buf()]);
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    while let Some(directory) = pending.pop_front() {
+        for entry in std::fs::read_dir(directory).map_err(|_| SigningError::SignedMetadataFailed)? {
+            let entry = entry.map_err(|_| SigningError::SignedMetadataFailed)?;
+            entries = entries
+                .checked_add(1)
+                .filter(|count| *count <= MAX_ENTRIES)
+                .ok_or(SigningError::SignedMetadataFailed)?;
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|_| SigningError::SignedMetadataFailed)?;
+            if metadata.file_type().is_symlink() {
+                return Err(SigningError::SignedMetadataFailed);
+            }
+            let canonical_path =
+                std::fs::canonicalize(&path).map_err(|_| SigningError::SignedMetadataFailed)?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(SigningError::SignedMetadataFailed);
+            }
+            if metadata.is_dir() {
+                pending.push_back(path);
+            } else if metadata.is_file() {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .filter(|total| *total <= MAX_BYTES)
+                    .ok_or(SigningError::SignedMetadataFailed)?;
+            } else {
+                return Err(SigningError::SignedMetadataFailed);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_signed_app_inner(
+    source: &Path,
+    artifact_storage: &Path,
+    force_source_quarantine: bool,
+) -> Result<SignedAppArtifact, SigningError> {
+    let source_metadata =
+        std::fs::symlink_metadata(source).map_err(|_| SigningError::SignedMetadataFailed)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(SigningError::SignedMetadataFailed);
+    }
+    std::fs::create_dir_all(artifact_storage).map_err(|_| SigningError::SignedMetadataFailed)?;
+    let storage_metadata = std::fs::symlink_metadata(artifact_storage)
+        .map_err(|_| SigningError::SignedMetadataFailed)?;
+    if storage_metadata.file_type().is_symlink() || !storage_metadata.is_dir() {
+        return Err(SigningError::SignedMetadataFailed);
+    }
+    restrict_signed_artifact_path(artifact_storage, true)?;
+    let canonical_storage =
+        std::fs::canonicalize(artifact_storage).map_err(|_| SigningError::SignedMetadataFailed)?;
+    let direct_owned_path =
+        artifact_storage.join(format!("iphoneloadly-signed-{}.app", Uuid::now_v7()));
+    let direct_move = if force_source_quarantine {
+        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+    } else {
+        std::fs::rename(source, &direct_owned_path)
+    };
+    let (owned_path, cleanup_root, expected_parent) = match direct_move {
+        Ok(()) => (
+            direct_owned_path.clone(),
+            direct_owned_path,
+            canonical_storage,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            match quarantine_signed_app(source, artifact_storage) {
+                Ok((owned_path, cleanup_root, expected_parent)) => {
+                    (owned_path, cleanup_root, expected_parent)
+                }
+                Err(error) => {
+                    remove_signed_artifact_path(source);
+                    return Err(error);
+                }
+            }
+        }
+        Err(_) => {
+            remove_signed_artifact_path(source);
+            return Err(SigningError::SignedMetadataFailed);
+        }
+    };
+
+    let snapshot_result = (|| {
+        let owned_metadata = std::fs::symlink_metadata(&owned_path)
+            .map_err(|_| SigningError::SignedMetadataFailed)?;
+        if owned_metadata.file_type().is_symlink() || !owned_metadata.is_dir() {
+            return Err(SigningError::SignedMetadataFailed);
+        }
+        restrict_signed_artifact_path(&owned_path, true)?;
+        let canonical_owned =
+            std::fs::canonicalize(&owned_path).map_err(|_| SigningError::SignedMetadataFailed)?;
+        if canonical_owned.parent() != Some(expected_parent.as_path()) {
+            return Err(SigningError::SignedMetadataFailed);
+        }
+        validate_private_signed_tree(&owned_path)?;
+        let info_path = owned_path.join("Info.plist");
+        let info_metadata = std::fs::symlink_metadata(&info_path)
+            .map_err(|_| SigningError::SignedMetadataFailed)?;
+        if info_metadata.file_type().is_symlink() || !info_metadata.is_file() {
+            return Err(SigningError::SignedMetadataFailed);
+        }
+        let signed_info =
+            plist::Value::from_file(info_path).map_err(|_| SigningError::SignedMetadataFailed)?;
+        let bundle_id = signed_info
+            .as_dictionary()
+            .and_then(|info| info.get("CFBundleIdentifier"))
+            .and_then(plist::Value::as_string)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .map(str::to_owned)
+            .ok_or(SigningError::SignedMetadataFailed)?;
+        Ok(SignedAppArtifact {
+            app_bundle_path: Some(owned_path.clone()),
+            cleanup_root: Some(cleanup_root.clone()),
+            bundle_id,
+        })
+    })();
+    if snapshot_result.is_err() {
+        remove_signed_artifact_path(&cleanup_root);
+    }
+    snapshot_result
+}
+
+fn snapshot_signed_app(
+    source: &Path,
+    artifact_storage: &Path,
+) -> Result<SignedAppArtifact, SigningError> {
+    snapshot_signed_app_inner(source, artifact_storage, false)
 }
 
 impl AppleSigningProvider {
@@ -413,27 +695,98 @@ impl AppleSigningProvider {
         let attempt = attempt.ok_or(SigningError::UnknownSession)?;
         Ok(attempt.status().await)
     }
-    pub async fn install_ipa(
+    pub async fn account_preflight(
         &self,
-        provider: &TcpProvider,
-        ipa_path: std::path::PathBuf,
-        progress: impl Fn(u8) + Send + Sync + 'static,
-    ) -> Result<String, SigningError> {
+        identity: &SigningDeviceIdentity,
+    ) -> Result<AppleAccountPreflight, SigningError> {
         let mut sideloader = self.sideloader.lock().await;
         let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
-        let progress = Arc::new(progress);
-        let device = IdeviceInfo::from_device(provider)
-            .await
-            .map_err(|_| SigningError::DeviceInfoFailed)?;
         let team = sideloader
             .get_team()
             .await
             .map_err(|_| SigningError::DeveloperTeamFailed)?;
-        sideloader
+        let devices = sideloader
             .get_dev_session()
-            .ensure_device_registered(&team, &device.name, &device.udid, None)
+            .list_devices(&team, None)
             .await
-            .map_err(|_| SigningError::DeviceRegistrationFailed)?;
+            .map_err(|_| SigningError::DeveloperTeamFailed)?;
+        let device_registration = if devices
+            .iter()
+            .any(|device| device.device_number == identity.udid)
+        {
+            DeviceRegistrationState::AlreadyPresent
+        } else {
+            DeviceRegistrationState::NewRequired
+        };
+        let certificates = sideloader
+            .get_dev_session()
+            .list_ios_certs(&team)
+            .await
+            .map_err(|_| SigningError::DeveloperTeamFailed)?;
+        let development_certificate_capacity = certificates
+            .iter()
+            .filter_map(|certificate| {
+                certificate
+                    .certificate_type
+                    .as_ref()
+                    .and_then(|certificate_type| certificate_type.max_active_certs)
+            })
+            .filter_map(|capacity| usize::try_from(capacity).ok())
+            .max();
+        let active_certificates = certificates.iter().filter(|certificate| {
+            certificate.serial_number.is_some() && certificate.status.as_deref() != Some("Revoked")
+        });
+        let development_certificate_count = active_certificates.clone().count();
+        let machine_certificate_present = active_certificates
+            .into_iter()
+            .any(|certificate| certificate.machine_name.as_deref() == Some("iPhoneLoadly"));
+        Ok(AppleAccountPreflight {
+            device_registration,
+            development_certificate_count,
+            development_certificate_capacity,
+            machine_certificate_present,
+        })
+    }
+
+    pub async fn sign_for_device(
+        &self,
+        identity: &SigningDeviceIdentity,
+        ipa_path: PathBuf,
+        registration_policy: DeviceRegistrationPolicy,
+        progress: impl Fn(u8) + Send + Sync + 'static,
+    ) -> Result<SignedAppArtifact, SigningError> {
+        if !ipa_path.is_file() {
+            return Err(SigningError::IpaSigningFailed);
+        }
+        let mut sideloader = self.sideloader.lock().await;
+        let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
+        let team = sideloader
+            .get_team()
+            .await
+            .map_err(|_| SigningError::DeveloperTeamFailed)?;
+        match registration_policy {
+            DeviceRegistrationPolicy::RequireExisting => {
+                let devices = sideloader
+                    .get_dev_session()
+                    .list_devices(&team, None)
+                    .await
+                    .map_err(|_| SigningError::DeveloperTeamFailed)?;
+                if !devices
+                    .iter()
+                    .any(|device| device.device_number == identity.udid)
+                {
+                    return Err(SigningError::DeviceRegistrationRequired);
+                }
+            }
+            DeviceRegistrationPolicy::Ensure => {
+                sideloader
+                    .get_dev_session()
+                    .ensure_device_registered(&team, &identity.name, &identity.udid, None)
+                    .await
+                    .map_err(|_| SigningError::DeviceRegistrationFailed)?;
+            }
+        }
+        let progress = Arc::new(progress);
         let signing_progress = progress.clone();
         let (signed_app_path, _) = sideloader
             .sign_app(
@@ -447,18 +800,37 @@ impl AppleSigningProvider {
             )
             .await
             .map_err(|_| SigningError::IpaSigningFailed)?;
-        let signed_info = plist::Value::from_file(signed_app_path.join("Info.plist"))
-            .map_err(|_| SigningError::SignedMetadataFailed)?;
-        let installed_bundle_id = signed_info
-            .as_dictionary()
-            .and_then(|info| info.get("CFBundleIdentifier"))
-            .and_then(plist::Value::as_string)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or(SigningError::SignedMetadataFailed)?;
+        let artifact = snapshot_signed_app(
+            &signed_app_path,
+            &self.signing_storage_path.join("signed-artifacts"),
+        )?;
         progress(40);
+        Ok(artifact)
+    }
+
+    pub async fn install_ipa(
+        &self,
+        provider: &TcpProvider,
+        ipa_path: PathBuf,
+        progress: impl Fn(u8) + Send + Sync + 'static,
+    ) -> Result<String, SigningError> {
+        let device = IdeviceInfo::from_device(provider)
+            .await
+            .map_err(|_| SigningError::DeviceInfoFailed)?;
+        let identity = SigningDeviceIdentity::new(device.name, device.udid)?;
+        let progress = Arc::new(progress);
+        let signing_progress = progress.clone();
+        let artifact = self
+            .sign_for_device(
+                &identity,
+                ipa_path,
+                DeviceRegistrationPolicy::Ensure,
+                move |value| signing_progress(value),
+            )
+            .await?;
+        let installed_bundle_id = artifact.bundle_id().to_owned();
         let install_progress = progress.clone();
-        install_signed_app(provider, &signed_app_path, move |value| {
+        install_signed_app(provider, artifact.app_bundle_path(), move |value| {
             let percent = 40 + ((value.min(100) * 60) / 100) as u8;
             install_progress(percent);
         })
@@ -492,5 +864,143 @@ impl AppleSigningProvider {
             .ok_or(SigningError::UnknownSession)?
             .submit(response)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("iphoneloadly-signing-{name}-{}", Uuid::now_v7()))
+    }
+
+    #[test]
+    fn signed_artifact_owns_unique_bundle_and_removes_only_it_on_drop() {
+        let root = temp_directory("owned-artifact");
+        let source = root.join("Signed.app");
+        std::fs::create_dir_all(&source).expect("create signed app");
+        std::fs::write(
+            source.join("Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.example.signed</string>
+</dict></plist>"#,
+        )
+        .expect("write signed metadata");
+
+        let artifact = snapshot_signed_app(&source, &root.join("storage")).expect("own signed app");
+        let owned = artifact.app_bundle_path().to_path_buf();
+        assert_eq!(artifact.bundle_id(), "com.example.signed");
+        assert!(!source.exists());
+        assert!(owned.is_dir());
+        assert_eq!(owned.parent(), Some(root.join("storage").as_path()));
+
+        drop(artifact);
+        assert!(!owned.exists());
+        assert!(root.join("storage").is_dir());
+        assert!(root.is_dir());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_fallback_owns_and_cleans_the_source_filesystem_quarantine() {
+        let root = temp_directory("quarantine-artifact");
+        let source_parent = root.join("Payload");
+        let source = source_parent.join("Signed.app");
+        std::fs::create_dir_all(&source).expect("create signed app");
+        std::fs::write(
+            source.join("Info.plist"),
+            br#"<plist><dict>
+<key>CFBundleIdentifier</key><string>com.example.quarantined</string>
+</dict></plist>"#,
+        )
+        .expect("write signed metadata");
+
+        let artifact = snapshot_signed_app_inner(&source, &root.join("storage"), true)
+            .expect("own signed app through quarantine");
+        let owned = artifact.app_bundle_path().to_path_buf();
+        let quarantine = owned.parent().expect("quarantine parent").to_path_buf();
+        assert_eq!(artifact.bundle_id(), "com.example.quarantined");
+        assert_eq!(quarantine.parent(), Some(source_parent.as_path()));
+        assert!(!source.exists());
+
+        drop(artifact);
+        assert!(!quarantine.exists());
+        assert!(source_parent.is_dir());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_cross_device_fallback_fails_closed() {
+        let root = temp_directory("unsupported-quarantine-artifact");
+        let source = root.join("Payload").join("Signed.app");
+        std::fs::create_dir_all(&source).expect("create signed app");
+        std::fs::write(
+            source.join("Info.plist"),
+            br#"<plist><dict>
+<key>CFBundleIdentifier</key><string>com.example.unsupported</string>
+</dict></plist>"#,
+        )
+        .expect("write signed metadata");
+
+        assert!(snapshot_signed_app_inner(&source, &root.join("storage"), true).is_err());
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_fallback_cleans_quarantine_after_post_move_validation_failure() {
+        let root = temp_directory("invalid-quarantine-artifact");
+        let source_parent = root.join("Payload");
+        let source = source_parent.join("Signed.app");
+        std::fs::create_dir_all(&source).expect("create signed app");
+
+        assert!(snapshot_signed_app_inner(&source, &root.join("storage"), true).is_err());
+        assert!(!source.exists());
+        assert!(
+            std::fs::read_dir(&source_parent)
+                .expect("read source parent")
+                .next()
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn invalid_signed_metadata_removes_the_unowned_source_bundle() {
+        let root = temp_directory("invalid-artifact");
+        let source = root.join("Signed.app");
+        std::fs::create_dir_all(&source).expect("create signed app");
+
+        assert!(snapshot_signed_app(&source, &root.join("storage")).is_err());
+        assert!(!source.exists());
+        assert!(root.is_dir());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_snapshot_rejects_descendant_symlinks_before_metadata_read() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_directory("symlink-artifact");
+        let source = root.join("Signed.app");
+        let outside = root.join("outside.plist");
+        std::fs::create_dir_all(&source).expect("create signed app");
+        std::fs::write(
+            &outside,
+            br#"<plist><dict><key>CFBundleIdentifier</key><string>outside</string></dict></plist>"#,
+        )
+        .expect("write outside metadata");
+        symlink(&outside, source.join("Info.plist")).expect("link outside metadata");
+
+        assert!(snapshot_signed_app(&source, &root.join("storage")).is_err());
+        assert!(!source.exists());
+        assert!(outside.is_file());
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 }
