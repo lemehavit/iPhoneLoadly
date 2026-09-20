@@ -12,6 +12,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use idevice::provider::TcpProvider;
 use isideload::{
+    SideloadError,
     anisette::remote_v3::RemoteV3AnisetteProvider,
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
     dev::{
@@ -23,6 +24,7 @@ use isideload::{
     },
     util::{device::IdeviceInfo, fs_storage::FsStorage, storage::InMemoryStorage},
 };
+use rootcause::Report;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
@@ -36,6 +38,110 @@ pub enum LoginPhase {
     Ready,
     Failed,
 }
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthDiagnosticStage {
+    AnisetteInit,
+    AppleAccountLogin,
+    AppleAccountLoginTimeout,
+    DeveloperSession,
+}
+
+impl AuthDiagnosticStage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AnisetteInit => "ANISSETTE_INIT",
+            Self::AppleAccountLogin => "APPLE_ACCOUNT_LOGIN",
+            Self::AppleAccountLoginTimeout => "APPLE_ACCOUNT_LOGIN_TIMEOUT",
+            Self::DeveloperSession => "DEVELOPER_SESSION",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthNetworkClass {
+    AppleAuth,
+    Http,
+    Network,
+    Timeout,
+    Unknown,
+}
+
+impl AuthNetworkClass {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AppleAuth => "APPLE_AUTH",
+            Self::Http => "HTTP",
+            Self::Network => "NETWORK",
+            Self::Timeout => "TIMEOUT",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthFailureDiagnostic {
+    #[serde(rename = "AUTH_STAGE")]
+    pub auth_stage: AuthDiagnosticStage,
+    #[serde(rename = "HTTP_STATUS", skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(rename = "APPLE_AUTH_CODE", skip_serializing_if = "Option::is_none")]
+    pub apple_auth_code: Option<i64>,
+    #[serde(rename = "NETWORK_CLASS")]
+    pub network_class: AuthNetworkClass,
+    #[serde(rename = "TIMEOUT")]
+    pub timeout: bool,
+}
+
+impl AuthFailureDiagnostic {
+    fn unknown(auth_stage: AuthDiagnosticStage) -> Self {
+        Self {
+            auth_stage,
+            http_status: None,
+            apple_auth_code: None,
+            network_class: AuthNetworkClass::Unknown,
+            timeout: false,
+        }
+    }
+
+    fn timeout(auth_stage: AuthDiagnosticStage) -> Self {
+        Self {
+            auth_stage,
+            http_status: None,
+            apple_auth_code: None,
+            network_class: AuthNetworkClass::Timeout,
+            timeout: true,
+        }
+    }
+
+    fn from_report(auth_stage: AuthDiagnosticStage, report: &Report) -> Self {
+        let mut diagnostic = Self::unknown(auth_stage);
+        for context in report.as_ref().iter_reports() {
+            if let Some(error) = context.downcast_current_context::<SideloadError>() {
+                if let SideloadError::AuthWithMessage(code, _) = error {
+                    diagnostic.apple_auth_code = Some(*code);
+                    diagnostic.network_class = AuthNetworkClass::AppleAuth;
+                    diagnostic.timeout = false;
+                    return diagnostic;
+                }
+            }
+
+            if let Some(error) = context.downcast_current_context::<reqwest_013::Error>() {
+                if let Some(status) = error.status() {
+                    diagnostic.http_status = Some(status.as_u16());
+                    diagnostic.network_class = AuthNetworkClass::Http;
+                } else if error.is_timeout() && diagnostic.http_status.is_none() {
+                    diagnostic.network_class = AuthNetworkClass::Timeout;
+                    diagnostic.timeout = true;
+                } else if diagnostic.http_status.is_none() && !diagnostic.timeout {
+                    diagnostic.network_class = AuthNetworkClass::Network;
+                }
+            }
+        }
+        diagnostic
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +150,41 @@ pub struct LoginStatus {
     pub phase: LoginPhase,
     pub two_factor: Option<TwoFactorCallbackParams>,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<AuthFailureDiagnostic>,
+}
+
+fn log_auth_failure(diagnostic: &AuthFailureDiagnostic) {
+    match (diagnostic.http_status, diagnostic.apple_auth_code) {
+        (Some(http_status), Some(apple_auth_code)) => tracing::warn!(
+            AUTH_STAGE = diagnostic.auth_stage.as_str(),
+            HTTP_STATUS = http_status,
+            APPLE_AUTH_CODE = apple_auth_code,
+            NETWORK_CLASS = diagnostic.network_class.as_str(),
+            TIMEOUT = diagnostic.timeout,
+            "Apple authentication failed"
+        ),
+        (Some(http_status), None) => tracing::warn!(
+            AUTH_STAGE = diagnostic.auth_stage.as_str(),
+            HTTP_STATUS = http_status,
+            NETWORK_CLASS = diagnostic.network_class.as_str(),
+            TIMEOUT = diagnostic.timeout,
+            "Apple authentication failed"
+        ),
+        (None, Some(apple_auth_code)) => tracing::warn!(
+            AUTH_STAGE = diagnostic.auth_stage.as_str(),
+            APPLE_AUTH_CODE = apple_auth_code,
+            NETWORK_CLASS = diagnostic.network_class.as_str(),
+            TIMEOUT = diagnostic.timeout,
+            "Apple authentication failed"
+        ),
+        (None, None) => tracing::warn!(
+            AUTH_STAGE = diagnostic.auth_stage.as_str(),
+            NETWORK_CLASS = diagnostic.network_class.as_str(),
+            TIMEOUT = diagnostic.timeout,
+            "Apple authentication failed"
+        ),
+    }
 }
 
 struct LoginAttempt {
@@ -62,6 +203,7 @@ impl LoginAttempt {
                 phase: LoginPhase::Authenticating,
                 two_factor: None,
                 message: "Authenticating with Apple.".into(),
+                diagnostic: None,
             }),
             response: Mutex::new(None),
             response_ready: Notify::new(),
@@ -76,6 +218,7 @@ impl LoginAttempt {
         let mut state = self.state.lock().await;
         state.phase = LoginPhase::Authenticating;
         state.two_factor = None;
+        state.diagnostic = None;
         state.message = message.into();
     }
 
@@ -90,6 +233,7 @@ impl LoginAttempt {
                 phase: LoginPhase::AwaitingTwoFactor,
                 two_factor: Some(params),
                 message: "Apple requires a two-factor authentication response.".into(),
+                diagnostic: None,
             };
         }
 
@@ -116,22 +260,20 @@ impl LoginAttempt {
             phase: LoginPhase::Ready,
             two_factor: None,
             message: "Apple signing session is ready.".into(),
+            diagnostic: None,
         };
     }
 
-    async fn failed(&self, stage: &'static str) {
+    async fn failed(&self, diagnostic: AuthFailureDiagnostic) {
+        log_auth_failure(&diagnostic);
         *self.state.lock().await = LoginStatus {
             id: self.id,
             phase: LoginPhase::Failed,
             two_factor: None,
             message: "Apple authentication failed. Check the server logs for redacted diagnostics."
                 .into(),
+            diagnostic: Some(diagnostic),
         };
-        tracing::warn!(
-            login_id = %self.id,
-            stage,
-            "Apple authentication failed"
-        );
     }
 }
 
@@ -696,7 +838,11 @@ impl AppleSigningProvider {
             ) {
                 Ok(provider) => provider,
                 Err(_) => {
-                    background_attempt.failed("ANISSETTE_INIT").await;
+                    background_attempt
+                        .failed(AuthFailureDiagnostic::unknown(
+                            AuthDiagnosticStage::AnisetteInit,
+                        ))
+                        .await;
                     return;
                 }
             };
@@ -718,21 +864,33 @@ impl AppleSigningProvider {
             .await;
             let mut account = match result {
                 Ok(Ok(account)) => account,
-                Ok(Err(_)) => {
-                    background_attempt.failed("APPLE_ACCOUNT_LOGIN").await;
+                Ok(Err(error)) => {
+                    background_attempt
+                        .failed(AuthFailureDiagnostic::from_report(
+                            AuthDiagnosticStage::AppleAccountLogin,
+                            &error,
+                        ))
+                        .await;
                     return;
                 }
                 Err(_) => {
                     background_attempt
-                        .failed("APPLE_ACCOUNT_LOGIN_TIMEOUT")
+                        .failed(AuthFailureDiagnostic::timeout(
+                            AuthDiagnosticStage::AppleAccountLoginTimeout,
+                        ))
                         .await;
                     return;
                 }
             };
             let developer_session = match DeveloperSession::from_account(&mut account).await {
                 Ok(session) => session,
-                Err(_) => {
-                    background_attempt.failed("DEVELOPER_SESSION").await;
+                Err(error) => {
+                    background_attempt
+                        .failed(AuthFailureDiagnostic::from_report(
+                            AuthDiagnosticStage::DeveloperSession,
+                            &error,
+                        ))
+                        .await;
                     return;
                 }
             };
@@ -1173,5 +1331,103 @@ mod tests {
         assert!(!source.exists());
         assert!(outside.is_file());
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+    #[test]
+    fn auth_diagnostic_redacts_typed_apple_auth_messages() {
+        let report = Report::new(SideloadError::AuthWithMessage(
+            -22406,
+            "sensitive Apple response text".into(),
+        ))
+        .into_dynamic();
+        let diagnostic =
+            AuthFailureDiagnostic::from_report(AuthDiagnosticStage::AppleAccountLogin, &report);
+        let serialized = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
+
+        assert_eq!(diagnostic.apple_auth_code, Some(-22406));
+        assert_eq!(diagnostic.network_class, AuthNetworkClass::AppleAuth);
+        assert!(serialized.contains("\"APPLE_AUTH_CODE\":-22406"));
+        assert!(!serialized.contains("sensitive Apple response text"));
+    }
+
+    #[tokio::test]
+    async fn auth_diagnostic_captures_http_status_without_response_data() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind local test listener");
+        let address = listener.local_addr().expect("read local test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = [0_u8; 1024];
+            stream.read(&mut request).await.expect("read test request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write test response");
+        });
+
+        let error = reqwest_013::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("receive test response")
+            .error_for_status()
+            .expect_err("convert test status to error");
+        let report = Report::new(error).into_dynamic();
+        let diagnostic =
+            AuthFailureDiagnostic::from_report(AuthDiagnosticStage::AppleAccountLogin, &report);
+
+        assert_eq!(diagnostic.http_status, Some(503));
+        assert_eq!(diagnostic.network_class, AuthNetworkClass::Http);
+        assert!(!diagnostic.timeout);
+        server.await.expect("join test server");
+    }
+
+    #[test]
+    fn failed_login_status_serializes_only_bounded_diagnostic_fields() {
+        let status = LoginStatus {
+            id: Uuid::now_v7(),
+            phase: LoginPhase::Failed,
+            two_factor: None,
+            message: "Apple authentication failed.".into(),
+            diagnostic: Some(AuthFailureDiagnostic {
+                auth_stage: AuthDiagnosticStage::AppleAccountLogin,
+                http_status: Some(503),
+                apple_auth_code: Some(-22406),
+                network_class: AuthNetworkClass::Http,
+                timeout: false,
+            }),
+        };
+        let value = serde_json::to_value(status).expect("serialize failed login status");
+        let diagnostic = value["diagnostic"].as_object().expect("diagnostic object");
+
+        assert_eq!(diagnostic.len(), 5);
+        assert_eq!(diagnostic["AUTH_STAGE"], "APPLE_ACCOUNT_LOGIN");
+        assert_eq!(diagnostic["HTTP_STATUS"], 503);
+        assert_eq!(diagnostic["APPLE_AUTH_CODE"], -22406);
+        assert_eq!(diagnostic["NETWORK_CLASS"], "HTTP");
+        assert_eq!(diagnostic["TIMEOUT"], false);
+        assert!(!diagnostic.contains_key("id"));
+    }
+
+    #[test]
+    fn successful_login_status_omits_diagnostic() {
+        let status = LoginStatus {
+            id: Uuid::now_v7(),
+            phase: LoginPhase::Ready,
+            two_factor: None,
+            message: "Apple signing session is ready.".into(),
+            diagnostic: None,
+        };
+        let serialized = serde_json::to_string(&status).expect("serialize login status");
+
+        assert!(!serialized.contains("diagnostic"));
+        assert!(!serialized.contains("AUTH_STAGE"));
     }
 }
