@@ -10,9 +10,8 @@ aes-gcm = "0.10.3"
 axum = { version = "0.8.8", features = ["multipart"] }
 base64 = "0.22.1"
 idevice = { version = "=0.1.65", features = ["tcp", "usbmuxd", "remote_pairing", "mdns", "rsd", "afc", "installation_proxy", "core_device", "core_device_proxy", "tunnel_tcp_stack"] }
-# Pin the same signing stack as iLoader. The Git branch is required because
-# published isideload releases do not contain its current signing backend.
-isideload = { version = "0.3.17", git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick", features = ["fs-storage"] }
+# Pin the same signing stack as iLoader at the verified surgical GSA-503 backport.
+isideload = { version = "0.3.17", git = "https://github.com/lemehavit/isideload", package = "isideload", rev = "20870a7f5c1ae0fc2ef32c31d0edcfedc0a0aa23", features = ["fs-storage"] }
 if-addrs = "0.15.0"
 mdns-sd = "0.20.3"
 plist = "1.10.0"

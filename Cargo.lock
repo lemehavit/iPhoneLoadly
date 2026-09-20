@@ -1686,7 +1686,7 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 [[package]]
 name = "isideload"
 version = "0.3.17"
-source = "git+https://github.com/nab138/isideload?branch=apple-codesign-quick#0f4ffaf22212781810491156113f6160504880cc"
+source = "git+https://github.com/lemehavit/isideload?rev=20870a7f5c1ae0fc2ef32c31d0edcfedc0a0aa23#20870a7f5c1ae0fc2ef32c31d0edcfedc0a0aa23"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm 0.11.0",
