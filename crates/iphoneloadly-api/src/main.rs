@@ -2587,6 +2587,7 @@ async fn main() {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("install rustls AWS-LC crypto provider");
+    isideload::init().expect("initialize isideload error reporting");
 
     tracing_subscriber::registry()
         .with(
@@ -2666,8 +2667,11 @@ async fn main() {
     tokio::fs::create_dir_all(&state.apps_dir)
         .await
         .expect("create app storage");
-    if let Err(error) = state.signing.restore_saved_login().await {
-        tracing::warn!(error = %error, "unable to restore saved Apple sign-in");
+    if state.signing.restore_saved_login().await.is_err() {
+        tracing::warn!(
+            stage = "SAVED_LOGIN_RESTORE",
+            "unable to restore saved Apple sign-in"
+        );
     }
     let app = Router::new()
         .route("/", get(dashboard))

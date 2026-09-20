@@ -119,7 +119,7 @@ impl LoginAttempt {
         };
     }
 
-    async fn failed(&self, error: impl std::fmt::Display) {
+    async fn failed(&self, stage: &'static str) {
         *self.state.lock().await = LoginStatus {
             id: self.id,
             phase: LoginPhase::Failed,
@@ -127,7 +127,11 @@ impl LoginAttempt {
             message: "Apple authentication failed. Check the server logs for redacted diagnostics."
                 .into(),
         };
-        tracing::warn!(login_id = %self.id, error = %error, "Apple authentication failed");
+        tracing::warn!(
+            login_id = %self.id,
+            stage,
+            "Apple authentication failed"
+        );
     }
 }
 
@@ -691,8 +695,8 @@ impl AppleSigningProvider {
                 "0".into(),
             ) {
                 Ok(provider) => provider,
-                Err(error) => {
-                    background_attempt.failed(error).await;
+                Err(_) => {
+                    background_attempt.failed("ANISSETTE_INIT").await;
                     return;
                 }
             };
@@ -714,21 +718,21 @@ impl AppleSigningProvider {
             .await;
             let mut account = match result {
                 Ok(Ok(account)) => account,
-                Ok(Err(error)) => {
-                    background_attempt.failed(error).await;
+                Ok(Err(_)) => {
+                    background_attempt.failed("APPLE_ACCOUNT_LOGIN").await;
                     return;
                 }
                 Err(_) => {
                     background_attempt
-                        .failed("Apple authentication timed out after 90 seconds")
+                        .failed("APPLE_ACCOUNT_LOGIN_TIMEOUT")
                         .await;
                     return;
                 }
             };
             let developer_session = match DeveloperSession::from_account(&mut account).await {
                 Ok(session) => session,
-                Err(error) => {
-                    background_attempt.failed(error).await;
+                Err(_) => {
+                    background_attempt.failed("DEVELOPER_SESSION").await;
                     return;
                 }
             };
