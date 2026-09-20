@@ -2149,6 +2149,52 @@ fn outcome_after_install_failure(
         }
     }
 }
+
+fn outcome_after_install_result(
+    install_result: Result<(), InstallCommandFailure>,
+    lookup: Result<bool, ()>,
+) -> RsdInstallOutcome {
+    match install_result {
+        Ok(()) => match lookup {
+            Ok(true) => RsdInstallOutcome::Installed,
+            Ok(false) => RsdInstallOutcome::NotInstalled,
+            Err(()) => RsdInstallOutcome::OutcomeUnknown,
+        },
+        Err(failure) => outcome_after_install_failure(failure, lookup),
+    }
+}
+async fn verified_install_outcome(
+    install_result: Result<(), InstallCommandFailure>,
+    lookup: impl Future<Output = Result<bool, ()>>,
+) -> RsdInstallOutcome {
+    outcome_after_install_result(install_result, lookup.await)
+}
+
+fn install_verification_deadline(
+    overall_deadline: tokio::time::Instant,
+    verification_start: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let overall_verification_limit = overall_deadline
+        .checked_sub(RSD_INSTALL_CLEANUP_TIMEOUT)
+        .unwrap_or(overall_deadline);
+    let timeout_limit = verification_start
+        .checked_add(RSD_INSTALL_VERIFICATION_TIMEOUT)
+        .unwrap_or(overall_verification_limit);
+    overall_verification_limit.min(timeout_limit)
+}
+
+fn install_error_kind(
+    install_result: Result<(), InstallCommandFailure>,
+    outcome: RsdInstallOutcome,
+) -> &'static str {
+    match (install_result, outcome) {
+        (_, RsdInstallOutcome::Installed) => "",
+        (Ok(()), RsdInstallOutcome::NotInstalled) => "install_not_verified",
+        (_, RsdInstallOutcome::NotInstalled) => "install_rejected",
+        (_, RsdInstallOutcome::OutcomeUnknown) => "install_result_ambiguous",
+        (_, RsdInstallOutcome::NotStarted) => unreachable!("install command was sent"),
+    }
+}
 fn open_verified_upload_file(
     path: &Path,
     canonical_root: &Path,
@@ -2487,12 +2533,12 @@ async fn execute_rsd_first_install(
 
     let mut report = match staging_result {
         Ok(Ok(())) => {
-            let verification_deadline = deadline
+            let overall_verification_limit = deadline
                 .checked_sub(RSD_INSTALL_CLEANUP_TIMEOUT)
                 .unwrap_or(deadline);
-            let install_deadline = verification_deadline
+            let install_deadline = overall_verification_limit
                 .checked_sub(RSD_INSTALL_VERIFICATION_TIMEOUT)
-                .unwrap_or(verification_deadline);
+                .unwrap_or(overall_verification_limit);
             if tokio::time::Instant::now() >= install_deadline {
                 let mut report = rsd_install_failure(
                     RsdInstallStage::Install,
@@ -2522,17 +2568,14 @@ async fn execute_rsd_first_install(
             let install_result =
                 send_one_install_command(&mut client, &staging.app, install_deadline).await;
             drop(client);
-            let mut report = RsdInstallReport {
-                outcome: RsdInstallOutcome::Installed,
-                stage: RsdInstallStage::Complete,
-                cleanup: RsdStagingCleanup::NotNeeded,
-                install_command_count: 1,
-                error_kind: "",
-                bundle_id: Some(bundle_id.clone()),
-                certificate_pressure,
-            };
-            if let Err(install_failure) = install_result {
-                let lookup = match session
+
+            let verification_deadline =
+                install_verification_deadline(deadline, tokio::time::Instant::now());
+            let outcome = verified_install_outcome(install_result, async {
+                if tokio::time::Instant::now() >= verification_deadline {
+                    return Err(());
+                }
+                match session
                     .installation_proxy_client(verification_deadline)
                     .await
                 {
@@ -2545,25 +2588,26 @@ async fn execute_rsd_first_install(
                         .await
                     }
                     Err(()) => Err(()),
-                };
-                report.outcome = outcome_after_install_failure(install_failure, lookup);
-                match report.outcome {
-                    RsdInstallOutcome::Installed => {
-                        report.stage = RsdInstallStage::Complete;
-                        report.error_kind = "";
-                    }
-                    RsdInstallOutcome::NotInstalled => {
-                        report.stage = RsdInstallStage::Verification;
-                        report.error_kind = "install_rejected";
-                    }
-                    RsdInstallOutcome::OutcomeUnknown => {
-                        report.stage = RsdInstallStage::Verification;
-                        report.error_kind = "install_result_ambiguous";
-                    }
-                    RsdInstallOutcome::NotStarted => unreachable!("install command was sent"),
                 }
+            })
+            .await;
+            let (stage, error_kind) = match outcome {
+                RsdInstallOutcome::Installed => (RsdInstallStage::Complete, ""),
+                RsdInstallOutcome::NotInstalled | RsdInstallOutcome::OutcomeUnknown => (
+                    RsdInstallStage::Verification,
+                    install_error_kind(install_result, outcome),
+                ),
+                RsdInstallOutcome::NotStarted => unreachable!("install command was sent"),
+            };
+            RsdInstallReport {
+                outcome,
+                stage,
+                cleanup: RsdStagingCleanup::NotNeeded,
+                install_command_count: 1,
+                error_kind,
+                bundle_id: Some(bundle_id.clone()),
+                certificate_pressure,
             }
-            report
         }
         Ok(Err(error_kind)) => {
             let mut report = rsd_install_failure(
@@ -4108,7 +4152,7 @@ mod tests {
         );
 
         fs::rename(&executable, root.join("Original")).expect("move original");
-        fs::write(&executable, b"replaced").expect("write replacement");
+        fs::write(&executable, b"replacement").expect("write replacement");
         assert_eq!(
             open_verified_upload_file(&entry.local_path, &plan.canonical_root, size, identity)
                 .err(),
@@ -4174,6 +4218,54 @@ mod tests {
         );
         let failure = rsd_install_failure(RsdInstallStage::Install, "send_failed", false, None);
         assert_eq!(failure.install_command_count, 0);
+    }
+    #[test]
+    fn every_install_result_requires_exact_bundle_verification() {
+        assert_eq!(
+            outcome_after_install_result(Ok(()), Ok(true)),
+            RsdInstallOutcome::Installed
+        );
+        assert_eq!(
+            outcome_after_install_result(Ok(()), Ok(false)),
+            RsdInstallOutcome::NotInstalled
+        );
+        assert_eq!(
+            outcome_after_install_result(Ok(()), Err(())),
+            RsdInstallOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            outcome_after_install_result(Err(InstallCommandFailure::Definitive), Ok(true)),
+            RsdInstallOutcome::Installed
+        );
+        assert_eq!(
+            outcome_after_install_result(Err(InstallCommandFailure::PossiblyAccepted), Ok(true)),
+            RsdInstallOutcome::Installed
+        );
+    }
+    #[tokio::test]
+    async fn successful_install_still_executes_exact_bundle_lookup() {
+        let lookups = AtomicUsize::new(0);
+        let outcome = verified_install_outcome(Ok(()), async {
+            lookups.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        })
+        .await;
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome, RsdInstallOutcome::NotInstalled);
+    }
+
+    #[test]
+    fn post_install_verification_deadline_is_bounded_by_timeout_and_reserve() {
+        let start = tokio::time::Instant::now();
+        let bounded = install_verification_deadline(start + Duration::from_secs(60), start);
+        assert_eq!(bounded, start + RSD_INSTALL_VERIFICATION_TIMEOUT);
+
+        let reserve_limited = install_verification_deadline(start + Duration::from_secs(18), start);
+        assert_eq!(reserve_limited, start + Duration::from_secs(8));
+
+        let delayed_start = start + Duration::from_secs(5);
+        let delayed = install_verification_deadline(start + Duration::from_secs(60), delayed_start);
+        assert_eq!(delayed, delayed_start + RSD_INSTALL_VERIFICATION_TIMEOUT);
     }
 
     fn test_rsd_handshake() -> RsdHandshake {

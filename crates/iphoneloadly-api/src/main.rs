@@ -1273,6 +1273,72 @@ mod tests {
         assert!(value["completedAt"].is_null());
         assert_eq!(value["publicMessage"], "Signing the IPA.");
     }
+    fn install_report(
+        outcome: wireless_pairing::RsdInstallOutcome,
+        cleanup: wireless_pairing::RsdStagingCleanup,
+        error_kind: &'static str,
+    ) -> wireless_pairing::RsdInstallReport {
+        wireless_pairing::RsdInstallReport {
+            outcome,
+            stage: wireless_pairing::RsdInstallStage::Complete,
+            cleanup,
+            install_command_count: 1,
+            error_kind,
+            bundle_id: Some("com.example.test".into()),
+            certificate_pressure: false,
+        }
+    }
+
+    #[test]
+    fn verified_installed_status_is_success_despite_ancillary_cleanup_errors() {
+        for (cleanup, error_kind) in [
+            (
+                wireless_pairing::RsdStagingCleanup::Failed,
+                "staging_cleanup",
+            ),
+            (
+                wireless_pairing::RsdStagingCleanup::Succeeded,
+                "session_cleanup",
+            ),
+        ] {
+            let report = install_report(
+                wireless_pairing::RsdInstallOutcome::Installed,
+                cleanup,
+                error_kind,
+            );
+            assert_eq!(super::spike_install_status(&report), StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn unverified_install_outcomes_remain_failure_class_statuses() {
+        for outcome in [
+            wireless_pairing::RsdInstallOutcome::NotInstalled,
+            wireless_pairing::RsdInstallOutcome::OutcomeUnknown,
+        ] {
+            let report =
+                install_report(outcome, wireless_pairing::RsdStagingCleanup::NotNeeded, "");
+            assert_eq!(
+                super::spike_install_status(&report),
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        let report = install_report(
+            wireless_pairing::RsdInstallOutcome::NotStarted,
+            wireless_pairing::RsdStagingCleanup::NotNeeded,
+            "",
+        );
+        assert_eq!(
+            super::spike_install_status(&report),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let report = install_report(
+            wireless_pairing::RsdInstallOutcome::NotStarted,
+            wireless_pairing::RsdStagingCleanup::NotNeeded,
+            "app_already_installed",
+        );
+        assert_eq!(super::spike_install_status(&report), StatusCode::CONFLICT);
+    }
 }
 
 #[derive(Serialize)]
@@ -1707,6 +1773,20 @@ async fn run_spike_remote_pairing_install(
             .await,
     )
 }
+fn spike_install_status(report: &wireless_pairing::RsdInstallReport) -> StatusCode {
+    if report.outcome == wireless_pairing::RsdInstallOutcome::Installed {
+        StatusCode::OK
+    } else if matches!(
+        report.error_kind,
+        "device_registration_required" | "app_already_installed" | "signing_not_ready"
+    ) {
+        StatusCode::CONFLICT
+    } else if report.outcome == wireless_pairing::RsdInstallOutcome::NotStarted {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
 
 async fn spike_remote_pairing_install(
     State(state): State<AppState>,
@@ -1769,18 +1849,7 @@ async fn spike_remote_pairing_install(
         }
         SpikeInstallExecution::Report(report) => report,
     };
-    let status = if report.error_kind.is_empty() {
-        StatusCode::OK
-    } else if matches!(
-        report.error_kind,
-        "device_registration_required" | "app_already_installed" | "signing_not_ready"
-    ) {
-        StatusCode::CONFLICT
-    } else if report.outcome == wireless_pairing::RsdInstallOutcome::NotStarted {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
+    let status = spike_install_status(&report);
     let result = if report.error_kind.is_empty() {
         "ok"
     } else {
