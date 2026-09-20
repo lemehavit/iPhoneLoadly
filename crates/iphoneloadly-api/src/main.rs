@@ -115,6 +115,7 @@ struct SpikeRsdInstallResponse {
     outcome: &'static str,
     stage: &'static str,
     cleanup: &'static str,
+    session_cleanup: &'static str,
     install_command_count: u8,
     error_kind: Option<&'static str>,
     bundle_id: Option<String>,
@@ -1134,6 +1135,7 @@ mod tests {
                 "outcome": "notStarted",
                 "stage": "discovery",
                 "cleanup": "notNeeded",
+                "sessionCleanup": "notNeeded",
                 "installCommandCount": 0,
                 "errorKind": "session_open",
                 "bundleId": null,
@@ -1282,6 +1284,7 @@ mod tests {
             outcome,
             stage: wireless_pairing::RsdInstallStage::Complete,
             cleanup,
+            session_cleanup: wireless_pairing::RsdSessionCleanup::NotNeeded,
             install_command_count: 1,
             error_kind,
             bundle_id: Some("com.example.test".into()),
@@ -1308,6 +1311,22 @@ mod tests {
             );
             assert_eq!(super::spike_install_status(&report), StatusCode::OK);
         }
+    }
+    #[test]
+    fn verified_install_preserves_both_cleanup_failures() {
+        let mut report = install_report(
+            wireless_pairing::RsdInstallOutcome::Installed,
+            wireless_pairing::RsdStagingCleanup::Failed,
+            "staging_cleanup",
+        );
+        report.session_cleanup = wireless_pairing::RsdSessionCleanup::Failed;
+        assert_eq!(super::spike_install_status(&report), StatusCode::OK);
+
+        let response =
+            serde_json::to_value(super::spike_install_response(report)).expect("serialize report");
+        assert_eq!(response["cleanup"], "failed");
+        assert_eq!(response["sessionCleanup"], "failed");
+        assert_eq!(response["errorKind"], "staging_cleanup");
     }
 
     #[test]
@@ -1769,7 +1788,7 @@ async fn run_spike_remote_pairing_install(
     SpikeInstallExecution::Report(
         state
             .wireless_pairing
-            .install_remote_pairing_first_app(&state.signing, ipa_path)
+            .install_remote_pairing_first_app(state.signing.clone(), ipa_path)
             .await,
     )
 }
@@ -1785,6 +1804,19 @@ fn spike_install_status(report: &wireless_pairing::RsdInstallReport) -> StatusCo
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_GATEWAY
+    }
+}
+fn spike_install_response(report: wireless_pairing::RsdInstallReport) -> SpikeRsdInstallResponse {
+    SpikeRsdInstallResponse {
+        transport: "rsd",
+        outcome: report.outcome.as_str(),
+        stage: report.stage.as_str(),
+        cleanup: report.cleanup.as_str(),
+        session_cleanup: report.session_cleanup.as_str(),
+        install_command_count: report.install_command_count,
+        error_kind: (!report.error_kind.is_empty()).then_some(report.error_kind),
+        bundle_id: report.bundle_id,
+        certificate_pressure: report.certificate_pressure,
     }
 }
 
@@ -1863,23 +1895,11 @@ async fn spike_remote_pairing_install(
         error_kind = report.error_kind,
         install_command_count = report.install_command_count,
         cleanup = report.cleanup.as_str(),
+        session_cleanup = report.session_cleanup.as_str(),
         certificate_pressure = report.certificate_pressure,
         "remote pairing first-install spike completed"
     );
-    (
-        status,
-        Json(SpikeRsdInstallResponse {
-            transport: "rsd",
-            outcome: report.outcome.as_str(),
-            stage: report.stage.as_str(),
-            cleanup: report.cleanup.as_str(),
-            install_command_count: report.install_command_count,
-            error_kind: (!report.error_kind.is_empty()).then_some(report.error_kind),
-            bundle_id: report.bundle_id,
-            certificate_pressure: report.certificate_pressure,
-        }),
-    )
-        .into_response()
+    (status, Json(spike_install_response(report))).into_response()
 }
 
 async fn list_managed_installations(State(state): State<AppState>) -> impl IntoResponse {

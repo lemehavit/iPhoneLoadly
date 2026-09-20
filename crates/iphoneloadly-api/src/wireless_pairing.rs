@@ -99,8 +99,25 @@ impl RsdProbeStage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RsdSessionCleanup {
+    NotNeeded,
+    Succeeded,
+    Failed,
+}
+
+impl RsdSessionCleanup {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "notNeeded",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsdProbeFailure {
     pub stage: RsdProbeStage,
+    pub(crate) session_cleanup: RsdSessionCleanup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +327,7 @@ pub(crate) struct RsdInstallReport {
     pub(crate) outcome: RsdInstallOutcome,
     pub(crate) stage: RsdInstallStage,
     pub(crate) cleanup: RsdStagingCleanup,
+    pub(crate) session_cleanup: RsdSessionCleanup,
     pub(crate) install_command_count: u8,
     pub(crate) error_kind: &'static str,
     pub(crate) bundle_id: Option<String>,
@@ -550,15 +568,26 @@ pub struct WirelessPairingService {
 }
 
 trait ClosableRsdProvider {
-    fn close_provider(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+    async fn close_provider(&mut self) -> Result<(), std::io::Error>;
 }
 
 impl ClosableRsdProvider for AdapterHandle {
-    fn close_provider(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send {
-        self.close()
+    async fn close_provider(&mut self) -> Result<(), std::io::Error> {
+        self.close().await?;
+        match self.connect(0).await {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::NetworkUnreachable
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other("RSD adapter accepted work after shutdown")),
+        }
     }
 }
-
 struct RemoteRsdSession<P> {
     provider: Option<P>,
     handshake: Option<RsdHandshake>,
@@ -1134,45 +1163,213 @@ impl WirelessPairingService {
 
     pub(crate) async fn install_remote_pairing_first_app(
         &self,
-        signing: &crate::signing::AppleSigningProvider,
+        signing: Arc<crate::signing::AppleSigningProvider>,
         ipa_path: PathBuf,
     ) -> RsdInstallReport {
         let deadline = tokio::time::Instant::now() + RSD_INSTALL_TIMEOUT;
+        let work_deadline = install_work_deadline(deadline, tokio::time::Instant::now());
         let mut current_stage = ReadOnlyProbeStage::Discovery;
-        let mut session = match tokio::time::timeout_at(
-            deadline,
+        let mut identity_session = match tokio::time::timeout_at(
+            work_deadline,
             RemoteRsdSession::open(self, Some(&mut current_stage)),
         )
         .await
         {
             Ok(Ok(session)) => session,
             Ok(Err(failure)) => {
-                return rsd_install_failure(
+                let mut report = rsd_install_failure(
                     RsdInstallStage::from(failure.stage),
                     "session_open",
                     false,
                     None,
                 );
+                record_session_cleanup(&mut report, failure.session_cleanup);
+                return report;
             }
             Err(_) => {
-                return rsd_install_failure(
+                let mut report = rsd_install_failure(
                     RsdInstallStage::from(current_stage),
                     "timeout",
                     false,
                     None,
                 );
+                if current_stage == ReadOnlyProbeStage::RsdHandshake {
+                    record_session_cleanup(&mut report, RsdSessionCleanup::Failed);
+                }
+                return report;
             }
         };
 
-        let mut report = execute_rsd_first_install(&mut session, signing, ipa_path, deadline).await;
-        if !matches!(
-            timeout(RSD_INSTALL_CLEANUP_TIMEOUT, session.close()).await,
-            Ok(Ok(()))
-        ) && report.error_kind.is_empty()
-        {
-            report.stage = RsdInstallStage::SessionCleanup;
-            report.error_kind = "session_cleanup";
+        let identity_result =
+            tokio::time::timeout_at(work_deadline, identity_session.verified_signing_identity())
+                .await;
+        let initial_session_cleanup = close_install_session(identity_session).await;
+        let identity = match identity_result {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(failure)) => {
+                let mut report =
+                    rsd_install_failure(RsdInstallStage::Identity, failure.kind(), false, None);
+                record_session_cleanup(&mut report, initial_session_cleanup);
+                return report;
+            }
+            Err(_) => {
+                let mut report =
+                    rsd_install_failure(RsdInstallStage::Identity, "timeout", false, None);
+                record_session_cleanup(&mut report, initial_session_cleanup);
+                return report;
+            }
+        };
+        if initial_session_cleanup == RsdSessionCleanup::Failed {
+            let mut report = rsd_install_failure(
+                RsdInstallStage::SessionCleanup,
+                "session_cleanup",
+                false,
+                None,
+            );
+            record_session_cleanup(&mut report, initial_session_cleanup);
+            return report;
         }
+
+        let signing_identity = identity.clone();
+        let mut signing_task = tokio::spawn(async move {
+            signing
+                .preflight_and_sign_for_existing_device(&signing_identity, ipa_path)
+                .await
+        });
+        let (preflight, artifact) =
+            match tokio::time::timeout_at(work_deadline, &mut signing_task).await {
+                Ok(Ok(Ok(result))) => result,
+                Ok(Ok(Err(error))) => {
+                    let (stage, error) = match error {
+                        crate::signing::ExistingDeviceSigningError::Preflight(error) => {
+                            (RsdInstallStage::AccountPreflight, error)
+                        }
+                        crate::signing::ExistingDeviceSigningError::Signing(error) => {
+                            (RsdInstallStage::Signing, error)
+                        }
+                    };
+                    let mut report =
+                        rsd_install_failure(stage, signing_error_kind(&error), false, None);
+                    record_session_cleanup(&mut report, initial_session_cleanup);
+                    return report;
+                }
+                Ok(Err(_)) => {
+                    let mut report =
+                        rsd_install_failure(RsdInstallStage::Signing, "local_task", false, None);
+                    record_session_cleanup(&mut report, initial_session_cleanup);
+                    return report;
+                }
+                Err(_) => {
+                    signing_task.abort();
+                    drop(tokio::spawn(async move {
+                        if let Ok(Ok((_, artifact))) = signing_task.await {
+                            schedule_artifact_cleanup(artifact);
+                        }
+                    }));
+                    let mut report =
+                        rsd_install_failure(RsdInstallStage::Signing, "timeout", false, None);
+                    record_session_cleanup(&mut report, initial_session_cleanup);
+                    return report;
+                }
+            };
+        let certificate_pressure = preflight
+            .development_certificate_capacity
+            .is_some_and(|capacity| preflight.development_certificate_count >= capacity)
+            && !preflight.machine_certificate_present;
+        let Some(artifact) = artifact else {
+            let mut report = rsd_install_failure(
+                RsdInstallStage::AccountPreflight,
+                "device_registration_required",
+                certificate_pressure,
+                None,
+            );
+            record_session_cleanup(&mut report, initial_session_cleanup);
+            return report;
+        };
+        let bundle_id = artifact.bundle_id().to_owned();
+        let mut artifact_cleanup = Some(artifact);
+
+        let mut current_stage = ReadOnlyProbeStage::Discovery;
+        let mut session = match tokio::time::timeout_at(
+            work_deadline,
+            RemoteRsdSession::open(self, Some(&mut current_stage)),
+        )
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(failure)) => {
+                let mut report = rsd_install_failure(
+                    RsdInstallStage::from(failure.stage),
+                    "session_open",
+                    certificate_pressure,
+                    Some(bundle_id),
+                );
+                record_session_cleanup(
+                    &mut report,
+                    merge_session_cleanup(initial_session_cleanup, failure.session_cleanup),
+                );
+                schedule_artifact_cleanup(artifact_cleanup.take());
+                return report;
+            }
+            Err(_) => {
+                let second_cleanup = if current_stage == ReadOnlyProbeStage::RsdHandshake {
+                    RsdSessionCleanup::Failed
+                } else {
+                    RsdSessionCleanup::NotNeeded
+                };
+                let mut report = rsd_install_failure(
+                    RsdInstallStage::from(current_stage),
+                    "timeout",
+                    certificate_pressure,
+                    Some(bundle_id),
+                );
+                record_session_cleanup(
+                    &mut report,
+                    merge_session_cleanup(initial_session_cleanup, second_cleanup),
+                );
+                schedule_artifact_cleanup(artifact_cleanup.take());
+                return report;
+            }
+        };
+
+        let second_identity_error =
+            match tokio::time::timeout_at(work_deadline, session.verified_signing_identity()).await
+            {
+                Ok(Ok(second_identity)) if second_identity == identity => None,
+                Ok(Ok(_)) => Some("identity_changed"),
+                Ok(Err(failure)) => Some(failure.kind()),
+                Err(_) => Some("timeout"),
+            };
+        if let Some(error_kind) = second_identity_error {
+            let second_cleanup = close_install_session(session).await;
+            let mut report = rsd_install_failure(
+                RsdInstallStage::Identity,
+                error_kind,
+                certificate_pressure,
+                Some(bundle_id),
+            );
+            record_session_cleanup(
+                &mut report,
+                merge_session_cleanup(initial_session_cleanup, second_cleanup),
+            );
+            schedule_artifact_cleanup(artifact_cleanup.take());
+            return report;
+        }
+
+        let mut report = execute_rsd_first_install(
+            &mut session,
+            bundle_id,
+            certificate_pressure,
+            deadline,
+            &mut artifact_cleanup,
+        )
+        .await;
+        let final_session_cleanup = close_install_session(session).await;
+        record_session_cleanup(
+            &mut report,
+            merge_session_cleanup(initial_session_cleanup, final_session_cleanup),
+        );
+        schedule_artifact_cleanup(artifact_cleanup.take());
         report
     }
 
@@ -1477,6 +1674,7 @@ impl WirelessPairingService {
 
 const RSD_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const RSD_INSTALL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const RSD_INSTALL_SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const RSD_INSTALL_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 const RSD_INSTALL_FILE_LIMIT: usize = 20_000;
 const RSD_INSTALL_BYTE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
@@ -1492,6 +1690,7 @@ enum UploadPlanFailure {
     TooManyEntries,
     TooManyBytes,
     LocalIo,
+    Timeout,
 }
 
 impl UploadPlanFailure {
@@ -1505,6 +1704,7 @@ impl UploadPlanFailure {
             Self::TooManyEntries => "entry_limit",
             Self::TooManyBytes => "byte_limit",
             Self::LocalIo => "local_io",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -1632,7 +1832,9 @@ fn hash_planned_file(
     path: &Path,
     size: u64,
     identity: FileIdentity,
+    deadline: Option<Instant>,
 ) -> Result<[u8; 32], UploadPlanFailure> {
+    ensure_plan_deadline(deadline)?;
     let mut file = fs::File::open(path).map_err(|_| UploadPlanFailure::LocalIo)?;
     let opened_metadata = file.metadata().map_err(|_| UploadPlanFailure::LocalIo)?;
     if !opened_metadata.is_file()
@@ -1644,6 +1846,7 @@ fn hash_planned_file(
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; RSD_INSTALL_TRANSFER_CHUNK];
     loop {
+        ensure_plan_deadline(deadline)?;
         let count =
             std::io::Read::read(&mut file, &mut buffer).map_err(|_| UploadPlanFailure::LocalIo)?;
         if count == 0 {
@@ -1651,6 +1854,7 @@ fn hash_planned_file(
         }
         digest.update(&buffer[..count]);
     }
+    ensure_plan_deadline(deadline)?;
     let final_metadata = file.metadata().map_err(|_| UploadPlanFailure::LocalIo)?;
     if final_metadata.len() != size || file_identity(&final_metadata) != Some(identity) {
         return Err(UploadPlanFailure::LocalIo);
@@ -1658,7 +1862,25 @@ fn hash_planned_file(
     Ok(digest.finalize().into())
 }
 
+fn ensure_plan_deadline(deadline: Option<Instant>) -> Result<(), UploadPlanFailure> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(UploadPlanFailure::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn plan_signed_bundle(root: &Path) -> Result<SignedBundleUploadPlan, UploadPlanFailure> {
+    plan_signed_bundle_until(root, None)
+}
+
+fn plan_signed_bundle_until(
+    root: &Path,
+    deadline: Option<Instant>,
+) -> Result<SignedBundleUploadPlan, UploadPlanFailure> {
+    ensure_plan_deadline(deadline)?;
+
     let root_metadata = fs::symlink_metadata(root).map_err(|_| UploadPlanFailure::LocalIo)?;
     if root_metadata.file_type().is_symlink() {
         return Err(UploadPlanFailure::SourceSymlink);
@@ -1673,6 +1895,7 @@ fn plan_signed_bundle(root: &Path) -> Result<SignedBundleUploadPlan, UploadPlanF
     let mut entries = Vec::new();
     let mut byte_count = 0_u64;
     while let Some(directory) = pending.pop_front() {
+        ensure_plan_deadline(deadline)?;
         let directory_metadata =
             fs::symlink_metadata(&directory).map_err(|_| UploadPlanFailure::LocalIo)?;
         if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
@@ -1682,6 +1905,7 @@ fn plan_signed_bundle(root: &Path) -> Result<SignedBundleUploadPlan, UploadPlanF
         ensure_canonical_descendant(&directory, &canonical_root)?;
         let children = fs::read_dir(&directory).map_err(|_| UploadPlanFailure::LocalIo)?;
         for child in children {
+            ensure_plan_deadline(deadline)?;
             let child = child.map_err(|_| UploadPlanFailure::LocalIo)?;
             let path = child.path();
             let metadata = fs::symlink_metadata(&path).map_err(|_| UploadPlanFailure::LocalIo)?;
@@ -1706,7 +1930,7 @@ fn plan_signed_bundle(root: &Path) -> Result<SignedBundleUploadPlan, UploadPlanF
                     .ok_or(UploadPlanFailure::TooManyBytes)?;
                 validate_upload_bounds(entries.len(), byte_count)?;
                 let identity = file_identity(&metadata).ok_or(UploadPlanFailure::LocalIo)?;
-                let digest = hash_planned_file(&path, size, identity)?;
+                let digest = hash_planned_file(&path, size, identity, deadline)?;
                 UploadEntryKind::File {
                     size,
                     identity,
@@ -1723,6 +1947,7 @@ fn plan_signed_bundle(root: &Path) -> Result<SignedBundleUploadPlan, UploadPlanF
             validate_upload_bounds(entries.len(), byte_count)?;
         }
     }
+    ensure_plan_deadline(deadline)?;
     entries.sort_by(|left, right| left.remote_relative_path.cmp(&right.remote_relative_path));
     Ok(SignedBundleUploadPlan {
         canonical_root,
@@ -1956,8 +2181,15 @@ impl RemoteRsdSession<AdapterHandle> {
                 session.handshake = Some(handshake);
                 Ok(session)
             }
-            Err(failure) => {
-                let _ = timeout(REMOTE_CONNECT_TIMEOUT, session.close()).await;
+            Err(mut failure) => {
+                failure.session_cleanup = if matches!(
+                    timeout(RSD_INSTALL_SESSION_CLEANUP_TIMEOUT, session.close()).await,
+                    Ok(Ok(()))
+                ) {
+                    RsdSessionCleanup::Succeeded
+                } else {
+                    RsdSessionCleanup::Failed
+                };
                 Err(failure)
             }
         }
@@ -2170,17 +2402,63 @@ async fn verified_install_outcome(
     outcome_after_install_result(install_result, lookup.await)
 }
 
+fn install_cleanup_reserve() -> Duration {
+    RSD_INSTALL_CLEANUP_TIMEOUT
+        .checked_add(RSD_INSTALL_SESSION_CLEANUP_TIMEOUT)
+        .unwrap_or(Duration::MAX)
+}
+
+fn install_work_deadline(
+    overall_deadline: tokio::time::Instant,
+    work_start: tokio::time::Instant,
+) -> tokio::time::Instant {
+    overall_deadline
+        .checked_sub(install_cleanup_reserve())
+        .unwrap_or(work_start)
+}
+
 fn install_verification_deadline(
     overall_deadline: tokio::time::Instant,
     verification_start: tokio::time::Instant,
 ) -> tokio::time::Instant {
-    let overall_verification_limit = overall_deadline
-        .checked_sub(RSD_INSTALL_CLEANUP_TIMEOUT)
-        .unwrap_or(overall_deadline);
+    let overall_verification_limit = install_work_deadline(overall_deadline, verification_start);
     let timeout_limit = verification_start
         .checked_add(RSD_INSTALL_VERIFICATION_TIMEOUT)
         .unwrap_or(overall_verification_limit);
     overall_verification_limit.min(timeout_limit)
+}
+fn record_session_cleanup(report: &mut RsdInstallReport, session_cleanup: RsdSessionCleanup) {
+    report.session_cleanup = session_cleanup;
+    if session_cleanup == RsdSessionCleanup::Failed && report.error_kind.is_empty() {
+        report.stage = RsdInstallStage::SessionCleanup;
+        report.error_kind = "session_cleanup";
+    }
+}
+async fn close_install_session(session: RemoteRsdSession<AdapterHandle>) -> RsdSessionCleanup {
+    if matches!(
+        timeout(RSD_INSTALL_SESSION_CLEANUP_TIMEOUT, session.close()).await,
+        Ok(Ok(()))
+    ) {
+        RsdSessionCleanup::Succeeded
+    } else {
+        RsdSessionCleanup::Failed
+    }
+}
+
+fn merge_session_cleanup(first: RsdSessionCleanup, second: RsdSessionCleanup) -> RsdSessionCleanup {
+    if first == RsdSessionCleanup::Failed || second == RsdSessionCleanup::Failed {
+        RsdSessionCleanup::Failed
+    } else if first == RsdSessionCleanup::Succeeded || second == RsdSessionCleanup::Succeeded {
+        RsdSessionCleanup::Succeeded
+    } else {
+        RsdSessionCleanup::NotNeeded
+    }
+}
+
+fn schedule_artifact_cleanup(artifact: Option<crate::signing::SignedAppArtifact>) {
+    if let Some(artifact) = artifact {
+        drop(tokio::task::spawn_blocking(move || drop(artifact)));
+    }
 }
 
 fn install_error_kind(
@@ -2358,6 +2636,7 @@ fn rsd_install_failure(
         outcome: RsdInstallOutcome::NotStarted,
         stage,
         cleanup: RsdStagingCleanup::NotNeeded,
+        session_cleanup: RsdSessionCleanup::NotNeeded,
         install_command_count: 0,
         error_kind,
         bundle_id,
@@ -2377,81 +2656,14 @@ fn signing_error_kind(error: &crate::signing::SigningError) -> &'static str {
 
 async fn execute_rsd_first_install(
     session: &mut RemoteRsdSession<AdapterHandle>,
-    signing: &crate::signing::AppleSigningProvider,
-    ipa_path: PathBuf,
+    bundle_id: String,
+    certificate_pressure: bool,
     deadline: tokio::time::Instant,
+    artifact_cleanup: &mut Option<crate::signing::SignedAppArtifact>,
 ) -> RsdInstallReport {
-    let identity =
-        match tokio::time::timeout_at(deadline, session.verified_signing_identity()).await {
-            Ok(Ok(identity)) => identity,
-            Ok(Err(failure)) => {
-                return rsd_install_failure(RsdInstallStage::Identity, failure.kind(), false, None);
-            }
-            Err(_) => {
-                return rsd_install_failure(RsdInstallStage::Identity, "timeout", false, None);
-            }
-        };
-    let preflight = match tokio::time::timeout_at(deadline, signing.account_preflight(&identity))
-        .await
-    {
-        Ok(Ok(preflight)) => preflight,
-        Ok(Err(error)) => {
-            return rsd_install_failure(
-                RsdInstallStage::AccountPreflight,
-                signing_error_kind(&error),
-                false,
-                None,
-            );
-        }
-        Err(_) => {
-            return rsd_install_failure(RsdInstallStage::AccountPreflight, "timeout", false, None);
-        }
-    };
-    let certificate_pressure = preflight
-        .development_certificate_capacity
-        .is_some_and(|capacity| preflight.development_certificate_count >= capacity)
-        && !preflight.machine_certificate_present;
-    if preflight.device_registration == crate::signing::DeviceRegistrationState::NewRequired {
-        return rsd_install_failure(
-            RsdInstallStage::AccountPreflight,
-            "device_registration_required",
-            certificate_pressure,
-            None,
-        );
-    }
+    let work_deadline = install_work_deadline(deadline, tokio::time::Instant::now());
 
-    let artifact = match tokio::time::timeout_at(
-        deadline,
-        signing.sign_for_device(
-            &identity,
-            ipa_path,
-            crate::signing::DeviceRegistrationPolicy::RequireExisting,
-            |_| {},
-        ),
-    )
-    .await
-    {
-        Ok(Ok(artifact)) => artifact,
-        Ok(Err(error)) => {
-            return rsd_install_failure(
-                RsdInstallStage::Signing,
-                signing_error_kind(&error),
-                certificate_pressure,
-                None,
-            );
-        }
-        Err(_) => {
-            return rsd_install_failure(
-                RsdInstallStage::Signing,
-                "timeout",
-                certificate_pressure,
-                None,
-            );
-        }
-    };
-    let bundle_id = artifact.bundle_id().to_owned();
-
-    let mut installation_proxy = match session.installation_proxy_client(deadline).await {
+    let mut installation_proxy = match session.installation_proxy_client(work_deadline).await {
         Ok(client) => client,
         Err(()) => {
             return rsd_install_failure(
@@ -2462,7 +2674,7 @@ async fn execute_rsd_first_install(
             );
         }
     };
-    match installed_bundle_lookup(&mut installation_proxy, &bundle_id, deadline).await {
+    match installed_bundle_lookup(&mut installation_proxy, &bundle_id, work_deadline).await {
         Ok(true) => {
             return rsd_install_failure(
                 RsdInstallStage::AlreadyInstalled,
@@ -2483,10 +2695,24 @@ async fn execute_rsd_first_install(
     }
     drop(installation_proxy);
 
-    let artifact_path = artifact.app_bundle_path().to_path_buf();
-    let plan = match tokio::task::spawn_blocking(move || plan_signed_bundle(&artifact_path)).await {
-        Ok(Ok(plan)) => plan,
-        Ok(Err(failure)) => {
+    let artifact = artifact_cleanup
+        .take()
+        .expect("signed artifact remains owned until cleanup");
+    let planning_task = tokio::task::spawn_blocking(move || {
+        let artifact_path = artifact.app_bundle_path().to_path_buf();
+        let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plan_signed_bundle_until(&artifact_path, Some(work_deadline.into_std()))
+        }))
+        .unwrap_or(Err(UploadPlanFailure::LocalIo));
+        (artifact, plan)
+    });
+    let plan = match tokio::time::timeout_at(work_deadline, planning_task).await {
+        Ok(Ok((artifact, Ok(plan)))) => {
+            *artifact_cleanup = Some(artifact);
+            plan
+        }
+        Ok(Ok((artifact, Err(failure)))) => {
+            *artifact_cleanup = Some(artifact);
             return rsd_install_failure(
                 RsdInstallStage::Staging,
                 failure.kind(),
@@ -2494,7 +2720,7 @@ async fn execute_rsd_first_install(
                 Some(bundle_id),
             );
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             return rsd_install_failure(
                 RsdInstallStage::Staging,
                 "local_task",
@@ -2502,17 +2728,17 @@ async fn execute_rsd_first_install(
                 Some(bundle_id),
             );
         }
+        Err(_) => {
+            return rsd_install_failure(
+                RsdInstallStage::Staging,
+                "timeout",
+                certificate_pressure,
+                Some(bundle_id),
+            );
+        }
     };
-    if tokio::time::Instant::now() >= deadline {
-        return rsd_install_failure(
-            RsdInstallStage::Staging,
-            "timeout",
-            certificate_pressure,
-            Some(bundle_id),
-        );
-    }
     let staging = TaskStagingPath::new(Uuid::new_v4());
-    let mut afc = match session.task_afc_client(deadline).await {
+    let mut afc = match session.task_afc_client(work_deadline).await {
         Ok(client) => client,
         Err(()) => {
             return rsd_install_failure(
@@ -2525,7 +2751,7 @@ async fn execute_rsd_first_install(
     };
     let mut root_created = false;
     let staging_result = tokio::time::timeout_at(
-        deadline,
+        work_deadline,
         stage_signed_bundle(&mut afc, &staging, &plan, &mut root_created),
     )
     .await;
@@ -2533,9 +2759,8 @@ async fn execute_rsd_first_install(
 
     let mut report = match staging_result {
         Ok(Ok(())) => {
-            let overall_verification_limit = deadline
-                .checked_sub(RSD_INSTALL_CLEANUP_TIMEOUT)
-                .unwrap_or(deadline);
+            let install_window_start = tokio::time::Instant::now();
+            let overall_verification_limit = install_work_deadline(deadline, install_window_start);
             let install_deadline = overall_verification_limit
                 .checked_sub(RSD_INSTALL_VERIFICATION_TIMEOUT)
                 .unwrap_or(overall_verification_limit);
@@ -2603,6 +2828,7 @@ async fn execute_rsd_first_install(
                 outcome,
                 stage,
                 cleanup: RsdStagingCleanup::NotNeeded,
+                session_cleanup: RsdSessionCleanup::NotNeeded,
                 install_command_count: 1,
                 error_kind,
                 bundle_id: Some(bundle_id.clone()),
@@ -2723,7 +2949,10 @@ async fn complete_read_only_probe_with_timeout<P: ClosableRsdProvider>(
 }
 
 fn probe_failure(stage: RsdProbeStage) -> RsdProbeFailure {
-    RsdProbeFailure { stage }
+    RsdProbeFailure {
+        stage,
+        session_cleanup: RsdSessionCleanup::NotNeeded,
+    }
 }
 
 fn report_appservice_setup_failure(failure: RsdProbeFailure) -> RsdProbeFailure {
@@ -2813,6 +3042,7 @@ fn report_core_device_service_failure(failure: CoreDeviceServiceFailure) -> RsdP
     );
     RsdProbeFailure {
         stage: RsdProbeStage::CoreDeviceService,
+        session_cleanup: RsdSessionCleanup::NotNeeded,
     }
 }
 
@@ -4130,6 +4360,16 @@ mod tests {
             Err(UploadPlanFailure::TooManyBytes)
         );
     }
+    #[test]
+    fn upload_plan_honors_expired_deadline() {
+        let root = temp_state_dir("upload-timeout").join("Signed.app");
+        fs::create_dir_all(&root).expect("create signed tree");
+        assert_eq!(
+            plan_signed_bundle_until(&root, Some(Instant::now())),
+            Err(UploadPlanFailure::Timeout)
+        );
+        fs::remove_dir_all(root.parent().expect("test root")).expect("remove upload test tree");
+    }
 
     #[test]
     fn upload_plan_rejects_a_replaced_file_before_follow_open() {
@@ -4257,15 +4497,54 @@ mod tests {
     #[test]
     fn post_install_verification_deadline_is_bounded_by_timeout_and_reserve() {
         let start = tokio::time::Instant::now();
+        assert_eq!(install_cleanup_reserve(), Duration::from_secs(20));
+
         let bounded = install_verification_deadline(start + Duration::from_secs(60), start);
         assert_eq!(bounded, start + RSD_INSTALL_VERIFICATION_TIMEOUT);
 
-        let reserve_limited = install_verification_deadline(start + Duration::from_secs(18), start);
+        let reserve_limited = install_verification_deadline(start + Duration::from_secs(28), start);
         assert_eq!(reserve_limited, start + Duration::from_secs(8));
+
+        let no_safe_window = install_verification_deadline(start + Duration::from_secs(15), start);
+        assert!(no_safe_window < start);
 
         let delayed_start = start + Duration::from_secs(5);
         let delayed = install_verification_deadline(start + Duration::from_secs(60), delayed_start);
         assert_eq!(delayed, delayed_start + RSD_INSTALL_VERIFICATION_TIMEOUT);
+    }
+
+    #[test]
+    fn session_cleanup_failure_preserves_staging_cleanup_diagnostic() {
+        let mut report = RsdInstallReport {
+            outcome: RsdInstallOutcome::Installed,
+            stage: RsdInstallStage::Cleanup,
+            cleanup: RsdStagingCleanup::Failed,
+            session_cleanup: RsdSessionCleanup::NotNeeded,
+            install_command_count: 1,
+            error_kind: "staging_cleanup",
+            bundle_id: Some("com.example.test".into()),
+            certificate_pressure: false,
+        };
+        record_session_cleanup(&mut report, RsdSessionCleanup::Failed);
+        assert_eq!(report.outcome, RsdInstallOutcome::Installed);
+        assert_eq!(report.cleanup, RsdStagingCleanup::Failed);
+        assert_eq!(report.session_cleanup, RsdSessionCleanup::Failed);
+        assert_eq!(report.error_kind, "staging_cleanup");
+    }
+    #[test]
+    fn multiple_session_cleanup_attempts_preserve_any_failure() {
+        assert_eq!(
+            merge_session_cleanup(RsdSessionCleanup::Succeeded, RsdSessionCleanup::NotNeeded,),
+            RsdSessionCleanup::Succeeded
+        );
+        assert_eq!(
+            merge_session_cleanup(RsdSessionCleanup::Succeeded, RsdSessionCleanup::Failed),
+            RsdSessionCleanup::Failed
+        );
+        assert_eq!(
+            merge_session_cleanup(RsdSessionCleanup::NotNeeded, RsdSessionCleanup::NotNeeded),
+            RsdSessionCleanup::NotNeeded
+        );
     }
 
     fn test_rsd_handshake() -> RsdHandshake {
@@ -4468,18 +4747,12 @@ mod tests {
     }
 
     impl ClosableRsdProvider for TestCloseProvider {
-        fn close_provider(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send {
-            let outcome = self.outcome;
-            let close_calls = self.close_calls.clone();
-            async move {
-                close_calls.fetch_add(1, Ordering::SeqCst);
-                match outcome {
-                    TestCloseOutcome::Success => Ok(()),
-                    TestCloseOutcome::Error => {
-                        Err(std::io::Error::other("synthetic close failure"))
-                    }
-                    TestCloseOutcome::Pending => std::future::pending().await,
-                }
+        async fn close_provider(&mut self) -> Result<(), std::io::Error> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                TestCloseOutcome::Success => Ok(()),
+                TestCloseOutcome::Error => Err(std::io::Error::other("synthetic close failure")),
+                TestCloseOutcome::Pending => std::future::pending().await,
             }
         }
     }
@@ -5154,6 +5427,7 @@ mod tests {
     fn appservice_setup_reporter_only_changes_the_target() {
         let failure = RsdProbeFailure {
             stage: RsdProbeStage::Tunnel,
+            session_cleanup: RsdSessionCleanup::NotNeeded,
         };
         let (reported, events) = capture_events(|| report_appservice_setup_failure(failure));
         assert_eq!(reported, failure);

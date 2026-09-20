@@ -181,7 +181,12 @@ pub enum SigningError {
     #[error("encrypted credential storage failed")]
     CredentialStorage,
 }
+pub enum ExistingDeviceSigningError {
+    Preflight(SigningError),
+    Signing(SigningError),
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningDeviceIdentity {
     name: String,
     udid: String,
@@ -220,6 +225,7 @@ pub struct AppleAccountPreflight {
 pub struct SignedAppArtifact {
     app_bundle_path: Option<PathBuf>,
     cleanup_root: Option<PathBuf>,
+    extraction_root: Option<PathBuf>,
     bundle_id: String,
 }
 
@@ -239,6 +245,61 @@ impl Drop for SignedAppArtifact {
     fn drop(&mut self) {
         self.app_bundle_path.take();
         if let Some(path) = self.cleanup_root.take() {
+            remove_signed_artifact_path(&path);
+        }
+        if let Some(path) = self.extraction_root.take() {
+            remove_signed_artifact_path(&path);
+        }
+    }
+}
+struct SideloadInput {
+    path: PathBuf,
+}
+
+impl SideloadInput {
+    fn for_ipa(ipa_path: &Path) -> Result<Self, SigningError> {
+        let parent = ipa_path.parent().ok_or(SigningError::IpaSigningFailed)?;
+        let path = parent.join(format!(".iphoneloadly-signing-{}.ipa", Uuid::now_v7()));
+        std::fs::hard_link(ipa_path, &path).map_err(|_| SigningError::IpaSigningFailed)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SideloadInput {
+    fn drop(&mut self) {
+        remove_signed_artifact_path(&self.path);
+    }
+}
+
+struct SideloadExtractionCleanup {
+    path: Option<PathBuf>,
+}
+
+impl SideloadExtractionCleanup {
+    fn for_ipa(ipa_path: &Path) -> Result<Self, SigningError> {
+        let file_name = ipa_path
+            .file_name()
+            .ok_or(SigningError::IpaSigningFailed)?
+            .to_string_lossy();
+        Ok(Self {
+            path: Some(std::env::temp_dir().join(format!("{file_name}_extracted"))),
+        })
+    }
+
+    fn into_path(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("extraction root remains owned until artifact transfer")
+    }
+}
+
+impl Drop for SideloadExtractionCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
             remove_signed_artifact_path(&path);
         }
     }
@@ -444,6 +505,7 @@ fn snapshot_signed_app_inner(
         Ok(SignedAppArtifact {
             app_bundle_path: Some(owned_path.clone()),
             cleanup_root: Some(cleanup_root.clone()),
+            extraction_root: None,
             bundle_id,
         })
     })();
@@ -695,12 +757,10 @@ impl AppleSigningProvider {
         let attempt = attempt.ok_or(SigningError::UnknownSession)?;
         Ok(attempt.status().await)
     }
-    pub async fn account_preflight(
-        &self,
+    async fn account_preflight_with_sideloader(
+        sideloader: &mut Sideloader,
         identity: &SigningDeviceIdentity,
     ) -> Result<AppleAccountPreflight, SigningError> {
-        let mut sideloader = self.sideloader.lock().await;
-        let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
         let team = sideloader
             .get_team()
             .await
@@ -748,18 +808,14 @@ impl AppleSigningProvider {
         })
     }
 
-    pub async fn sign_for_device(
+    async fn sign_for_device_with_sideloader(
         &self,
+        sideloader: &mut Sideloader,
         identity: &SigningDeviceIdentity,
         ipa_path: PathBuf,
         registration_policy: DeviceRegistrationPolicy,
         progress: impl Fn(u8) + Send + Sync + 'static,
     ) -> Result<SignedAppArtifact, SigningError> {
-        if !ipa_path.is_file() {
-            return Err(SigningError::IpaSigningFailed);
-        }
-        let mut sideloader = self.sideloader.lock().await;
-        let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
         let team = sideloader
             .get_team()
             .await
@@ -786,11 +842,13 @@ impl AppleSigningProvider {
                     .map_err(|_| SigningError::DeviceRegistrationFailed)?;
             }
         }
+        let sideload_input = SideloadInput::for_ipa(&ipa_path)?;
+        let extraction_cleanup = SideloadExtractionCleanup::for_ipa(sideload_input.path())?;
         let progress = Arc::new(progress);
         let signing_progress = progress.clone();
         let (signed_app_path, _) = sideloader
             .sign_app(
-                ipa_path,
+                sideload_input.path().to_path_buf(),
                 Some(team),
                 false,
                 Some(move |value: f32| {
@@ -800,12 +858,70 @@ impl AppleSigningProvider {
             )
             .await
             .map_err(|_| SigningError::IpaSigningFailed)?;
-        let artifact = snapshot_signed_app(
+        let mut artifact = snapshot_signed_app(
             &signed_app_path,
             &self.signing_storage_path.join("signed-artifacts"),
         )?;
+        artifact.extraction_root = Some(extraction_cleanup.into_path());
         progress(40);
         Ok(artifact)
+    }
+
+    pub async fn preflight_and_sign_for_existing_device(
+        &self,
+        identity: &SigningDeviceIdentity,
+        ipa_path: PathBuf,
+    ) -> Result<(AppleAccountPreflight, Option<SignedAppArtifact>), ExistingDeviceSigningError>
+    {
+        if !ipa_path.is_file() {
+            return Err(ExistingDeviceSigningError::Signing(
+                SigningError::IpaSigningFailed,
+            ));
+        }
+        let mut sideloader = self.sideloader.lock().await;
+        let sideloader = sideloader
+            .as_mut()
+            .ok_or(ExistingDeviceSigningError::Preflight(
+                SigningError::NotReady,
+            ))?;
+        let preflight = Self::account_preflight_with_sideloader(sideloader, identity)
+            .await
+            .map_err(ExistingDeviceSigningError::Preflight)?;
+        if preflight.device_registration == DeviceRegistrationState::NewRequired {
+            return Ok((preflight, None));
+        }
+        let artifact = self
+            .sign_for_device_with_sideloader(
+                sideloader,
+                identity,
+                ipa_path,
+                DeviceRegistrationPolicy::RequireExisting,
+                |_| {},
+            )
+            .await
+            .map_err(ExistingDeviceSigningError::Signing)?;
+        Ok((preflight, Some(artifact)))
+    }
+    pub async fn sign_for_device(
+        &self,
+        identity: &SigningDeviceIdentity,
+        ipa_path: PathBuf,
+        registration_policy: DeviceRegistrationPolicy,
+        progress: impl Fn(u8) + Send + Sync + 'static,
+    ) -> Result<SignedAppArtifact, SigningError> {
+        if !ipa_path.is_file() {
+            return Err(SigningError::IpaSigningFailed);
+        }
+        let mut sideloader = self.sideloader.lock().await;
+        let sideloader = sideloader.as_mut().ok_or(SigningError::NotReady)?;
+        self.sign_for_device_with_sideloader(
+            sideloader,
+            identity,
+            ipa_path,
+            registration_policy,
+            progress,
+        )
+        .await
     }
 
     pub async fn install_ipa(
@@ -874,6 +990,50 @@ mod tests {
     fn temp_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("iphoneloadly-signing-{name}-{}", Uuid::now_v7()))
     }
+    #[test]
+    fn sideload_inputs_use_unique_hardlinks_and_cleanup_independently() {
+        let root = temp_directory("sideload-input");
+        std::fs::create_dir_all(&root).expect("create input root");
+        let source = root.join("source.ipa");
+        std::fs::write(&source, b"ipa").expect("write source IPA");
+
+        let first = SideloadInput::for_ipa(&source).expect("create first hardlink");
+        let second = SideloadInput::for_ipa(&source).expect("create second hardlink");
+        assert_ne!(first.path(), second.path());
+        assert_eq!(std::fs::read(first.path()).expect("read first"), b"ipa");
+        assert_eq!(std::fs::read(second.path()).expect("read second"), b"ipa");
+        let first_extraction =
+            SideloadExtractionCleanup::for_ipa(first.path()).expect("first extraction root");
+        let second_extraction =
+            SideloadExtractionCleanup::for_ipa(second.path()).expect("second extraction root");
+        assert_ne!(
+            first_extraction.path.as_ref(),
+            second_extraction.path.as_ref()
+        );
+
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.is_file());
+        assert!(source.is_file());
+        drop(second);
+        assert!(!second_path.exists());
+        assert!(source.is_file());
+        std::fs::remove_dir_all(root).expect("remove input root");
+    }
+
+    #[test]
+    fn sideloader_extraction_guard_removes_untransferred_root() {
+        let ipa_path = temp_directory("extraction-guard").with_extension("ipa");
+        let guard = SideloadExtractionCleanup::for_ipa(&ipa_path).expect("derive extraction root");
+        let extraction_root = guard.path.as_ref().expect("owned extraction root").clone();
+        std::fs::create_dir_all(&extraction_root).expect("create extraction root");
+        std::fs::write(extraction_root.join("extra.bin"), b"extra").expect("write extracted extra");
+
+        drop(guard);
+        assert!(!extraction_root.exists());
+    }
 
     #[test]
     fn signed_artifact_owns_unique_bundle_and_removes_only_it_on_drop() {
@@ -889,15 +1049,22 @@ mod tests {
         )
         .expect("write signed metadata");
 
-        let artifact = snapshot_signed_app(&source, &root.join("storage")).expect("own signed app");
+        let mut artifact =
+            snapshot_signed_app(&source, &root.join("storage")).expect("own signed app");
         let owned = artifact.app_bundle_path().to_path_buf();
         assert_eq!(artifact.bundle_id(), "com.example.signed");
         assert!(!source.exists());
         assert!(owned.is_dir());
         assert_eq!(owned.parent(), Some(root.join("storage").as_path()));
+        let extraction_root = root.join("ipa-extracted");
+        std::fs::create_dir_all(&extraction_root).expect("create extraction root");
+        std::fs::write(extraction_root.join("extra.bin"), b"extra").expect("write extracted extra");
+        artifact.extraction_root = Some(extraction_root.clone());
+        assert!(extraction_root.is_dir());
 
         drop(artifact);
         assert!(!owned.exists());
+        assert!(!extraction_root.exists());
         assert!(root.join("storage").is_dir());
         assert!(root.is_dir());
         std::fs::remove_dir_all(root).expect("remove test root");
