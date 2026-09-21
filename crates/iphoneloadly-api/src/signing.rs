@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -14,7 +14,12 @@ use idevice::provider::TcpProvider;
 use isideload::{
     SideloadError,
     anisette::remote_v3::RemoteV3AnisetteProvider,
-    auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
+    auth::apple_account::{
+        AppleAccount, PostTwoFactorDiagnosticEvent as PostTwoFactorSourceEvent,
+        PostTwoFactorDiagnosticResult as PostTwoFactorSourceResult, PostTwoFactorDiagnosticSink,
+        PostTwoFactorLoginStage as PostTwoFactorSourceStage, TwoFactorCallbackParams,
+        TwoFactorCallbackResponse,
+    },
     dev::{
         certificates::CertificatesApi, developer_session::DeveloperSession, devices::DevicesApi,
     },
@@ -80,6 +85,94 @@ impl AuthNetworkClass {
     }
 }
 
+const MAX_POST_TWO_FACTOR_DIAGNOSTIC_EVENTS: usize = 32;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum PostTwoFactorDiagnosticEventKind {
+    #[serde(rename = "TRUSTED_DEVICE_VERIFY_BEGIN")]
+    TrustedDeviceVerifyBegin,
+    #[serde(rename = "TRUSTED_DEVICE_VERIFY_SUCCESS")]
+    TrustedDeviceVerifySuccess,
+    #[serde(rename = "TRUSTED_DEVICE_VERIFY_REJECTED")]
+    TrustedDeviceVerifyRejected,
+    #[serde(rename = "TRUSTED_DEVICE_VERIFY_FAILURE")]
+    TrustedDeviceVerifyFailure,
+    #[serde(rename = "TRANSITION_TO_NEEDS_LOGIN")]
+    TransitionToNeedsLogin,
+    #[serde(rename = "TRANSITION_TO_NEEDS_DEVICE_2FA_VERIFICATION")]
+    TransitionToNeedsDevice2FAVerification,
+    #[serde(rename = "POST_2FA_INITIAL_LOGIN_BEGIN")]
+    PostTwoFactorInitialLoginBegin,
+    #[serde(rename = "POST_2FA_INITIAL_LOGIN_RESPONSE_RESULT")]
+    PostTwoFactorInitialLoginResponseResult,
+    #[serde(rename = "POST_2FA_PROOF_LOGIN_BEGIN")]
+    PostTwoFactorProofLoginBegin,
+    #[serde(rename = "POST_2FA_PROOF_LOGIN_RESPONSE_RESULT")]
+    PostTwoFactorProofLoginResponseResult,
+    #[serde(rename = "TRANSITION_TO_NEEDS_DEVICE_2FA")]
+    TransitionToNeedsDevice2FA,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum PostTwoFactorRequestStage {
+    #[serde(rename = "TRUSTED_DEVICE_VERIFY")]
+    TrustedDeviceVerify,
+    #[serde(rename = "INITIAL_LOGIN")]
+    InitialLogin,
+    #[serde(rename = "PROOF_LOGIN")]
+    ProofLogin,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum PostTwoFactorAuthState {
+    #[serde(rename = "NEEDS_LOGIN")]
+    NeedsLogin,
+    #[serde(rename = "NEEDS_DEVICE_2FA")]
+    NeedsDevice2FA,
+    #[serde(rename = "NEEDS_DEVICE_2FA_VERIFICATION")]
+    NeedsDevice2FAVerification,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum PostTwoFactorResultClass {
+    #[serde(rename = "SUCCESS")]
+    Success,
+    #[serde(rename = "HTTP_FAILURE")]
+    HttpFailure,
+    #[serde(rename = "APPLE_SERVICE_FAILURE")]
+    AppleServiceFailure,
+    #[serde(rename = "RESPONSE_BODY_FAILURE")]
+    ResponseBodyFailure,
+    #[serde(rename = "PLIST_PARSE_FAILURE")]
+    PlistParseFailure,
+    #[serde(rename = "TRANSPORT_FAILURE")]
+    TransportFailure,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct PostTwoFactorDiagnosticEvent {
+    #[serde(rename = "EVENT_KIND")]
+    pub event_kind: PostTwoFactorDiagnosticEventKind,
+    #[serde(rename = "HTTP_STATUS", skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(rename = "APPLE_SERVICE_CODE", skip_serializing_if = "Option::is_none")]
+    pub apple_service_code: Option<i64>,
+    #[serde(rename = "FROM_AUTH_STATE", skip_serializing_if = "Option::is_none")]
+    pub from_auth_state: Option<PostTwoFactorAuthState>,
+    #[serde(rename = "TO_AUTH_STATE", skip_serializing_if = "Option::is_none")]
+    pub to_auth_state: Option<PostTwoFactorAuthState>,
+    #[serde(rename = "REQUEST_STAGE", skip_serializing_if = "Option::is_none")]
+    pub request_stage: Option<PostTwoFactorRequestStage>,
+    #[serde(rename = "RESULT_CLASS", skip_serializing_if = "Option::is_none")]
+    pub result_class: Option<PostTwoFactorResultClass>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PostTwoFactorDiagnosticSnapshot {
+    pub events: Vec<PostTwoFactorDiagnosticEvent>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AuthFailureDiagnostic {
     #[serde(rename = "AUTH_STAGE")]
@@ -143,6 +236,154 @@ impl AuthFailureDiagnostic {
     }
 }
 
+fn post_two_factor_result_fields(
+    result: PostTwoFactorSourceResult,
+) -> (Option<u16>, Option<i64>, Option<PostTwoFactorResultClass>) {
+    match result {
+        PostTwoFactorSourceResult::Success => (None, None, Some(PostTwoFactorResultClass::Success)),
+        PostTwoFactorSourceResult::HttpStatus(status) => (
+            Some(status),
+            None,
+            Some(PostTwoFactorResultClass::HttpFailure),
+        ),
+        PostTwoFactorSourceResult::AppleServiceCode(code) => (
+            None,
+            Some(code),
+            Some(PostTwoFactorResultClass::AppleServiceFailure),
+        ),
+        PostTwoFactorSourceResult::ResponseBodyFailure => (
+            None,
+            None,
+            Some(PostTwoFactorResultClass::ResponseBodyFailure),
+        ),
+        PostTwoFactorSourceResult::PlistParseFailure => (
+            None,
+            None,
+            Some(PostTwoFactorResultClass::PlistParseFailure),
+        ),
+        PostTwoFactorSourceResult::TransportFailure => {
+            (None, None, Some(PostTwoFactorResultClass::TransportFailure))
+        }
+    }
+}
+
+fn post_two_factor_result_event(
+    event_kind: PostTwoFactorDiagnosticEventKind,
+    request_stage: PostTwoFactorRequestStage,
+    result: PostTwoFactorSourceResult,
+) -> PostTwoFactorDiagnosticEvent {
+    let (http_status, apple_service_code, result_class) = post_two_factor_result_fields(result);
+    PostTwoFactorDiagnosticEvent {
+        event_kind,
+        http_status,
+        apple_service_code,
+        from_auth_state: None,
+        to_auth_state: None,
+        request_stage: Some(request_stage),
+        result_class,
+    }
+}
+
+fn empty_post_two_factor_event(
+    event_kind: PostTwoFactorDiagnosticEventKind,
+) -> PostTwoFactorDiagnosticEvent {
+    PostTwoFactorDiagnosticEvent {
+        event_kind,
+        http_status: None,
+        apple_service_code: None,
+        from_auth_state: None,
+        to_auth_state: None,
+        request_stage: None,
+        result_class: None,
+    }
+}
+
+fn post_two_factor_source_event(event: PostTwoFactorSourceEvent) -> PostTwoFactorDiagnosticEvent {
+    match event {
+        PostTwoFactorSourceEvent::TrustedDeviceVerifyBegin => {
+            empty_post_two_factor_event(PostTwoFactorDiagnosticEventKind::TrustedDeviceVerifyBegin)
+        }
+        PostTwoFactorSourceEvent::TrustedDeviceVerifySuccess => empty_post_two_factor_event(
+            PostTwoFactorDiagnosticEventKind::TrustedDeviceVerifySuccess,
+        ),
+        PostTwoFactorSourceEvent::TrustedDeviceVerifyRejected { apple_service_code } => {
+            PostTwoFactorDiagnosticEvent {
+                event_kind: PostTwoFactorDiagnosticEventKind::TrustedDeviceVerifyRejected,
+                http_status: None,
+                apple_service_code: Some(apple_service_code),
+                from_auth_state: None,
+                to_auth_state: None,
+                request_stage: Some(PostTwoFactorRequestStage::TrustedDeviceVerify),
+                result_class: Some(PostTwoFactorResultClass::AppleServiceFailure),
+            }
+        }
+        PostTwoFactorSourceEvent::TrustedDeviceVerifyFailure { result } => {
+            post_two_factor_result_event(
+                PostTwoFactorDiagnosticEventKind::TrustedDeviceVerifyFailure,
+                PostTwoFactorRequestStage::TrustedDeviceVerify,
+                result,
+            )
+        }
+        PostTwoFactorSourceEvent::TransitionToNeedsLogin => PostTwoFactorDiagnosticEvent {
+            event_kind: PostTwoFactorDiagnosticEventKind::TransitionToNeedsLogin,
+            http_status: None,
+            apple_service_code: None,
+            from_auth_state: Some(PostTwoFactorAuthState::NeedsDevice2FAVerification),
+            to_auth_state: Some(PostTwoFactorAuthState::NeedsLogin),
+            request_stage: None,
+            result_class: None,
+        },
+        PostTwoFactorSourceEvent::TransitionToNeedsDevice2FAVerification => {
+            PostTwoFactorDiagnosticEvent {
+                event_kind:
+                    PostTwoFactorDiagnosticEventKind::TransitionToNeedsDevice2FAVerification,
+                http_status: None,
+                apple_service_code: None,
+                from_auth_state: Some(PostTwoFactorAuthState::NeedsDevice2FAVerification),
+                to_auth_state: Some(PostTwoFactorAuthState::NeedsDevice2FAVerification),
+                request_stage: Some(PostTwoFactorRequestStage::TrustedDeviceVerify),
+                result_class: None,
+            }
+        }
+        PostTwoFactorSourceEvent::PostTwoFactorInitialLoginBegin => empty_post_two_factor_event(
+            PostTwoFactorDiagnosticEventKind::PostTwoFactorInitialLoginBegin,
+        ),
+        PostTwoFactorSourceEvent::PostTwoFactorInitialLoginResponseResult { result } => {
+            post_two_factor_result_event(
+                PostTwoFactorDiagnosticEventKind::PostTwoFactorInitialLoginResponseResult,
+                PostTwoFactorRequestStage::InitialLogin,
+                result,
+            )
+        }
+        PostTwoFactorSourceEvent::PostTwoFactorProofLoginBegin => empty_post_two_factor_event(
+            PostTwoFactorDiagnosticEventKind::PostTwoFactorProofLoginBegin,
+        ),
+        PostTwoFactorSourceEvent::PostTwoFactorProofLoginResponseResult { result } => {
+            post_two_factor_result_event(
+                PostTwoFactorDiagnosticEventKind::PostTwoFactorProofLoginResponseResult,
+                PostTwoFactorRequestStage::ProofLogin,
+                result,
+            )
+        }
+        PostTwoFactorSourceEvent::TransitionToNeedsDevice2FA { preceding_stage } => {
+            PostTwoFactorDiagnosticEvent {
+                event_kind: PostTwoFactorDiagnosticEventKind::TransitionToNeedsDevice2FA,
+                http_status: None,
+                apple_service_code: None,
+                from_auth_state: Some(PostTwoFactorAuthState::NeedsLogin),
+                to_auth_state: Some(PostTwoFactorAuthState::NeedsDevice2FA),
+                request_stage: Some(match preceding_stage {
+                    PostTwoFactorSourceStage::InitialLogin => {
+                        PostTwoFactorRequestStage::InitialLogin
+                    }
+                    PostTwoFactorSourceStage::ProofLogin => PostTwoFactorRequestStage::ProofLogin,
+                }),
+                result_class: None,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStatus {
@@ -152,6 +393,8 @@ pub struct LoginStatus {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<AuthFailureDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_two_factor_diagnostics: Option<PostTwoFactorDiagnosticSnapshot>,
 }
 
 fn log_auth_failure(diagnostic: &AuthFailureDiagnostic) {
@@ -192,6 +435,7 @@ struct LoginAttempt {
     state: Mutex<LoginStatus>,
     response: Mutex<Option<TwoFactorCallbackResponse>>,
     response_ready: Notify,
+    post_two_factor_events: StdMutex<VecDeque<PostTwoFactorDiagnosticEvent>>,
 }
 
 impl LoginAttempt {
@@ -204,14 +448,41 @@ impl LoginAttempt {
                 two_factor: None,
                 message: "Authenticating with Apple.".into(),
                 diagnostic: None,
+                post_two_factor_diagnostics: None,
             }),
             response: Mutex::new(None),
             response_ready: Notify::new(),
+            post_two_factor_events: StdMutex::new(VecDeque::new()),
         }
     }
 
     async fn status(&self) -> LoginStatus {
-        self.state.lock().await.clone()
+        let mut state = self.state.lock().await.clone();
+        state.post_two_factor_diagnostics = self.post_two_factor_snapshot();
+        state
+    }
+
+    fn post_two_factor_snapshot(&self) -> Option<PostTwoFactorDiagnosticSnapshot> {
+        let events = self
+            .post_two_factor_events
+            .lock()
+            .expect("post-two-factor diagnostic history is not poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        (!events.is_empty()).then_some(PostTwoFactorDiagnosticSnapshot { events })
+    }
+
+    fn record_post_two_factor_event(&self, event: PostTwoFactorSourceEvent) {
+        let event = post_two_factor_source_event(event);
+        let mut events = self
+            .post_two_factor_events
+            .lock()
+            .expect("post-two-factor diagnostic history is not poisoned");
+        if events.len() == MAX_POST_TWO_FACTOR_DIAGNOSTIC_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
     }
 
     async fn authenticating(&self, message: &str) {
@@ -234,6 +505,7 @@ impl LoginAttempt {
                 two_factor: Some(params),
                 message: "Apple requires a two-factor authentication response.".into(),
                 diagnostic: None,
+                post_two_factor_diagnostics: None,
             };
         }
 
@@ -261,6 +533,7 @@ impl LoginAttempt {
             two_factor: None,
             message: "Apple signing session is ready.".into(),
             diagnostic: None,
+            post_two_factor_diagnostics: None,
         };
     }
 
@@ -273,6 +546,7 @@ impl LoginAttempt {
             message: "Apple authentication failed. Check the server logs for redacted diagnostics."
                 .into(),
             diagnostic: Some(diagnostic),
+            post_two_factor_diagnostics: None,
         };
     }
 }
@@ -847,6 +1121,10 @@ impl AppleSigningProvider {
                 }
             };
             let callback_attempt = background_attempt.clone();
+            let diagnostic_attempt = background_attempt.clone();
+            let diagnostic_sink: PostTwoFactorDiagnosticSink = Arc::new(move |event| {
+                diagnostic_attempt.record_post_two_factor_event(event);
+            });
             background_attempt
                 .authenticating("Contacting Apple through the local anisette provider.")
                 .await;
@@ -856,10 +1134,14 @@ impl AppleSigningProvider {
                 Duration::from_secs(5 * 60),
                 AppleAccount::builder(&email)
                     .anisette_provider(anisette)
-                    .login(&password, move |params| {
-                        let callback_attempt = callback_attempt.clone();
-                        async move { Ok(callback_attempt.wait_for_two_factor(params).await) }
-                    }),
+                    .login_with_diagnostics(
+                        &password,
+                        move |params| {
+                            let callback_attempt = callback_attempt.clone();
+                            async move { Ok(callback_attempt.wait_for_two_factor(params).await) }
+                        },
+                        diagnostic_sink,
+                    ),
             )
             .await;
             let mut account = match result {
@@ -1403,6 +1685,7 @@ mod tests {
                 network_class: AuthNetworkClass::Http,
                 timeout: false,
             }),
+            post_two_factor_diagnostics: None,
         };
         let value = serde_json::to_value(status).expect("serialize failed login status");
         let diagnostic = value["diagnostic"].as_object().expect("diagnostic object");
@@ -1424,10 +1707,159 @@ mod tests {
             two_factor: None,
             message: "Apple signing session is ready.".into(),
             diagnostic: None,
+            post_two_factor_diagnostics: None,
         };
         let serialized = serde_json::to_string(&status).expect("serialize login status");
 
         assert!(!serialized.contains("diagnostic"));
         assert!(!serialized.contains("AUTH_STAGE"));
+    }
+
+    #[tokio::test]
+    async fn two_factor_bridge_consumes_one_response_without_synthesizing_callback() {
+        let provider = AppleSigningProvider::new(None, temp_directory("two-factor-bridge"));
+        let id = Uuid::now_v7();
+        let attempt = Arc::new(LoginAttempt::new(id));
+        provider.attempts.lock().await.insert(id, attempt.clone());
+
+        let params = TwoFactorCallbackParams {
+            last_error: None,
+            unknown: false,
+            sms: false,
+            numbers: Vec::new(),
+            selected_number_id: None,
+        };
+        let waiter = tokio::spawn({
+            let attempt = attempt.clone();
+            async move { attempt.wait_for_two_factor(params).await }
+        });
+
+        for _ in 0..100 {
+            if matches!(attempt.status().await.phase, LoginPhase::AwaitingTwoFactor) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let status = attempt.status().await;
+        assert!(matches!(status.phase, LoginPhase::AwaitingTwoFactor));
+        let callback = status
+            .two_factor
+            .expect("two-factor callback was published");
+        assert!(!callback.sms);
+        assert!(!callback.unknown);
+        assert!(callback.selected_number_id.is_none());
+
+        provider
+            .submit_two_factor(id, "submitCode", Some("123456".into()), None)
+            .await
+            .expect("submitCode should be accepted once");
+
+        let response = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("callback response should be consumed")
+            .expect("callback task should finish");
+        assert!(matches!(
+            response,
+            TwoFactorCallbackResponse::SubmitCode(code) if code == "123456"
+        ));
+        assert!(attempt.response.lock().await.is_none());
+        assert!(matches!(
+            attempt.status().await.phase,
+            LoginPhase::AwaitingTwoFactor
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_two_factor_history_is_bounded_and_redacted() {
+        let attempt = LoginAttempt::new(Uuid::now_v7());
+        for _ in 0..40 {
+            attempt.record_post_two_factor_event(
+                PostTwoFactorSourceEvent::PostTwoFactorProofLoginResponseResult {
+                    result: PostTwoFactorSourceResult::HttpStatus(503),
+                },
+            );
+        }
+
+        let status = attempt.status().await;
+        let snapshot = status
+            .post_two_factor_diagnostics
+            .as_ref()
+            .expect("diagnostic history should be exposed");
+        assert_eq!(snapshot.events.len(), MAX_POST_TWO_FACTOR_DIAGNOSTIC_EVENTS);
+        assert!(snapshot.events.iter().all(|event| {
+            matches!(
+                event.event_kind,
+                PostTwoFactorDiagnosticEventKind::PostTwoFactorProofLoginResponseResult
+            ) && event.http_status == Some(503)
+        }));
+
+        let serialized = serde_json::to_string(&status).expect("serialize login status");
+        assert!(serialized.contains("POST_2FA_PROOF_LOGIN_RESPONSE_RESULT"));
+        assert!(serialized.contains("\"HTTP_STATUS\":503"));
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("security-code"));
+        assert!(!serialized.contains("token"));
+        assert!(!serialized.contains("cookie"));
+    }
+
+    #[tokio::test]
+    async fn post_two_factor_status_exposes_typed_reentry_stage() {
+        let attempt = LoginAttempt::new(Uuid::now_v7());
+        attempt
+            .record_post_two_factor_event(PostTwoFactorSourceEvent::PostTwoFactorInitialLoginBegin);
+        attempt.record_post_two_factor_event(
+            PostTwoFactorSourceEvent::PostTwoFactorInitialLoginResponseResult {
+                result: PostTwoFactorSourceResult::Success,
+            },
+        );
+        attempt
+            .record_post_two_factor_event(PostTwoFactorSourceEvent::PostTwoFactorProofLoginBegin);
+        attempt.record_post_two_factor_event(
+            PostTwoFactorSourceEvent::PostTwoFactorProofLoginResponseResult {
+                result: PostTwoFactorSourceResult::Success,
+            },
+        );
+        attempt.record_post_two_factor_event(
+            PostTwoFactorSourceEvent::TransitionToNeedsDevice2FA {
+                preceding_stage: PostTwoFactorSourceStage::ProofLogin,
+            },
+        );
+
+        let status = attempt.status().await;
+        let value = serde_json::to_value(status).expect("serialize login status");
+        let events = value["postTwoFactorDiagnostics"]["events"]
+            .as_array()
+            .expect("diagnostic event list");
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[4]["EVENT_KIND"], "TRANSITION_TO_NEEDS_DEVICE_2FA");
+        assert_eq!(events[4]["FROM_AUTH_STATE"], "NEEDS_LOGIN");
+        assert_eq!(events[4]["TO_AUTH_STATE"], "NEEDS_DEVICE_2FA");
+        assert_eq!(events[4]["REQUEST_STAGE"], "PROOF_LOGIN");
+    }
+
+    #[tokio::test]
+    async fn post_two_factor_status_preserves_typed_failure_classes() {
+        let attempt = LoginAttempt::new(Uuid::now_v7());
+        attempt.record_post_two_factor_event(
+            PostTwoFactorSourceEvent::TrustedDeviceVerifyFailure {
+                result: PostTwoFactorSourceResult::ResponseBodyFailure,
+            },
+        );
+        attempt.record_post_two_factor_event(
+            PostTwoFactorSourceEvent::TrustedDeviceVerifyFailure {
+                result: PostTwoFactorSourceResult::PlistParseFailure,
+            },
+        );
+
+        let status = attempt.status().await;
+        let value = serde_json::to_value(status).expect("serialize login status");
+        let events = value["postTwoFactorDiagnostics"]["events"]
+            .as_array()
+            .expect("diagnostic event list");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["EVENT_KIND"], "TRUSTED_DEVICE_VERIFY_FAILURE");
+        assert_eq!(events[0]["RESULT_CLASS"], "RESPONSE_BODY_FAILURE");
+        assert_eq!(events[1]["RESULT_CLASS"], "PLIST_PARSE_FAILURE");
     }
 }

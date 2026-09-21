@@ -1688,7 +1688,7 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 [[package]]
 name = "isideload"
 version = "0.3.17"
-source = "git+https://github.com/lemehavit/isideload?rev=88c69a35682d763b7f846329d67df4c8a7099c5b#88c69a35682d763b7f846329d67df4c8a7099c5b"
+source = "git+https://github.com/lemehavit/isideload?rev=76e0749ded7e9bd4ae7dd3748ea99c43f240f0da#76e0749ded7e9bd4ae7dd3748ea99c43f240f0da"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm 0.11.0",
