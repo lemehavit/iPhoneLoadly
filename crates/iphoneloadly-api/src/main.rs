@@ -37,6 +37,8 @@ pub(crate) struct AppState {
     pub(crate) signing: Arc<signing::AppleSigningProvider>,
     pub(crate) devices: Arc<dyn DeviceTransport>,
     pub(crate) wireless_pairing: Arc<wireless_pairing::WirelessPairingService>,
+    /// Install jobs for the remotely paired device go over RSD instead of netmuxd.
+    pub(crate) rsd_install: bool,
     pub(crate) apps_dir: PathBuf,
     pub(crate) database: Arc<Mutex<rusqlite::Connection>>,
     pub(crate) app_mutation: Arc<tokio::sync::RwLock<()>>,
@@ -120,6 +122,8 @@ struct SpikeRsdInstallResponse {
     error_kind: Option<&'static str>,
     bundle_id: Option<String>,
     certificate_pressure: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signing_diagnostic: Option<signing::SigningFailureDiagnostic>,
 }
 
 const SPIKE_AFC_PROBE_PATH: &str = "/api/spike/devices/{id}/afc-probe";
@@ -307,7 +311,10 @@ impl DeviceTransport for NetmuxTransport {
                 signing::SigningError::DeviceRegistrationFailed => {
                     TransportError::DeviceRegistrationFailed
                 }
-                signing::SigningError::IpaSigningFailed => TransportError::IpaSigningFailed,
+                signing::SigningError::IpaSigningFailed
+                | signing::SigningError::ClassifiedIpaSigning(_) => {
+                    TransportError::IpaSigningFailed
+                }
                 signing::SigningError::SignedMetadataFailed => TransportError::SignedMetadataFailed,
                 signing::SigningError::DeviceInstallFailed | signing::SigningError::NotReady => {
                     TransportError::DeviceInstallFailed
@@ -778,6 +785,7 @@ mod tests {
                 signing: signing::AppleSigningProvider::new(None, root.join("signing")),
                 devices: Arc::new(RejectingTransport),
                 wireless_pairing: wireless_pairing.clone(),
+                rsd_install: false,
                 apps_dir: root.join("apps"),
                 database: Arc::new(Mutex::new(database)),
                 app_mutation: Arc::new(tokio::sync::RwLock::new(())),
@@ -1289,7 +1297,45 @@ mod tests {
             error_kind,
             bundle_id: Some("com.example.test".into()),
             certificate_pressure: false,
+            signing_diagnostic: None,
         }
+    }
+
+    #[test]
+    fn signing_failure_response_keeps_zero_installs_and_bounded_diagnostic() {
+        let mut report = install_report(
+            wireless_pairing::RsdInstallOutcome::NotStarted,
+            wireless_pairing::RsdStagingCleanup::NotNeeded,
+            "signing_failed",
+        );
+        report.stage = wireless_pairing::RsdInstallStage::Signing;
+        report.install_command_count = 0;
+        report.bundle_id = None;
+        report.signing_diagnostic = Some(crate::signing::SigningFailureDiagnostic {
+            stage: "certificateIdentity",
+            error_class: crate::signing::AuthFailureKind::DeveloperService,
+            http_status: None,
+            apple_code: Some(7460),
+            local_io: None,
+        });
+        assert_eq!(
+            super::spike_install_status(&report),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let value = serde_json::to_value(super::spike_install_response(report)).unwrap();
+        assert_eq!(value["outcome"], "notStarted");
+        assert_eq!(value["stage"], "signing");
+        assert_eq!(value["installCommandCount"], 0);
+        assert_eq!(value["signingDiagnostic"]["stage"], "certificateIdentity");
+        assert_eq!(value["signingDiagnostic"]["appleCode"], 7460);
+        assert_eq!(value["signingDiagnostic"].as_object().unwrap().len(), 5);
+        let clean = install_report(
+            wireless_pairing::RsdInstallOutcome::Installed,
+            wireless_pairing::RsdStagingCleanup::NotNeeded,
+            "",
+        );
+        let clean = serde_json::to_value(super::spike_install_response(clean)).unwrap();
+        assert!(clean.get("signingDiagnostic").is_none());
     }
 
     #[test]
@@ -1357,6 +1403,152 @@ mod tests {
             "app_already_installed",
         );
         assert_eq!(super::spike_install_status(&report), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn rsd_install_requires_explicit_on() {
+        assert!(super::rsd_install_enabled(Some("on".into())));
+        assert!(super::rsd_install_enabled(Some(" on\n".into())));
+        for value in [
+            None,
+            Some(String::new()),
+            Some("1".into()),
+            Some("ON".into()),
+        ] {
+            assert!(!super::rsd_install_enabled(value));
+        }
+    }
+
+    fn rsd_test_device() -> super::DeviceSummary {
+        let identity = crate::signing::SigningDeviceIdentity::new(
+            "Test iPhone".into(),
+            "00008110-000000000000001E".into(),
+        )
+        .unwrap();
+        super::rsd_device_summary(&identity)
+    }
+
+    #[test]
+    fn rsd_device_replaces_netmux_entry_and_survives_netmux_outage() {
+        let rsd = rsd_test_device();
+        let mut duplicate = rsd_test_device();
+        duplicate.display_name = "via netmuxd".into();
+        let other_id = super::device_id_for_udid("other-udid");
+        let mut other = rsd_test_device();
+        other.id = other_id;
+
+        let merged =
+            super::merge_install_devices(Ok(vec![duplicate, other]), Some(rsd.clone())).unwrap();
+        assert_eq!(merged.len(), 2);
+        let entry = merged.iter().find(|device| device.id == rsd.id).unwrap();
+        assert_eq!(entry.display_name, "Test iPhone");
+        assert!(merged.iter().any(|device| device.id == other_id));
+
+        let merged = super::merge_install_devices(
+            Err(super::TransportError::Unavailable),
+            Some(rsd.clone()),
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(
+            super::merge_install_devices(Err(super::TransportError::Unavailable), None),
+            Err(super::TransportError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn rsd_install_result_accepts_only_verified_installs() {
+        let mut report = install_report(
+            wireless_pairing::RsdInstallOutcome::Installed,
+            wireless_pairing::RsdStagingCleanup::Succeeded,
+            "",
+        );
+        report.bundle_id = Some("com.example.test.TEAMID1234".into());
+        assert_eq!(
+            super::rsd_install_result(report).unwrap(),
+            "com.example.test.TEAMID1234"
+        );
+
+        let mut report = install_report(
+            wireless_pairing::RsdInstallOutcome::Installed,
+            wireless_pairing::RsdStagingCleanup::Succeeded,
+            "",
+        );
+        report.bundle_id = None;
+        assert!(matches!(
+            super::rsd_install_result(report),
+            Err(super::TransportError::DeviceInstallFailed)
+        ));
+
+        for (outcome, stage, error_kind, expected) in [
+            (
+                wireless_pairing::RsdInstallOutcome::NotStarted,
+                wireless_pairing::RsdInstallStage::Signing,
+                "signing_failed",
+                "signing",
+            ),
+            (
+                wireless_pairing::RsdInstallOutcome::NotStarted,
+                wireless_pairing::RsdInstallStage::Tunnel,
+                "session_open",
+                "unavailable",
+            ),
+            (
+                wireless_pairing::RsdInstallOutcome::NotStarted,
+                wireless_pairing::RsdInstallStage::AccountPreflight,
+                "device_registration_required",
+                "registration",
+            ),
+            (
+                wireless_pairing::RsdInstallOutcome::OutcomeUnknown,
+                wireless_pairing::RsdInstallStage::Verification,
+                "verification",
+                "install",
+            ),
+        ] {
+            let mut report = install_report(
+                outcome,
+                wireless_pairing::RsdStagingCleanup::NotNeeded,
+                error_kind,
+            );
+            report.stage = stage;
+            let error = super::rsd_install_result(report).unwrap_err();
+            let matched = match expected {
+                "signing" => matches!(error, super::TransportError::IpaSigningFailed),
+                "unavailable" => matches!(error, super::TransportError::Unavailable),
+                "registration" => matches!(error, super::TransportError::DeviceRegistrationFailed),
+                _ => matches!(error, super::TransportError::DeviceInstallFailed),
+            };
+            assert!(matched, "unexpected mapping for {expected}");
+        }
+    }
+
+    #[test]
+    fn rsd_installed_apps_reads_names_versions_and_falls_back() {
+        let mut full = plist::Dictionary::new();
+        full.insert("CFBundleName".into(), "hello_world".into());
+        full.insert("CFBundleShortVersionString".into(), "1.13.8".into());
+        let mut apps = std::collections::HashMap::new();
+        apps.insert(
+            "com.k2fsa.sherpa.onnx.hello.world.252NQ2KTH7".to_owned(),
+            plist::Value::Dictionary(full),
+        );
+        apps.insert("com.example.bare".to_owned(), plist::Value::Boolean(true));
+        let mut listed = super::rsd_installed_apps(apps);
+        listed.sort_by(|a, b| a.bundle_id.cmp(&b.bundle_id));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].bundle_id, "com.example.bare");
+        assert_eq!(listed[0].display_name, "com.example.bare");
+        assert_eq!(listed[0].version, "—");
+        assert_eq!(listed[1].display_name, "hello_world");
+        assert_eq!(listed[1].version, "1.13.8");
+        assert!(super::managed_app(
+            &listed[1].bundle_id,
+            &[crate::store::ManagedAppIdentity {
+                installed_bundle_id: None,
+                source_bundle_id: Some("com.k2fsa.sherpa.onnx.hello.world".into()),
+            }]
+        ));
     }
 }
 
@@ -1532,8 +1724,82 @@ async fn submit_apple_two_factor(
     }
 }
 
+fn rsd_install_enabled(value: Option<String>) -> bool {
+    value.as_deref().map(str::trim) == Some("on")
+}
+
+/// The remotely paired device, when RSD install is enabled and its identity
+/// can be verified over the preserved pairing.
+async fn rsd_device(state: &AppState) -> Option<DeviceSummary> {
+    if !state.rsd_install {
+        return None;
+    }
+    let identity = state
+        .wireless_pairing
+        .remote_pairing_device_identity()
+        .await?;
+    Some(rsd_device_summary(&identity))
+}
+
+fn rsd_device_summary(identity: &signing::SigningDeviceIdentity) -> DeviceSummary {
+    DeviceSummary {
+        id: device_id_for_udid(identity.udid()),
+        display_name: identity.name().to_owned(),
+        product_type: "unknown".into(),
+        ios_version: "unknown".into(),
+        connection_type: ConnectionType::Network,
+        status: DeviceStatus::Online,
+        install_eligible: true,
+    }
+}
+
+/// netmuxd devices plus the RSD device. The RSD entry wins for its own id so
+/// installs to it never take the netmuxd path.
+async fn install_devices(state: &AppState) -> Result<Vec<DeviceSummary>, TransportError> {
+    let network = state.devices.list_network_devices().await;
+    let rsd = rsd_device(state).await;
+    merge_install_devices(network, rsd)
+}
+
+fn merge_install_devices(
+    network: Result<Vec<DeviceSummary>, TransportError>,
+    rsd: Option<DeviceSummary>,
+) -> Result<Vec<DeviceSummary>, TransportError> {
+    let Some(rsd) = rsd else {
+        return network;
+    };
+    let mut devices = network.unwrap_or_default();
+    devices.retain(|device| device.id != rsd.id);
+    devices.push(rsd);
+    Ok(devices)
+}
+
+fn rsd_installed_apps(
+    apps: std::collections::HashMap<String, plist::Value>,
+) -> Vec<InstalledAppSummary> {
+    apps.into_iter()
+        .map(|(bundle_id, value)| {
+            let info = value.as_dictionary();
+            let field = |keys: [&str; 2]| {
+                info.and_then(|info| {
+                    keys.iter()
+                        .find_map(|key| info.get(*key).and_then(|v| v.as_string()))
+                })
+                .map(str::to_owned)
+            };
+            InstalledAppSummary {
+                display_name: field(["CFBundleDisplayName", "CFBundleName"])
+                    .unwrap_or_else(|| bundle_id.clone()),
+                version: field(["CFBundleShortVersionString", "CFBundleVersion"])
+                    .unwrap_or_else(|| "—".to_owned()),
+                bundle_id,
+            }
+        })
+        .collect()
+}
+
 async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
-    match state.devices.list_network_devices().await {
+    match install_devices(&state).await {
         Ok(devices) => (StatusCode::OK, Json(devices)).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1658,7 +1924,20 @@ async fn list_device_apps(
                 .into_response();
         }
     };
-    match state.devices.list_installed_apps(id).await {
+    let installed = if rsd_device(&state)
+        .await
+        .is_some_and(|device| device.id == id)
+    {
+        state
+            .wireless_pairing
+            .remote_pairing_user_apps()
+            .await
+            .map(rsd_installed_apps)
+            .map_err(|()| TransportError::Unavailable)
+    } else {
+        state.devices.list_installed_apps(id).await
+    };
+    match installed {
         Ok(mut apps) => {
             apps.retain(|app| managed_app(&app.bundle_id, &identities));
             apps.sort_by(|a, b| a.display_name.cmp(&b.display_name));
@@ -1817,6 +2096,7 @@ fn spike_install_response(report: wireless_pairing::RsdInstallReport) -> SpikeRs
         error_kind: (!report.error_kind.is_empty()).then_some(report.error_kind),
         bundle_id: report.bundle_id,
         certificate_pressure: report.certificate_pressure,
+        signing_diagnostic: report.signing_diagnostic,
     }
 }
 
@@ -1974,7 +2254,7 @@ async fn create_install_job(
             Json(serde_json::json!({"message":"Apple signing is not ready. Sign in before creating an installation job."})),
         ).into_response();
     }
-    let devices = match state.devices.list_network_devices().await {
+    let devices = match install_devices(&state).await {
         Ok(devices) => devices,
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2043,7 +2323,7 @@ async fn trigger_refresh(State(state): State<AppState>) -> impl IntoResponse {
     if !state.signing.is_ready().await {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"message":"Apple signing is not ready. Sign in before refreshing apps."}))).into_response();
     }
-    let devices = match state.devices.list_network_devices().await {
+    let devices = match install_devices(&state).await {
         Ok(devices) => devices,
         Err(_) => return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2107,22 +2387,48 @@ async fn run_install_job(
     set_job_status(&state.database, id, "connecting", Some(0));
     set_job_status(&state.database, id, "signing", Some(1));
     let progress_database = state.database.clone();
-    let result = state
-        .devices
-        .install_ipa(
-            &state.signing,
-            device_id,
-            ipa_path,
-            Box::new(move |progress| {
-                let phase = if progress >= 40 {
-                    "transferring"
-                } else {
-                    "signing"
-                };
-                set_job_status(&progress_database, id, phase, Some(progress));
-            }),
-        )
-        .await;
+    let rsd_target = rsd_device(&state)
+        .await
+        .is_some_and(|device| device.id == device_id);
+    let result = if rsd_target {
+        // One RSD tunnel at a time; refresh may queue several jobs.
+        let _single_flight = state.spike_install_mutation.lock().await;
+        let report = state
+            .wireless_pairing
+            .install_remote_pairing_app(
+                state.signing.clone(),
+                ipa_path,
+                wireless_pairing::ExistingAppPolicy::Upgrade,
+            )
+            .await;
+        tracing::info!(
+            job_id = %id,
+            transport = "rsd",
+            outcome = report.outcome.as_str(),
+            stage = report.stage.as_str(),
+            error_kind = report.error_kind,
+            install_command_count = report.install_command_count,
+            "RSD install job finished"
+        );
+        rsd_install_result(report)
+    } else {
+        state
+            .devices
+            .install_ipa(
+                &state.signing,
+                device_id,
+                ipa_path,
+                Box::new(move |progress| {
+                    let phase = if progress >= 40 {
+                        "transferring"
+                    } else {
+                        "signing"
+                    };
+                    set_job_status(&progress_database, id, phase, Some(progress));
+                }),
+            )
+            .await
+    };
     match result {
         Ok(bundle_id) => {
             if let Ok(connection) = state.database.lock() {
@@ -2149,6 +2455,32 @@ async fn run_install_job(
             set_job_status(&state.database, id, "failed", None);
         }
     }
+}
+
+/// Only a verified `installed` outcome counts as success; the signed bundle id
+/// (with the team suffix) is what the job records.
+fn rsd_install_result(
+    report: wireless_pairing::RsdInstallReport,
+) -> Result<String, TransportError> {
+    use wireless_pairing::{RsdInstallOutcome, RsdInstallStage};
+    if report.outcome == RsdInstallOutcome::Installed {
+        return report.bundle_id.ok_or(TransportError::DeviceInstallFailed);
+    }
+    Err(match report.stage {
+        RsdInstallStage::Discovery
+        | RsdInstallStage::ValidatePairing
+        | RsdInstallStage::Tunnel
+        | RsdInstallStage::RsdHandshake => TransportError::Unavailable,
+        RsdInstallStage::Identity => TransportError::DeviceInfoFailed,
+        RsdInstallStage::AccountPreflight
+            if report.error_kind == "device_registration_required" =>
+        {
+            TransportError::DeviceRegistrationFailed
+        }
+        RsdInstallStage::AccountPreflight => TransportError::DeveloperTeamFailed,
+        RsdInstallStage::Signing => TransportError::IpaSigningFailed,
+        _ => TransportError::DeviceInstallFailed,
+    })
 }
 
 fn set_job_status(
@@ -2582,12 +2914,23 @@ async fn upload_ipa(State(state): State<AppState>, mut multipart: Multipart) -> 
 
 #[tokio::main]
 async fn main() {
-    let spike_mode = std::env::args().any(|argument| argument == "--wireless-pairing-spike");
+    let arguments = std::env::args().collect::<Vec<_>>();
+    let spike_mode = arguments
+        .iter()
+        .any(|argument| argument == "--wireless-pairing-spike");
+    let anisette_diagnostic_mode = arguments
+        .iter()
+        .any(|argument| argument == "--isolated-anisette-provisioning-diagnostic");
 
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("install rustls AWS-LC crypto provider");
     isideload::init().expect("initialize isideload error reporting");
+
+    if anisette_diagnostic_mode {
+        run_isolated_anisette_provisioning_diagnostic().await;
+        return;
+    }
 
     tracing_subscriber::registry()
         .with(
@@ -2657,6 +3000,8 @@ async fn main() {
         ),
         devices,
         wireless_pairing,
+        rsd_install: !spike_mode
+            && rsd_install_enabled(std::env::var("IPHONELOADLY_RSD_INSTALL").ok()),
         apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
         app_mutation: Arc::new(tokio::sync::RwLock::new(())),
@@ -2752,4 +3097,84 @@ async fn main() {
         .expect("bind API listener");
     tracing::info!(%address, spike_mode, "iPhoneLoadly API listening");
     axum::serve(listener, app).await.expect("serve API");
+}
+
+async fn run_isolated_anisette_provisioning_diagnostic() {
+    use isideload::{
+        anisette::{
+            AnisetteProvider,
+            remote_v3::{
+                AnisetteProvisioningDiagnosticSink, AnisetteProvisioningStage,
+                RemoteV3AnisetteProvider,
+            },
+        },
+        auth::grandslam::GrandSlam,
+        util::storage::InMemoryStorage,
+    };
+
+    let Ok(url) = std::env::var("IPHONELOADLY_ANISETTE_URL") else {
+        println!("ANISETTE_DIAGNOSTIC_RESULT=CONFIG_MISSING");
+        return;
+    };
+    if url.is_empty() {
+        println!("ANISETTE_DIAGNOSTIC_RESULT=CONFIG_MISSING");
+        return;
+    }
+
+    let events = Arc::new(Mutex::new(Vec::<AnisetteProvisioningStage>::new()));
+    let event_store = events.clone();
+    let sink: AnisetteProvisioningDiagnosticSink = Arc::new(move |event| {
+        if let Ok(mut events) = event_store.lock() {
+            if events.len() < 64 {
+                events.push(event);
+            }
+        }
+    });
+
+    let diagnostic = async {
+        let mut provider = match RemoteV3AnisetteProvider::new(
+            &url,
+            Box::new(InMemoryStorage::new()),
+            "0".to_string(),
+        ) {
+            Ok(provider) => provider.set_diagnostic_sink(Some(sink)),
+            Err(_) => return "PROVIDER_BUILD_FAILED",
+        };
+        let client_info = match provider.get_client_info().await {
+            Ok(client_info) => client_info,
+            Err(_) => return "CLIENT_INFO_FAILED",
+        };
+        let grandslam = match GrandSlam::new(client_info, false, None).await {
+            Ok(grandslam) => Arc::new(grandslam),
+            Err(_) => return "URL_BAG_FAILED",
+        };
+        if provider.provision(grandslam).await.is_err() {
+            return "PROVISION_FAILED";
+        }
+        if provider.get_anisette_data().await.is_err() {
+            return "HEADERS_FAILED";
+        }
+        "SUCCESS"
+    };
+
+    let result = match tokio::time::timeout(Duration::from_secs(45), diagnostic).await {
+        Ok(result) => result,
+        Err(_) => "TIMEOUT",
+    };
+    println!("ANISETTE_DIAGNOSTIC_RESULT={result}");
+    let events = events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    println!("ANISETTE_EVENT_COUNT={}", events.len());
+    for (index, event) in events.iter().enumerate() {
+        println!("ANISETTE_EVENT_{index}={}", event.as_str());
+    }
+    println!("SAVED_CREDENTIALS_READ=False");
+    println!("APPLE_ACCOUNT_LOGIN_EXECUTED=False");
+    println!("TWO_FACTOR_SUBMITTED=False");
+    println!("PHONE_CONTACTED=False");
+    println!("PAIRING_EXECUTED=False");
+    println!("SIGNING_EXECUTED=False");
+    println!("INSTALL_EXECUTED=False");
+    println!("PRODUCTION_CHANGED=False");
 }

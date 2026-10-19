@@ -27,7 +27,6 @@ use idevice::{
             opcode::{AfcFopenMode, AfcOpcode},
             packet::{AfcPacket, AfcPacketHeader},
         },
-        core_device::AppServiceClient,
         installation_proxy::{InstallationProxyClient, InstallationProxyError},
         lockdown::LockdownClient,
         rsd::RsdHandshake,
@@ -332,6 +331,7 @@ pub(crate) struct RsdInstallReport {
     pub(crate) error_kind: &'static str,
     pub(crate) bundle_id: Option<String>,
     pub(crate) certificate_pressure: bool,
+    pub(crate) signing_diagnostic: Option<crate::signing::SigningFailureDiagnostic>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoreDeviceServiceOperation {
@@ -563,8 +563,17 @@ pub struct WirelessPairingService {
     store: Arc<PairingStore>,
     session: Arc<Mutex<Option<SessionRuntime>>>,
     start_lock: Arc<Mutex<()>>,
+    identity_cache: Arc<Mutex<Option<crate::signing::SigningDeviceIdentity>>>,
     #[cfg(test)]
     probe_open_attempts: Arc<AtomicUsize>,
+}
+
+/// Whether an RSD install may replace an app that is already on the device.
+/// The one-shot spike refuses; production install and refresh jobs upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistingAppPolicy {
+    Refuse,
+    Upgrade,
 }
 
 trait ClosableRsdProvider {
@@ -786,6 +795,7 @@ impl WirelessPairingService {
             config,
             session: Arc::new(Mutex::new(None)),
             start_lock: Arc::new(Mutex::new(())),
+            identity_cache: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             probe_open_attempts: Arc::new(AtomicUsize::new(0)),
         }
@@ -926,40 +936,15 @@ impl WirelessPairingService {
     }
 
     pub async fn probe_remote_pairing_rsd(&self) -> Result<(), RsdProbeFailure> {
-        let mut session = RemoteRsdSession::open(self, None)
+        let session = RemoteRsdSession::open(self, None)
             .await
             .map_err(report_appservice_setup_failure)?;
         report_parsed_rsd_service_summary(parsed_rsd_service_summary(session.handshake()));
-        let result = async {
-            let app_port = core_device_appservice_port(session.handshake())
-                .map_err(report_core_device_service_failure)?;
-            let app_stream = run_core_device_service_operation(
-                CoreDeviceServiceOperation::ServiceConnect,
-                true,
-                REMOTE_CONNECT_TIMEOUT,
-                session.provider_mut().connect_to_service_port(app_port),
-            )
-            .await
-            .map_err(report_core_device_service_failure)?;
-            let mut app_service = run_core_device_service_operation(
-                CoreDeviceServiceOperation::ClientInit,
-                true,
-                REMOTE_CONNECT_TIMEOUT,
-                AppServiceClient::<idevice::IdeviceSocket>::new(app_stream),
-            )
-            .await
-            .map_err(report_core_device_service_failure)?;
-            let _ = run_core_device_service_operation(
-                CoreDeviceServiceOperation::ListApps,
-                true,
-                REMOTE_CONNECT_TIMEOUT,
-                app_service.list_apps(false, false, false, false, false),
-            )
-            .await
-            .map_err(report_core_device_service_failure)?;
-            Ok(())
-        }
-        .await;
+        let result = required_install_path_services_present(session.handshake())
+            .then_some(())
+            .ok_or_else(|| {
+                report_core_device_service_failure(CoreDeviceServiceFailure::missing_service())
+            });
         let _ = timeout(REMOTE_CONNECT_TIMEOUT, session.close()).await;
         result
     }
@@ -1161,10 +1146,70 @@ impl WirelessPairingService {
         .await
     }
 
+    /// Installed user apps on the remotely paired device, keyed by bundle id.
+    /// Read-only: one Installation Proxy lookup over a fresh RSD session.
+    pub(crate) async fn remote_pairing_user_apps(
+        &self,
+    ) -> Result<std::collections::HashMap<String, plist::Value>, ()> {
+        let deadline = tokio::time::Instant::now() + RSD_APP_LIST_TIMEOUT;
+        let mut session = tokio::time::timeout_at(deadline, RemoteRsdSession::open(self, None))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let result = async {
+            let mut client = session.installation_proxy_client(deadline).await?;
+            tokio::time::timeout_at(deadline, client.get_apps(Some("User"), None))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())
+        }
+        .await;
+        let _ = close_install_session(session).await;
+        result
+    }
+
+    /// Identity of the single remotely paired device, cached after the first
+    /// verified RSD lookup so device listing does not open a tunnel each time.
+    pub(crate) async fn remote_pairing_device_identity(
+        &self,
+    ) -> Option<crate::signing::SigningDeviceIdentity> {
+        if let Some(identity) = self.identity_cache.lock().await.clone() {
+            return Some(identity);
+        }
+        let mut session = timeout(
+            RSD_IDENTITY_LOOKUP_TIMEOUT,
+            RemoteRsdSession::open(self, None),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let identity = timeout(
+            RSD_IDENTITY_LOOKUP_TIMEOUT,
+            session.verified_signing_identity(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let _ = close_install_session(session).await;
+        let identity = identity?;
+        *self.identity_cache.lock().await = Some(identity.clone());
+        Some(identity)
+    }
+
     pub(crate) async fn install_remote_pairing_first_app(
         &self,
         signing: Arc<crate::signing::AppleSigningProvider>,
         ipa_path: PathBuf,
+    ) -> RsdInstallReport {
+        self.install_remote_pairing_app(signing, ipa_path, ExistingAppPolicy::Refuse)
+            .await
+    }
+
+    pub(crate) async fn install_remote_pairing_app(
+        &self,
+        signing: Arc<crate::signing::AppleSigningProvider>,
+        ipa_path: PathBuf,
+        existing_app: ExistingAppPolicy,
     ) -> RsdInstallReport {
         let deadline = tokio::time::Instant::now() + RSD_INSTALL_TIMEOUT;
         let work_deadline = install_work_deadline(deadline, tokio::time::Instant::now());
@@ -1250,6 +1295,9 @@ impl WirelessPairingService {
                     };
                     let mut report =
                         rsd_install_failure(stage, signing_error_kind(&error), false, None);
+                    if let crate::signing::SigningError::ClassifiedIpaSigning(diagnostic) = error {
+                        report.signing_diagnostic = Some(diagnostic);
+                    }
                     record_session_cleanup(&mut report, initial_session_cleanup);
                     return report;
                 }
@@ -1362,6 +1410,7 @@ impl WirelessPairingService {
             certificate_pressure,
             deadline,
             &mut artifact_cleanup,
+            existing_app,
         )
         .await;
         let final_session_cleanup = close_install_session(session).await;
@@ -1673,6 +1722,8 @@ impl WirelessPairingService {
 }
 
 const RSD_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const RSD_IDENTITY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+const RSD_APP_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const RSD_INSTALL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const RSD_INSTALL_SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const RSD_INSTALL_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2283,6 +2334,11 @@ fn exact_rsd_service_port(handshake: &RsdHandshake, service_name: &str) -> Optio
         .and_then(|service| (service.port != 0).then_some(service.port))
 }
 
+fn required_install_path_services_present(handshake: &RsdHandshake) -> bool {
+    exact_rsd_service_port(handshake, AFC_SERVICE_NAME).is_some()
+        && exact_rsd_service_port(handshake, INSTALLATION_PROXY_SERVICE_NAME).is_some()
+}
+
 fn validate_rsd_identity(
     handshake_identity: Option<&plist::Value>,
     lockdown_identity: Option<&plist::Value>,
@@ -2641,6 +2697,7 @@ fn rsd_install_failure(
         error_kind,
         bundle_id,
         certificate_pressure,
+        signing_diagnostic: None,
     }
 }
 
@@ -2660,40 +2717,43 @@ async fn execute_rsd_first_install(
     certificate_pressure: bool,
     deadline: tokio::time::Instant,
     artifact_cleanup: &mut Option<crate::signing::SignedAppArtifact>,
+    existing_app: ExistingAppPolicy,
 ) -> RsdInstallReport {
     let work_deadline = install_work_deadline(deadline, tokio::time::Instant::now());
 
-    let mut installation_proxy = match session.installation_proxy_client(work_deadline).await {
-        Ok(client) => client,
-        Err(()) => {
-            return rsd_install_failure(
-                RsdInstallStage::AlreadyInstalled,
-                "installation_proxy",
-                certificate_pressure,
-                Some(bundle_id),
-            );
+    if existing_app == ExistingAppPolicy::Refuse {
+        let mut installation_proxy = match session.installation_proxy_client(work_deadline).await {
+            Ok(client) => client,
+            Err(()) => {
+                return rsd_install_failure(
+                    RsdInstallStage::AlreadyInstalled,
+                    "installation_proxy",
+                    certificate_pressure,
+                    Some(bundle_id),
+                );
+            }
+        };
+        match installed_bundle_lookup(&mut installation_proxy, &bundle_id, work_deadline).await {
+            Ok(true) => {
+                return rsd_install_failure(
+                    RsdInstallStage::AlreadyInstalled,
+                    "app_already_installed",
+                    certificate_pressure,
+                    Some(bundle_id),
+                );
+            }
+            Ok(false) => {}
+            Err(()) => {
+                return rsd_install_failure(
+                    RsdInstallStage::AlreadyInstalled,
+                    "installed_app_lookup",
+                    certificate_pressure,
+                    Some(bundle_id),
+                );
+            }
         }
-    };
-    match installed_bundle_lookup(&mut installation_proxy, &bundle_id, work_deadline).await {
-        Ok(true) => {
-            return rsd_install_failure(
-                RsdInstallStage::AlreadyInstalled,
-                "app_already_installed",
-                certificate_pressure,
-                Some(bundle_id),
-            );
-        }
-        Ok(false) => {}
-        Err(()) => {
-            return rsd_install_failure(
-                RsdInstallStage::AlreadyInstalled,
-                "installed_app_lookup",
-                certificate_pressure,
-                Some(bundle_id),
-            );
-        }
+        drop(installation_proxy);
     }
-    drop(installation_proxy);
 
     let artifact = artifact_cleanup
         .take()
@@ -2833,6 +2893,7 @@ async fn execute_rsd_first_install(
                 error_kind,
                 bundle_id: Some(bundle_id.clone()),
                 certificate_pressure,
+                signing_diagnostic: None,
             }
         }
         Ok(Err(error_kind)) => {
@@ -4524,6 +4585,7 @@ mod tests {
             error_kind: "staging_cleanup",
             bundle_id: Some("com.example.test".into()),
             certificate_pressure: false,
+            signing_diagnostic: None,
         };
         record_session_cleanup(&mut report, RsdSessionCleanup::Failed);
         assert_eq!(report.outcome, RsdInstallOutcome::Installed);
@@ -6128,6 +6190,30 @@ mod tests {
                 Some(62_001)
             );
         }
+    }
+
+    #[test]
+    fn rsd_readiness_requires_both_install_path_services() {
+        let mut handshake = test_rsd_handshake();
+        assert!(!required_install_path_services_present(&handshake));
+
+        handshake
+            .services
+            .insert(AFC_SERVICE_NAME.to_owned(), test_rsd_service("", 62_010));
+        assert!(!required_install_path_services_present(&handshake));
+
+        handshake.services.insert(
+            INSTALLATION_PROXY_SERVICE_NAME.to_owned(),
+            test_rsd_service("", 62_011),
+        );
+        assert!(required_install_path_services_present(&handshake));
+
+        handshake
+            .services
+            .get_mut(INSTALLATION_PROXY_SERVICE_NAME)
+            .expect("installation proxy service")
+            .port = 0;
+        assert!(!required_install_path_services_present(&handshake));
     }
 
     #[test]
