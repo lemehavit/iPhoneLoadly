@@ -3,6 +3,70 @@
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
 
+## [Unreleased]
+
+## [0.3.0-alpha.5] - 2026-10-20
+
+### Added
+
+- Experimental Apple TV support behind `IPHONELOADLY_APPLE_TV=on` (requires
+  `IPHONELOADLY_RSD_INSTALL=on`). Settings gets an Apple TV card that finds an
+  Apple TV showing "Remote App and Devices" and pairs with the PIN it shows.
+  The paired Apple TV appears in the device list and installs, refreshes and
+  lists apps over the same RSD path as the iPhone. Signing registers the Apple
+  TV and requests tvOS provisioning profiles on its first install.
+- Install jobs refuse an iOS-only IPA on an Apple TV and a tvOS IPA on an
+  iPhone before any Apple account work starts.
+- Apple TV discovery logs what it saw (found, resolved and rejected services),
+  and install jobs log why signing failed (the bounded signing error and, when
+  present, the signing diagnostic).
+
+### Changed
+
+- The install picker calls the target a device instead of an iPhone, since it
+  also lists the Apple TV.
+
+### Fixed
+
+- The API service may now use netlink (`AF_NETLINK` in
+  `RestrictAddressFamilies`). Without it mDNS could not list network
+  interfaces, so Apple TV discovery and RSD discovery of the iPhone found
+  nothing.
+- Apple TV discovery waits 10 seconds, like the iPhone's RSD discovery.
+- The 2FA dialog no longer reopens after a submitted code while Apple is still
+  checking it.
+- The GitHub sources, managed installations and validity lists keep their list
+  layout after a loading or error message, instead of squeezing each row into a
+  narrow column.
+- IPAs with small, highly compressed files (such as NuvioTV's silent audio
+  file) are no longer rejected by the compression-ratio check on upload or
+  GitHub download; the check now applies to entries of 1 MiB or more.
+- An app whose IPA file is missing on the server no longer reports "The IPA
+  could not be signed". Install jobs fail with a clear message, the app can
+  still be removed, and "Download latest" restores the file even when the
+  release is unchanged.
+
+## [0.3.0-alpha.4] - 2026-10-20
+
+### Added
+
+- Wireless installs over RSD for an iPhone paired with remote pairing. With
+  `IPHONELOADLY_RSD_INSTALL=on` the paired iPhone appears in the device list,
+  and install and refresh jobs to it go over RSD, upgrading an app that is
+  already installed. A job only succeeds after the install is verified on the
+  device and records the team-suffixed bundle identifier.
+- The installed-apps list for the RSD iPhone is read over RSD.
+- Install responses can carry a bounded `signingDiagnostic` (stage, error
+  class, HTTP status, Apple code, local I/O kind) without raw error text.
+
+### Fixed
+
+- Apple sign-in after GrandSlam error -80045: anisette client info and URL bag
+  handling backported from upstream; GrandSlam keeps pinned Apple trust while
+  Developer Services uses public PKI.
+- App ID and app group names are stripped of characters Apple rejects (result
+  code 35), so apps such as `hello_world` can be signed.
+
 ## [0.3.0-alpha.3] - 2026-08-31
 
 ### Changed

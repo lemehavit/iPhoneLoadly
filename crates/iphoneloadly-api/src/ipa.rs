@@ -14,6 +14,10 @@ pub const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 20_000;
 pub const MAX_COMPRESSION_RATIO: u64 = 200;
+/// Entries smaller than this skip the ratio check. Small padding files
+/// (silent audio, blank images) compress far beyond 200:1 but cannot
+/// expand into anything dangerous; MAX_EXPANDED_BYTES still caps the total.
+const RATIO_CHECK_MIN_BYTES: u64 = 1024 * 1024;
 const MAX_INFO_PLIST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +29,71 @@ pub struct UploadMetadata {
     pub display_name: String,
     pub app_version: Option<String>,
     pub info_plist_present: bool,
+    pub platform: AppPlatform,
+}
+
+/// The device family an IPA is built for, read from its Info.plist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppPlatform {
+    Ios,
+    Tvos,
+    /// Info.plist names no platform; installs are allowed on any device.
+    Unknown,
+}
+
+impl AppPlatform {
+    /// Whether an app for this platform can be installed on the given device.
+    pub fn installable_on_apple_tv(self, apple_tv: bool) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Tvos => apple_tv,
+            Self::Ios => !apple_tv,
+        }
+    }
+
+    fn from_info_plist(dictionary: &plist::Dictionary) -> Self {
+        let names = dictionary
+            .get("DTPlatformName")
+            .and_then(plist_string)
+            .into_iter()
+            .chain(
+                dictionary
+                    .get("CFBundleSupportedPlatforms")
+                    .and_then(plist::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(plist_string),
+            )
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        if names.iter().any(|name| name.starts_with("appletv")) {
+            return Self::Tvos;
+        }
+        if names
+            .iter()
+            .any(|name| name.starts_with("iphone") || name.starts_with("ipad"))
+        {
+            return Self::Ios;
+        }
+        // UIDeviceFamily 3 is Apple TV; 1 and 2 are iPhone and iPad.
+        let families = dictionary
+            .get("UIDeviceFamily")
+            .and_then(plist::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(plist::Value::as_unsigned_integer)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if families.contains(&3) {
+            Self::Tvos
+        } else if families.iter().any(|family| matches!(family, 1 | 2)) {
+            Self::Ios
+        } else {
+            Self::Unknown
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -78,6 +147,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let mut bundle_id = None;
     let mut display_name = None;
     let mut app_version = None;
+    let mut platform = AppPlatform::Unknown;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -88,7 +158,8 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
         if expanded_bytes > MAX_EXPANDED_BYTES {
             return Err(UploadError::ExpansionLimit);
         }
-        if entry.compressed_size() > 0
+        if entry.size() >= RATIO_CHECK_MIN_BYTES
+            && entry.compressed_size() > 0
             && entry.size() / entry.compressed_size() > MAX_COMPRESSION_RATIO
         {
             return Err(UploadError::ExpansionLimit);
@@ -132,6 +203,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
                 .or_else(|| dictionary.get("CFBundleVersion").and_then(plist_string))
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned);
+            platform = AppPlatform::from_info_plist(dictionary);
         }
     }
     let app_bundle_path = app_bundle.ok_or(UploadError::InvalidPayload)?;
@@ -152,6 +224,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
         display_name,
         app_version,
         info_plist_present,
+        platform,
     })
 }
 
@@ -161,6 +234,10 @@ fn plist_string(value: &plist::Value) -> Option<&str> {
 
 pub fn bundle_identifier(path: &Path) -> Result<String, UploadError> {
     Ok(inspect_ipa(path)?.bundle_id)
+}
+
+pub fn app_platform(path: &Path) -> Result<AppPlatform, UploadError> {
+    Ok(inspect_ipa(path)?.platform)
 }
 
 fn validate_archive_path(name: &str) -> Result<(), UploadError> {
@@ -185,4 +262,100 @@ fn main_bundle_from_entry(name: &str) -> Option<&str> {
     bundle
         .ends_with(".app")
         .then(|| &name[.."Payload/".len() + bundle.len()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform(entries: &[(&str, plist::Value)]) -> AppPlatform {
+        let mut dictionary = plist::Dictionary::new();
+        for (key, value) in entries {
+            dictionary.insert((*key).into(), value.clone());
+        }
+        AppPlatform::from_info_plist(&dictionary)
+    }
+
+    #[test]
+    fn detects_tvos_and_ios_bundles() {
+        assert_eq!(
+            platform(&[("DTPlatformName", "appletvos".into())]),
+            AppPlatform::Tvos
+        );
+        assert_eq!(
+            platform(&[(
+                "CFBundleSupportedPlatforms",
+                plist::Value::Array(vec!["AppleTVOS".into()])
+            )]),
+            AppPlatform::Tvos
+        );
+        assert_eq!(
+            platform(&[("DTPlatformName", "iphoneos".into())]),
+            AppPlatform::Ios
+        );
+        assert_eq!(
+            platform(&[("UIDeviceFamily", plist::Value::Array(vec![3_u64.into()]))]),
+            AppPlatform::Tvos
+        );
+        assert_eq!(
+            platform(&[(
+                "UIDeviceFamily",
+                plist::Value::Array(vec![1_u64.into(), 2_u64.into()])
+            )]),
+            AppPlatform::Ios
+        );
+        assert_eq!(platform(&[]), AppPlatform::Unknown);
+    }
+
+    fn write_ipa(path: &Path, padding_bytes: usize) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut info = plist::Dictionary::new();
+        info.insert("CFBundleIdentifier".into(), "com.example.tv".into());
+        info.insert("DTPlatformName".into(), "appletvos".into());
+        let mut info_bytes = Vec::new();
+        plist::Value::Dictionary(info)
+            .to_writer_xml(&mut info_bytes)
+            .unwrap();
+        writer
+            .start_file("Payload/Example.app/Info.plist", options)
+            .unwrap();
+        writer.write_all(&info_bytes).unwrap();
+        writer
+            .start_file("Payload/Example.app/silent.mp4", options)
+            .unwrap();
+        writer.write_all(&vec![0_u8; padding_bytes]).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn small_highly_compressed_entries_are_accepted() {
+        let dir = std::env::temp_dir().join(format!("ipa-ratio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.ipa");
+        write_ipa(&small, 194_229);
+        let metadata = inspect_ipa(&small).expect("small padding file is fine");
+        assert_eq!(metadata.platform, AppPlatform::Tvos);
+
+        let large = dir.join("large.ipa");
+        write_ipa(&large, 8 * 1024 * 1024);
+        assert!(matches!(
+            inspect_ipa(&large),
+            Err(UploadError::ExpansionLimit)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn platform_gates_device_class() {
+        assert!(AppPlatform::Tvos.installable_on_apple_tv(true));
+        assert!(!AppPlatform::Tvos.installable_on_apple_tv(false));
+        assert!(AppPlatform::Ios.installable_on_apple_tv(false));
+        assert!(!AppPlatform::Ios.installable_on_apple_tv(true));
+        assert!(AppPlatform::Unknown.installable_on_apple_tv(true));
+        assert!(AppPlatform::Unknown.installable_on_apple_tv(false));
+    }
 }

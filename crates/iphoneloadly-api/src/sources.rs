@@ -37,7 +37,7 @@ pub struct AutomationRequest {
     #[serde(default)]
     pub acknowledged_security_warning: bool,
 }
-fn action_allowed(headers: &HeaderMap) -> bool {
+pub(crate) fn action_allowed(headers: &HeaderMap) -> bool {
     headers
         .get("x-iphoneloadly-action")
         .and_then(|value| value.to_str().ok())
@@ -48,7 +48,7 @@ fn action_allowed(headers: &HeaderMap) -> bool {
             .is_some_and(|value| value.starts_with("application/json"))
 }
 
-fn action_required() -> axum::response::Response {
+pub(crate) fn action_required() -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"message":"JSON action header required."})),
@@ -513,7 +513,7 @@ pub async fn download(
             if app.bundle_id.as_deref() != Some(&metadata.bundle_id) {
                 return Err(());
             }
-            if app.sha256 == metadata.sha256 {
+            if app.sha256 == metadata.sha256 && std::path::Path::new(&app.storage_path).is_file() {
                 let _ = std::fs::remove_file(&temporary);
                 store::record_source_check(
                     &db,
