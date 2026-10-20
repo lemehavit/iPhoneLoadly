@@ -2491,6 +2491,21 @@ async fn run_install_job(
             install_command_count = report.install_command_count,
             "RSD install job finished"
         );
+        if let Some(diagnostic) = &report.signing_diagnostic {
+            tracing::warn!(
+                job_id = %id,
+                signing_stage = diagnostic.stage,
+                error_class = ?diagnostic.error_class,
+                http_status = ?diagnostic.http_status,
+                apple_code = ?diagnostic.apple_code,
+                local_io = ?diagnostic.local_io,
+                "RSD install signing diagnostic"
+            );
+        } else if report.error_kind == "signing_failed" {
+            // Local failures (input link, signed artifact snapshot) carry no
+            // classified diagnostic.
+            tracing::warn!(job_id = %id, "RSD install signing failed without a classified diagnostic");
+        }
         rsd_install_result(report)
     } else {
         state

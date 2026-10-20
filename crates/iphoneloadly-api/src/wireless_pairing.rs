@@ -1398,6 +1398,12 @@ impl WirelessPairingService {
                             (RsdInstallStage::Signing, error)
                         }
                     };
+                    // SigningError messages are bounded and carry no secrets.
+                    tracing::warn!(
+                        stage = stage.as_str(),
+                        error = %error,
+                        "RSD install signing step failed"
+                    );
                     let mut report =
                         rsd_install_failure(stage, signing_error_kind(&error), false, None);
                     if let crate::signing::SigningError::ClassifiedIpaSigning(diagnostic) = error {
