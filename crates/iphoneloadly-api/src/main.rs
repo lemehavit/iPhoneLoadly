@@ -634,7 +634,10 @@ mod tests {
     fn missing_ipa_file_has_its_own_message() {
         let message = super::job_message("failed", Some("ipa_file_missing"));
         assert!(message.contains("missing on the server"));
-        assert_ne!(message, super::job_message("failed", Some("ipa_signing_failed")));
+        assert_ne!(
+            message,
+            super::job_message("failed", Some("ipa_signing_failed"))
+        );
     }
 
     use super::{

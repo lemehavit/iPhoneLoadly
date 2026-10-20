@@ -5,6 +5,8 @@ Semantic Versioning while remaining experimental alpha software.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.5] - 2026-10-20
+
 ### Added
 
 - Experimental Apple TV support behind `IPHONELOADLY_APPLE_TV=on` (requires
@@ -15,6 +17,34 @@ Semantic Versioning while remaining experimental alpha software.
   TV and requests tvOS provisioning profiles on its first install.
 - Install jobs refuse an iOS-only IPA on an Apple TV and a tvOS IPA on an
   iPhone before any Apple account work starts.
+- Apple TV discovery logs what it saw (found, resolved and rejected services),
+  and install jobs log why signing failed (the bounded signing error and, when
+  present, the signing diagnostic).
+
+### Changed
+
+- The install picker calls the target a device instead of an iPhone, since it
+  also lists the Apple TV.
+
+### Fixed
+
+- The API service may now use netlink (`AF_NETLINK` in
+  `RestrictAddressFamilies`). Without it mDNS could not list network
+  interfaces, so Apple TV discovery and RSD discovery of the iPhone found
+  nothing.
+- Apple TV discovery waits 10 seconds, like the iPhone's RSD discovery.
+- The 2FA dialog no longer reopens after a submitted code while Apple is still
+  checking it.
+- The GitHub sources, managed installations and validity lists keep their list
+  layout after a loading or error message, instead of squeezing each row into a
+  narrow column.
+- IPAs with small, highly compressed files (such as NuvioTV's silent audio
+  file) are no longer rejected by the compression-ratio check on upload or
+  GitHub download; the check now applies to entries of 1 MiB or more.
+- An app whose IPA file is missing on the server no longer reports "The IPA
+  could not be signed". Install jobs fail with a clear message, the app can
+  still be removed, and "Download latest" restores the file even when the
+  release is unchanged.
 
 ## [0.3.0-alpha.4] - 2026-10-20
 
