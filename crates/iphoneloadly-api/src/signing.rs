@@ -561,8 +561,17 @@ impl LoginAttempt {
     }
 
     async fn submit(&self, response: TwoFactorCallbackResponse) -> Result<(), SigningError> {
-        if !matches!(self.state.lock().await.phase, LoginPhase::AwaitingTwoFactor) {
-            return Err(SigningError::NoTwoFactorChallenge);
+        {
+            let mut state = self.state.lock().await;
+            if !matches!(state.phase, LoginPhase::AwaitingTwoFactor) {
+                return Err(SigningError::NoTwoFactorChallenge);
+            }
+            // Leave AwaitingTwoFactor at once so a dashboard poll that lands
+            // before Apple answers does not ask for the code again. A new
+            // challenge (for example a wrong code) sets it back.
+            state.phase = LoginPhase::Authenticating;
+            state.two_factor = None;
+            state.message = "Verifying the two-factor code with Apple.".into();
         }
         *self.response.lock().await = Some(response);
         self.response_ready.notify_one();
@@ -2017,9 +2026,14 @@ mod tests {
             TwoFactorCallbackResponse::SubmitCode(code) if code == "123456"
         ));
         assert!(attempt.response.lock().await.is_none());
+        let status = attempt.status().await;
+        assert!(matches!(status.phase, LoginPhase::Authenticating));
+        assert!(status.two_factor.is_none());
         assert!(matches!(
-            attempt.status().await.phase,
-            LoginPhase::AwaitingTwoFactor
+            provider
+                .submit_two_factor(id, "submitCode", Some("123456".into()), None)
+                .await,
+            Err(SigningError::NoTwoFactorChallenge)
         ));
     }
 
