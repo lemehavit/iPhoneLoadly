@@ -1,3 +1,4 @@
+mod apple_tv;
 mod github;
 mod ipa;
 mod jobs;
@@ -37,6 +38,8 @@ pub(crate) struct AppState {
     pub(crate) signing: Arc<signing::AppleSigningProvider>,
     pub(crate) devices: Arc<dyn DeviceTransport>,
     pub(crate) wireless_pairing: Arc<wireless_pairing::WirelessPairingService>,
+    /// Apple TV pairing and its RSD service, when `IPHONELOADLY_APPLE_TV=on`.
+    pub(crate) apple_tv: Option<Arc<apple_tv::AppleTv>>,
     /// Install jobs for the remotely paired device go over RSD instead of netmuxd.
     pub(crate) rsd_install: bool,
     pub(crate) apps_dir: PathBuf,
@@ -57,6 +60,7 @@ struct DeviceSummary {
     connection_type: ConnectionType,
     status: DeviceStatus,
     install_eligible: bool,
+    device_class: DeviceClass,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +200,13 @@ enum ConnectionType {
 #[serde(rename_all = "lowercase")]
 enum DeviceStatus {
     Online,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DeviceClass {
+    Iphone,
+    AppleTv,
 }
 
 /// Owns all Apple-account, 2FA, developer-resource, profile, and signing work.
@@ -556,6 +567,7 @@ impl NetmuxTransport {
             connection_type: ConnectionType::Network,
             status: DeviceStatus::Online,
             install_eligible: true,
+            device_class: DeviceClass::Iphone,
         })
     }
 }
@@ -785,6 +797,7 @@ mod tests {
                 signing: signing::AppleSigningProvider::new(None, root.join("signing")),
                 devices: Arc::new(RejectingTransport),
                 wireless_pairing: wireless_pairing.clone(),
+                apple_tv: None,
                 rsd_install: false,
                 apps_dir: root.join("apps"),
                 database: Arc::new(Mutex::new(database)),
@@ -1438,7 +1451,7 @@ mod tests {
         other.id = other_id;
 
         let merged =
-            super::merge_install_devices(Ok(vec![duplicate, other]), Some(rsd.clone())).unwrap();
+            super::merge_install_devices(Ok(vec![duplicate, other]), vec![rsd.clone()]).unwrap();
         assert_eq!(merged.len(), 2);
         let entry = merged.iter().find(|device| device.id == rsd.id).unwrap();
         assert_eq!(entry.display_name, "Test iPhone");
@@ -1446,12 +1459,12 @@ mod tests {
 
         let merged = super::merge_install_devices(
             Err(super::TransportError::Unavailable),
-            Some(rsd.clone()),
+            vec![rsd.clone()],
         )
         .unwrap();
         assert_eq!(merged.len(), 1);
         assert!(matches!(
-            super::merge_install_devices(Err(super::TransportError::Unavailable), None),
+            super::merge_install_devices(Err(super::TransportError::Unavailable), vec![]),
             Err(super::TransportError::Unavailable)
         ));
     }
@@ -1728,17 +1741,50 @@ fn rsd_install_enabled(value: Option<String>) -> bool {
     value.as_deref().map(str::trim) == Some("on")
 }
 
-/// The remotely paired device, when RSD install is enabled and its identity
-/// can be verified over the preserved pairing.
-async fn rsd_device(state: &AppState) -> Option<DeviceSummary> {
+/// A remotely paired device reachable over RSD, with the pairing service
+/// that owns its tunnel.
+#[derive(Clone)]
+struct RsdTarget {
+    device: DeviceSummary,
+    service: Arc<wireless_pairing::WirelessPairingService>,
+}
+
+/// The remotely paired iPhone and Apple TV whose identities can be verified
+/// over their preserved pairings, when RSD install is enabled.
+async fn rsd_targets(state: &AppState) -> Vec<RsdTarget> {
     if !state.rsd_install {
-        return None;
+        return Vec::new();
     }
-    let identity = state
-        .wireless_pairing
-        .remote_pairing_device_identity()
-        .await?;
-    Some(rsd_device_summary(&identity))
+    let iphone = rsd_target_for(state.wireless_pairing.clone());
+    let apple_tv = async {
+        match state.apple_tv.as_ref() {
+            Some(apple_tv) if apple_tv.service.has_stored_pairing() => {
+                rsd_target_for(apple_tv.service.clone()).await
+            }
+            _ => None,
+        }
+    };
+    let (iphone, apple_tv) = tokio::join!(iphone, apple_tv);
+    iphone.into_iter().chain(apple_tv).collect()
+}
+
+async fn rsd_target_for(
+    service: Arc<wireless_pairing::WirelessPairingService>,
+) -> Option<RsdTarget> {
+    // Boxed: the RSD session future is large, and two of them joined on the
+    // stack overflow a worker thread in debug builds.
+    let identity = Box::pin(service.remote_pairing_device_identity()).await?;
+    Some(RsdTarget {
+        device: rsd_device_summary(&identity),
+        service,
+    })
+}
+
+async fn rsd_target(state: &AppState, device_id: Uuid) -> Option<RsdTarget> {
+    rsd_targets(state)
+        .await
+        .into_iter()
+        .find(|target| target.device.id == device_id)
 }
 
 fn rsd_device_summary(identity: &signing::SigningDeviceIdentity) -> DeviceSummary {
@@ -1750,27 +1796,36 @@ fn rsd_device_summary(identity: &signing::SigningDeviceIdentity) -> DeviceSummar
         connection_type: ConnectionType::Network,
         status: DeviceStatus::Online,
         install_eligible: true,
+        device_class: if identity.is_apple_tv() {
+            DeviceClass::AppleTv
+        } else {
+            DeviceClass::Iphone
+        },
     }
 }
 
-/// netmuxd devices plus the RSD device. The RSD entry wins for its own id so
+/// netmuxd devices plus the RSD devices. An RSD entry wins for its own id so
 /// installs to it never take the netmuxd path.
 async fn install_devices(state: &AppState) -> Result<Vec<DeviceSummary>, TransportError> {
     let network = state.devices.list_network_devices().await;
-    let rsd = rsd_device(state).await;
+    let rsd = rsd_targets(state)
+        .await
+        .into_iter()
+        .map(|target| target.device)
+        .collect();
     merge_install_devices(network, rsd)
 }
 
 fn merge_install_devices(
     network: Result<Vec<DeviceSummary>, TransportError>,
-    rsd: Option<DeviceSummary>,
+    rsd: Vec<DeviceSummary>,
 ) -> Result<Vec<DeviceSummary>, TransportError> {
-    let Some(rsd) = rsd else {
+    if rsd.is_empty() {
         return network;
-    };
+    }
     let mut devices = network.unwrap_or_default();
-    devices.retain(|device| device.id != rsd.id);
-    devices.push(rsd);
+    devices.retain(|device| !rsd.iter().any(|rsd| rsd.id == device.id));
+    devices.extend(rsd);
     Ok(devices)
 }
 
@@ -1924,12 +1979,9 @@ async fn list_device_apps(
                 .into_response();
         }
     };
-    let installed = if rsd_device(&state)
-        .await
-        .is_some_and(|device| device.id == id)
-    {
-        state
-            .wireless_pairing
+    let installed = if let Some(target) = rsd_target(&state, id).await {
+        target
+            .service
             .remote_pairing_user_apps()
             .await
             .map(rsd_installed_apps)
@@ -2272,6 +2324,22 @@ async fn create_install_job(
     };
 
     let _mutation = state.app_mutation.read().await;
+    let stored_path = state.database.lock().ok().and_then(|database| {
+        store::app_path(&database, request.app_id)
+            .ok()
+            .flatten()
+            .map(PathBuf::from)
+    });
+    if let Some(message) = stored_path
+        .as_deref()
+        .and_then(|path| platform_mismatch(path, device.device_class))
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response();
+    }
     let id = Uuid::now_v7();
     let ipa_path = state.database.lock().map_err(|_| ()).and_then(|database| {
         let path = store::app_path(&database, request.app_id).map_err(|_| ())?;
@@ -2310,6 +2378,21 @@ async fn create_install_job(
         ),
     };
     (StatusCode::ACCEPTED, Json(job)).into_response()
+}
+
+/// Refuses an iOS app on an Apple TV and a tvOS app on an iPhone before any
+/// Apple account work starts. An IPA that names no platform is allowed.
+fn platform_mismatch(ipa_path: &StdPath, device_class: DeviceClass) -> Option<&'static str> {
+    let platform = ipa::app_platform(ipa_path).ok()?;
+    let apple_tv = device_class == DeviceClass::AppleTv;
+    if platform.installable_on_apple_tv(apple_tv) {
+        return None;
+    }
+    Some(if apple_tv {
+        "This IPA is built for iPhone and iPad and cannot be installed on Apple TV."
+    } else {
+        "This IPA is built for Apple TV and cannot be installed on iPhone."
+    })
 }
 
 #[derive(Serialize)]
@@ -2387,14 +2470,12 @@ async fn run_install_job(
     set_job_status(&state.database, id, "connecting", Some(0));
     set_job_status(&state.database, id, "signing", Some(1));
     let progress_database = state.database.clone();
-    let rsd_target = rsd_device(&state)
-        .await
-        .is_some_and(|device| device.id == device_id);
-    let result = if rsd_target {
+    let rsd_target = rsd_target(&state, device_id).await;
+    let result = if let Some(target) = rsd_target {
         // One RSD tunnel at a time; refresh may queue several jobs.
         let _single_flight = state.spike_install_mutation.lock().await;
-        let report = state
-            .wireless_pairing
+        let report = target
+            .service
             .install_remote_pairing_app(
                 state.signing.clone(),
                 ipa_path,
@@ -2988,6 +3069,20 @@ async fn main() {
             wireless_pairing::WirelessPairingConfig::disabled(data_dir.join("wireless-pairing"))
         }
     };
+    let rsd_install =
+        !spike_mode && rsd_install_enabled(std::env::var("IPHONELOADLY_RSD_INSTALL").ok());
+    // The Apple TV keeps its own pairing next to the iPhone's and installs over
+    // the same RSD path, so it needs RSD install too.
+    let apple_tv = (rsd_install && apple_tv::enabled(std::env::var("IPHONELOADLY_APPLE_TV").ok()))
+        .then(|| {
+            Arc::new(apple_tv::AppleTv::new(Arc::new(
+                wireless_pairing::WirelessPairingService::new(
+                    wireless_pairing::WirelessPairingConfig::disabled(
+                        wireless_pairing_config.state_dir.join("apple-tv"),
+                    ),
+                ),
+            )))
+        });
     let wireless_pairing = Arc::new(wireless_pairing::WirelessPairingService::new(
         wireless_pairing_config,
     ));
@@ -3000,8 +3095,8 @@ async fn main() {
         ),
         devices,
         wireless_pairing,
-        rsd_install: !spike_mode
-            && rsd_install_enabled(std::env::var("IPHONELOADLY_RSD_INSTALL").ok()),
+        apple_tv,
+        rsd_install,
         apps_dir: data_dir.join("apps"),
         database: Arc::new(Mutex::new(database)),
         app_mutation: Arc::new(tokio::sync::RwLock::new(())),
@@ -3039,6 +3134,17 @@ async fn main() {
         .route("/api/devices/{id}/apps", get(list_device_apps))
         .route("/api/devices/rescan", post(rescan_devices))
         .route("/api/pairing-sessions", post(create_pairing_session))
+        .route(
+            "/api/apple-tv",
+            get(apple_tv::overview).delete(apple_tv::forget),
+        )
+        .route("/api/apple-tv/discover", post(apple_tv::discover))
+        .route("/api/apple-tv/pairing", post(apple_tv::start_pairing))
+        .route(
+            "/api/apple-tv/pairing/{id}",
+            get(apple_tv::pairing_status).delete(apple_tv::cancel_pairing),
+        )
+        .route("/api/apple-tv/pairing/{id}/pin", post(apple_tv::submit_pin))
         .route(
             "/api/pairing-sessions/{id}",
             get(get_pairing_session).delete(cancel_pairing_session),

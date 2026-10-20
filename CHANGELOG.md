@@ -3,6 +3,19 @@
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
 
+## [Unreleased]
+
+### Added
+
+- Experimental Apple TV support behind `IPHONELOADLY_APPLE_TV=on` (requires
+  `IPHONELOADLY_RSD_INSTALL=on`). Settings gets an Apple TV card that finds an
+  Apple TV showing "Remote App and Devices" and pairs with the PIN it shows.
+  The paired Apple TV appears in the device list and installs, refreshes and
+  lists apps over the same RSD path as the iPhone. Signing registers the Apple
+  TV and requests tvOS provisioning profiles on its first install.
+- Install jobs refuse an iOS-only IPA on an Apple TV and a tvOS IPA on an
+  iPhone before any Apple account work starts.
+
 ## [0.3.0-alpha.4] - 2026-10-20
 
 ### Added

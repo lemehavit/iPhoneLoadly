@@ -25,6 +25,71 @@ pub struct UploadMetadata {
     pub display_name: String,
     pub app_version: Option<String>,
     pub info_plist_present: bool,
+    pub platform: AppPlatform,
+}
+
+/// The device family an IPA is built for, read from its Info.plist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppPlatform {
+    Ios,
+    Tvos,
+    /// Info.plist names no platform; installs are allowed on any device.
+    Unknown,
+}
+
+impl AppPlatform {
+    /// Whether an app for this platform can be installed on the given device.
+    pub fn installable_on_apple_tv(self, apple_tv: bool) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Tvos => apple_tv,
+            Self::Ios => !apple_tv,
+        }
+    }
+
+    fn from_info_plist(dictionary: &plist::Dictionary) -> Self {
+        let names = dictionary
+            .get("DTPlatformName")
+            .and_then(plist_string)
+            .into_iter()
+            .chain(
+                dictionary
+                    .get("CFBundleSupportedPlatforms")
+                    .and_then(plist::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(plist_string),
+            )
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        if names.iter().any(|name| name.starts_with("appletv")) {
+            return Self::Tvos;
+        }
+        if names
+            .iter()
+            .any(|name| name.starts_with("iphone") || name.starts_with("ipad"))
+        {
+            return Self::Ios;
+        }
+        // UIDeviceFamily 3 is Apple TV; 1 and 2 are iPhone and iPad.
+        let families = dictionary
+            .get("UIDeviceFamily")
+            .and_then(plist::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(plist::Value::as_unsigned_integer)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if families.contains(&3) {
+            Self::Tvos
+        } else if families.iter().any(|family| matches!(family, 1 | 2)) {
+            Self::Ios
+        } else {
+            Self::Unknown
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -78,6 +143,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
     let mut bundle_id = None;
     let mut display_name = None;
     let mut app_version = None;
+    let mut platform = AppPlatform::Unknown;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -132,6 +198,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
                 .or_else(|| dictionary.get("CFBundleVersion").and_then(plist_string))
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned);
+            platform = AppPlatform::from_info_plist(dictionary);
         }
     }
     let app_bundle_path = app_bundle.ok_or(UploadError::InvalidPayload)?;
@@ -152,6 +219,7 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
         display_name,
         app_version,
         info_plist_present,
+        platform,
     })
 }
 
@@ -161,6 +229,10 @@ fn plist_string(value: &plist::Value) -> Option<&str> {
 
 pub fn bundle_identifier(path: &Path) -> Result<String, UploadError> {
     Ok(inspect_ipa(path)?.bundle_id)
+}
+
+pub fn app_platform(path: &Path) -> Result<AppPlatform, UploadError> {
+    Ok(inspect_ipa(path)?.platform)
 }
 
 fn validate_archive_path(name: &str) -> Result<(), UploadError> {
@@ -185,4 +257,58 @@ fn main_bundle_from_entry(name: &str) -> Option<&str> {
     bundle
         .ends_with(".app")
         .then(|| &name[.."Payload/".len() + bundle.len()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform(entries: &[(&str, plist::Value)]) -> AppPlatform {
+        let mut dictionary = plist::Dictionary::new();
+        for (key, value) in entries {
+            dictionary.insert((*key).into(), value.clone());
+        }
+        AppPlatform::from_info_plist(&dictionary)
+    }
+
+    #[test]
+    fn detects_tvos_and_ios_bundles() {
+        assert_eq!(
+            platform(&[("DTPlatformName", "appletvos".into())]),
+            AppPlatform::Tvos
+        );
+        assert_eq!(
+            platform(&[(
+                "CFBundleSupportedPlatforms",
+                plist::Value::Array(vec!["AppleTVOS".into()])
+            )]),
+            AppPlatform::Tvos
+        );
+        assert_eq!(
+            platform(&[("DTPlatformName", "iphoneos".into())]),
+            AppPlatform::Ios
+        );
+        assert_eq!(
+            platform(&[("UIDeviceFamily", plist::Value::Array(vec![3_u64.into()]))]),
+            AppPlatform::Tvos
+        );
+        assert_eq!(
+            platform(&[(
+                "UIDeviceFamily",
+                plist::Value::Array(vec![1_u64.into(), 2_u64.into()])
+            )]),
+            AppPlatform::Ios
+        );
+        assert_eq!(platform(&[]), AppPlatform::Unknown);
+    }
+
+    #[test]
+    fn platform_gates_device_class() {
+        assert!(AppPlatform::Tvos.installable_on_apple_tv(true));
+        assert!(!AppPlatform::Tvos.installable_on_apple_tv(false));
+        assert!(AppPlatform::Ios.installable_on_apple_tv(false));
+        assert!(!AppPlatform::Ios.installable_on_apple_tv(true));
+        assert!(AppPlatform::Unknown.installable_on_apple_tv(true));
+        assert!(AppPlatform::Unknown.installable_on_apple_tv(false));
+    }
 }

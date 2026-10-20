@@ -58,6 +58,10 @@ const KEY_FILE: &str = "pairing-state.key";
 const MDNS_SERVICE_NAME_LIMIT: u8 = 30;
 const MDNS_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_PAIRING_SERVICE_TYPE: &str = "_remotepairing._tcp.local.";
+/// Apple TV advertises this while "Remote App and Devices" is open and waits
+/// for a host to connect and enter the PIN it shows.
+const MANUAL_PAIRING_SERVICE_TYPE: &str = "_remotepairing-manual-pairing._tcp.local.";
+const MANUAL_PAIRING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_ONLY_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1153,6 +1157,102 @@ impl WirelessPairingService {
 
     /// Installed user apps on the remotely paired device, keyed by bundle id.
     /// Read-only: one Installation Proxy lookup over a fresh RSD session.
+    /// Whether a completed pairing is stored for this service's device.
+    pub(crate) fn has_stored_pairing(&self) -> bool {
+        self.store
+            .load_existing(SERVICE_NAME)
+            .is_ok_and(|material| material.paired_peer_id.is_some())
+    }
+
+    /// Pairs as a client with a device that shows a PIN (Apple TV), then
+    /// stores the pairing so the RSD install path can use it. `pin` is awaited
+    /// only after the device has accepted the request and shows its PIN.
+    pub(crate) async fn pair_with_pin<F, Fut>(
+        &self,
+        target: &ManualPairingTarget,
+        pin: F,
+    ) -> Result<(), ManualPairingFailure>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
+        let _start_lock = self.start_lock.lock().await;
+        let mut pairing_file = RpPairingFile::generate(SERVICE_NAME);
+        pairing_file.identifier = Uuid::now_v7().to_string();
+        let mut stream = None;
+        for address in &target.addresses {
+            if let Ok(Ok(connected)) = timeout(
+                REMOTE_CONNECT_TIMEOUT,
+                TcpStream::connect(SocketAddr::new(*address, target.port)),
+            )
+            .await
+            {
+                stream = Some(connected);
+                break;
+            }
+        }
+        let stream = stream.ok_or(ManualPairingFailure::Connect)?;
+        let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), SERVICE_NAME);
+        match timeout(
+            MANUAL_PAIRING_HANDSHAKE_TIMEOUT,
+            client.connect(&mut pairing_file, pin),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    stage = "manual_pairing",
+                    error_kind = idevice_error_kind(&error),
+                    "manual remote pairing failed"
+                );
+                return Err(match error {
+                    IdeviceError::RemotePairing(RemotePairingError::SrpAuthFailed) => {
+                        ManualPairingFailure::WrongPin
+                    }
+                    IdeviceError::RemotePairing(RemotePairingError::PairingRejected(_)) => {
+                        ManualPairingFailure::Rejected
+                    }
+                    _ => ManualPairingFailure::Handshake,
+                });
+            }
+            Err(_) => return Err(ManualPairingFailure::Timeout),
+        }
+        let peer = client
+            .paired_peer_device()
+            .map_err(|_| ManualPairingFailure::Handshake)?;
+        if pairing_file
+            .alt_irk()
+            .is_none_or(|alt_irk| alt_irk.len() != 16)
+        {
+            return Err(ManualPairingFailure::Handshake);
+        }
+        let mut host_info = PairableHostInfo::generate(SERVICE_NAME, SERVICE_MODEL);
+        host_info.identifier = pairing_file.identifier().to_owned();
+        let material = StoredPairingMaterial {
+            host_info,
+            pairing_file,
+            paired_peer_id: Some(fingerprint_peer(&peer.remotepairing_udid)),
+        };
+        self.store
+            .save(&material)
+            .map_err(|_| ManualPairingFailure::Storage)?;
+        self.identity_cache.lock().await.take();
+        Ok(())
+    }
+
+    /// Deletes the stored pairing. The device keeps its own record until it is
+    /// removed under "Remote App and Devices".
+    pub(crate) async fn forget_pairing(&self) -> Result<(), PairingError> {
+        let _start_lock = self.start_lock.lock().await;
+        self.identity_cache.lock().await.take();
+        match fs::remove_file(self.store.state_dir.join(STATE_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(PairingError::Storage),
+        }
+    }
+
     pub(crate) async fn remote_pairing_user_apps(
         &self,
     ) -> Result<std::collections::HashMap<String, plist::Value>, ()> {
@@ -2286,11 +2386,18 @@ impl RemoteRsdSession<AdapterHandle> {
         .await
         .map_err(|_| RsdIdentityFailure::DeviceName)?
         .map_err(|_| RsdIdentityFailure::DeviceName)?;
+        let device_class = self
+            .handshake()
+            .properties
+            .get("DeviceClass")
+            .and_then(plist::Value::as_string)
+            .map(str::to_owned);
         validate_rsd_identity(
             handshake_identity.as_ref(),
             Some(&lockdown_identity),
             Some(&device_name),
         )
+        .map(|identity| identity.with_device_class(device_class.as_deref()))
     }
 
     async fn task_afc_client(
@@ -3675,6 +3782,120 @@ async fn commit_remote_pairing_endpoints(
 struct RemotePairingEndpoint {
     addresses: Vec<IpAddr>,
     port: u16,
+}
+
+/// A device waiting for a host to start PIN pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualPairingTarget {
+    pub(crate) identifier: String,
+    pub(crate) name: String,
+    pub(crate) model: Option<String>,
+    #[serde(skip)]
+    pub(crate) addresses: Vec<IpAddr>,
+    #[serde(skip)]
+    pub(crate) port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualPairingFailure {
+    Connect,
+    WrongPin,
+    Rejected,
+    Handshake,
+    Timeout,
+    Storage,
+}
+
+impl ManualPairingFailure {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::WrongPin => "wrong_pin",
+            Self::Rejected => "rejected",
+            Self::Handshake => "handshake",
+            Self::Timeout => "timeout",
+            Self::Storage => "storage",
+        }
+    }
+}
+
+/// Browses for devices showing "Remote App and Devices". Apple TV is the only
+/// device class that offers PIN pairing this way.
+pub(crate) async fn discover_manual_pairing_targets(
+    duration: Duration,
+) -> Result<Vec<ManualPairingTarget>, ()> {
+    let daemon = ServiceDaemon::new().map_err(|_| ())?;
+    let daemon = MdnsShutdownGuard::new(daemon);
+    let receiver = daemon
+        .daemon
+        .browse(MANUAL_PAIRING_SERVICE_TYPE)
+        .map_err(|_| ())?;
+    let deadline = Instant::now() + duration;
+    let mut targets: Vec<ManualPairingTarget> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let event = match timeout(remaining, receiver.recv_async()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        let ServiceEvent::ServiceResolved(info) = event else {
+            continue;
+        };
+        if let Some(target) = manual_pairing_target(
+            info.get_property_val_str("identifier"),
+            info.get_property_val_str("name"),
+            info.get_property_val_str("model"),
+            info.get_fullname(),
+            info.get_addresses()
+                .iter()
+                .map(|address| address.to_ip_addr())
+                .collect(),
+            info.get_port(),
+        ) {
+            targets.retain(|existing| existing.identifier != target.identifier);
+            targets.push(target);
+        }
+    }
+    Ok(targets)
+}
+
+fn manual_pairing_target(
+    identifier: Option<&str>,
+    name: Option<&str>,
+    model: Option<&str>,
+    fullname: &str,
+    mut addresses: Vec<IpAddr>,
+    port: u16,
+) -> Option<ManualPairingTarget> {
+    let identifier = identifier
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256)?;
+    if port == 0 || addresses.is_empty() {
+        return None;
+    }
+    addresses.sort_by_key(|address| (!address.is_ipv4(), address.to_string()));
+    addresses.dedup();
+    let name = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fullname.split('.').next().unwrap_or("Apple TV"))
+        .chars()
+        .take(64)
+        .collect();
+    Some(ManualPairingTarget {
+        identifier: identifier.to_owned(),
+        name,
+        model: model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        addresses,
+        port,
+    })
 }
 
 fn authenticated_remote_pairing_endpoint(
@@ -6541,5 +6762,52 @@ mod tests {
             .collect()
         );
         assert!(!format!("{:?}", events[0]).contains(secret));
+    }
+
+    #[test]
+    fn manual_pairing_target_needs_identifier_port_and_address() {
+        let address: IpAddr = "192.168.8.20".parse().unwrap();
+        let ipv6: IpAddr = "fe80::1".parse().unwrap();
+        let target = manual_pairing_target(
+            Some("ABCD-1234"),
+            Some("Living Room"),
+            Some("AppleTV14,1"),
+            "Living Room._remotepairing-manual-pairing._tcp.local.",
+            vec![ipv6, address, address],
+            49152,
+        )
+        .unwrap();
+        assert_eq!(target.identifier, "ABCD-1234");
+        assert_eq!(target.name, "Living Room");
+        assert_eq!(target.model.as_deref(), Some("AppleTV14,1"));
+        assert_eq!(target.addresses, vec![address, ipv6]);
+
+        let unnamed = manual_pairing_target(
+            Some("ABCD-1234"),
+            None,
+            None,
+            "Bedroom._remotepairing-manual-pairing._tcp.local.",
+            vec![address],
+            49152,
+        )
+        .unwrap();
+        assert_eq!(unnamed.name, "Bedroom");
+
+        assert!(manual_pairing_target(None, None, None, "x", vec![address], 1).is_none());
+        assert!(manual_pairing_target(Some(" "), None, None, "x", vec![address], 1).is_none());
+        assert!(manual_pairing_target(Some("id"), None, None, "x", vec![], 1).is_none());
+        assert!(manual_pairing_target(Some("id"), None, None, "x", vec![address], 0).is_none());
+    }
+
+    #[test]
+    fn identity_marks_apple_tv_from_device_class() {
+        let identity = crate::signing::SigningDeviceIdentity::new("TV".into(), "UDID".into())
+            .unwrap()
+            .with_device_class(Some("AppleTV"));
+        assert!(identity.is_apple_tv());
+        let identity = crate::signing::SigningDeviceIdentity::new("Phone".into(), "UDID".into())
+            .unwrap()
+            .with_device_class(Some("iPhone"));
+        assert!(!identity.is_apple_tv());
     }
 }

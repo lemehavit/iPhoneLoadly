@@ -21,7 +21,8 @@ use isideload::{
         TwoFactorCallbackResponse,
     },
     dev::{
-        certificates::CertificatesApi, developer_session::DeveloperSession, devices::DevicesApi,
+        certificates::CertificatesApi, developer_session::DeveloperSession,
+        device_type::DeveloperDeviceType, devices::DevicesApi,
     },
     sideload::{
         SideloaderBuilder, builder::MaxCertsBehavior, install::install_app as install_signed_app,
@@ -704,6 +705,7 @@ pub enum ExistingDeviceSigningError {
 pub struct SigningDeviceIdentity {
     name: String,
     udid: String,
+    apple_tv: bool,
 }
 
 impl SigningDeviceIdentity {
@@ -712,7 +714,26 @@ impl SigningDeviceIdentity {
         {
             return Err(SigningError::DeviceInfoFailed);
         }
-        Ok(Self { name, udid })
+        Ok(Self {
+            name,
+            udid,
+            apple_tv: false,
+        })
+    }
+
+    /// Marks the device as an Apple TV from its reported `DeviceClass`, so
+    /// signing registers it and requests profiles for tvOS.
+    pub fn with_device_class(mut self, device_class: Option<&str>) -> Self {
+        self.apple_tv = device_class.is_some_and(|class| class.eq_ignore_ascii_case("AppleTV"));
+        self
+    }
+
+    pub fn is_apple_tv(&self) -> bool {
+        self.apple_tv
+    }
+
+    fn developer_device_type(&self) -> Option<DeveloperDeviceType> {
+        self.apple_tv.then_some(DeveloperDeviceType::Tvos)
     }
 
     pub fn name(&self) -> &str {
@@ -1319,7 +1340,7 @@ impl AppleSigningProvider {
             .map_err(|_| SigningError::DeveloperTeamFailed)?;
         let devices = sideloader
             .get_dev_session()
-            .list_devices(&team, None)
+            .list_devices(&team, identity.developer_device_type())
             .await
             .map_err(|_| SigningError::DeveloperTeamFailed)?;
         let device_registration = if devices
@@ -1376,7 +1397,7 @@ impl AppleSigningProvider {
             DeviceRegistrationPolicy::RequireExisting => {
                 let devices = sideloader
                     .get_dev_session()
-                    .list_devices(&team, None)
+                    .list_devices(&team, identity.developer_device_type())
                     .await
                     .map_err(|_| SigningError::DeveloperTeamFailed)?;
                 if !devices
@@ -1389,7 +1410,12 @@ impl AppleSigningProvider {
             DeviceRegistrationPolicy::Ensure => {
                 sideloader
                     .get_dev_session()
-                    .ensure_device_registered(&team, &identity.name, &identity.udid, None)
+                    .ensure_device_registered(
+                        &team,
+                        &identity.name,
+                        &identity.udid,
+                        identity.developer_device_type(),
+                    )
                     .await
                     .map_err(|_| SigningError::DeviceRegistrationFailed)?;
             }
@@ -1399,10 +1425,11 @@ impl AppleSigningProvider {
         let progress = Arc::new(progress);
         let signing_progress = progress.clone();
         let (signed_app_path, _) = sideloader
-            .sign_app(
+            .sign_app_for_device_type(
                 sideload_input.path().to_path_buf(),
                 Some(team),
                 false,
+                identity.developer_device_type(),
                 Some(move |value: f32| {
                     signing_progress((value.clamp(0.0, 1.0) * 40.0) as u8);
                     async {}
@@ -1441,15 +1468,22 @@ impl AppleSigningProvider {
         let preflight = Self::account_preflight_with_sideloader(sideloader, identity)
             .await
             .map_err(ExistingDeviceSigningError::Preflight)?;
-        if preflight.device_registration == DeviceRegistrationState::NewRequired {
-            return Ok((preflight, None));
-        }
+        // An iPhone must already be registered on the team. An Apple TV is
+        // added through its own pairing flow in the dashboard, so its first
+        // install registers it, like atvloadly does.
+        let registration_policy = match preflight.device_registration {
+            DeviceRegistrationState::AlreadyPresent => DeviceRegistrationPolicy::RequireExisting,
+            DeviceRegistrationState::NewRequired if identity.is_apple_tv() => {
+                DeviceRegistrationPolicy::Ensure
+            }
+            DeviceRegistrationState::NewRequired => return Ok((preflight, None)),
+        };
         let artifact = self
             .sign_for_device_with_sideloader(
                 sideloader,
                 identity,
                 ipa_path,
-                DeviceRegistrationPolicy::RequireExisting,
+                registration_policy,
                 |_| {},
             )
             .await
