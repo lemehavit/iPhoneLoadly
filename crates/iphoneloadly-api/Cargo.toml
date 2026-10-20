@@ -10,9 +10,9 @@ aes-gcm = "0.10.3"
 axum = { version = "0.8.8", features = ["multipart"] }
 base64 = "0.22.1"
 idevice = { version = "=0.1.65", features = ["tcp", "usbmuxd", "remote_pairing", "mdns", "rsd", "afc", "installation_proxy", "core_device", "core_device_proxy", "tunnel_tcp_stack"] }
-# Keep the verified diagnostic fork while applying the narrow upstream
-# Android client-info backport for Apple GrandSlam error -80045.
-isideload = { version = "0.3.17", path = "../../../isideload-80045-backport/isideload", package = "isideload", features = ["fs-storage"] }
+# Pin the fork commit deployed to production (B115): -80045 auth backport,
+# split trust, signing diagnostics and App ID name sanitizing.
+isideload = { version = "0.3.17", git = "https://github.com/lemehavit/isideload", package = "isideload", rev = "54e2a20cf360fe073d0c856735478e04f02f8fa2", features = ["fs-storage"] }
 if-addrs = "0.15.0"
 mdns-sd = "0.20.3"
 plist = "1.10.0"
