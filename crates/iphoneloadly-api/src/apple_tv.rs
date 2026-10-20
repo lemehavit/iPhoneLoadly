@@ -28,7 +28,9 @@ use crate::{
     },
 };
 
-const DISCOVERY_DURATION: Duration = Duration::from_secs(4);
+// Same window as the iPhone's RSD discovery; a fresh mDNS daemon needs time
+// to start, query and collect SRV, TXT and address records.
+const DISCOVERY_DURATION: Duration = Duration::from_secs(10);
 const SESSION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 

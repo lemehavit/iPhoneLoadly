@@ -3833,6 +3833,7 @@ pub(crate) async fn discover_manual_pairing_targets(
         .map_err(|_| ())?;
     let deadline = Instant::now() + duration;
     let mut targets: Vec<ManualPairingTarget> = Vec::new();
+    let (mut found, mut resolved, mut rejected) = (0_usize, 0_usize, 0_usize);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -3842,10 +3843,16 @@ pub(crate) async fn discover_manual_pairing_targets(
             Ok(Ok(event)) => event,
             Ok(Err(_)) | Err(_) => break,
         };
-        let ServiceEvent::ServiceResolved(info) = event else {
-            continue;
+        let info = match event {
+            ServiceEvent::ServiceFound(..) => {
+                found += 1;
+                continue;
+            }
+            ServiceEvent::ServiceResolved(info) => info,
+            _ => continue,
         };
-        if let Some(target) = manual_pairing_target(
+        resolved += 1;
+        let target = manual_pairing_target(
             info.get_property_val_str("identifier"),
             info.get_property_val_str("name"),
             info.get_property_val_str("model"),
@@ -3855,11 +3862,32 @@ pub(crate) async fn discover_manual_pairing_targets(
                 .map(|address| address.to_ip_addr())
                 .collect(),
             info.get_port(),
-        ) {
-            targets.retain(|existing| existing.identifier != target.identifier);
-            targets.push(target);
+        );
+        match target {
+            Some(target) => {
+                targets.retain(|existing| existing.identifier != target.identifier);
+                targets.push(target);
+            }
+            None => {
+                rejected += 1;
+                tracing::warn!(
+                    stage = "apple_tv_discovery",
+                    has_identifier = info.get_property_val_str("identifier").is_some(),
+                    address_count = info.get_addresses().len(),
+                    port = info.get_port(),
+                    "manual pairing service ignored"
+                );
+            }
         }
     }
+    tracing::info!(
+        stage = "apple_tv_discovery",
+        found,
+        resolved,
+        rejected,
+        targets = targets.len(),
+        "Apple TV discovery finished"
+    );
     Ok(targets)
 }
 
