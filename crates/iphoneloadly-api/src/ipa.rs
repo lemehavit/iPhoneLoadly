@@ -14,6 +14,10 @@ pub const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 20_000;
 pub const MAX_COMPRESSION_RATIO: u64 = 200;
+/// Entries smaller than this skip the ratio check. Small padding files
+/// (silent audio, blank images) compress far beyond 200:1 but cannot
+/// expand into anything dangerous; MAX_EXPANDED_BYTES still caps the total.
+const RATIO_CHECK_MIN_BYTES: u64 = 1024 * 1024;
 const MAX_INFO_PLIST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,7 +158,8 @@ pub fn inspect_ipa(path: &Path) -> Result<UploadMetadata, UploadError> {
         if expanded_bytes > MAX_EXPANDED_BYTES {
             return Err(UploadError::ExpansionLimit);
         }
-        if entry.compressed_size() > 0
+        if entry.size() >= RATIO_CHECK_MIN_BYTES
+            && entry.compressed_size() > 0
             && entry.size() / entry.compressed_size() > MAX_COMPRESSION_RATIO
         {
             return Err(UploadError::ExpansionLimit);
@@ -300,6 +305,48 @@ mod tests {
             AppPlatform::Ios
         );
         assert_eq!(platform(&[]), AppPlatform::Unknown);
+    }
+
+    fn write_ipa(path: &Path, padding_bytes: usize) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut info = plist::Dictionary::new();
+        info.insert("CFBundleIdentifier".into(), "com.example.tv".into());
+        info.insert("DTPlatformName".into(), "appletvos".into());
+        let mut info_bytes = Vec::new();
+        plist::Value::Dictionary(info)
+            .to_writer_xml(&mut info_bytes)
+            .unwrap();
+        writer
+            .start_file("Payload/Example.app/Info.plist", options)
+            .unwrap();
+        writer.write_all(&info_bytes).unwrap();
+        writer
+            .start_file("Payload/Example.app/silent.mp4", options)
+            .unwrap();
+        writer.write_all(&vec![0_u8; padding_bytes]).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn small_highly_compressed_entries_are_accepted() {
+        let dir = std::env::temp_dir().join(format!("ipa-ratio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.ipa");
+        write_ipa(&small, 194_229);
+        let metadata = inspect_ipa(&small).expect("small padding file is fine");
+        assert_eq!(metadata.platform, AppPlatform::Tvos);
+
+        let large = dir.join("large.ipa");
+        write_ipa(&large, 8 * 1024 * 1024);
+        assert!(matches!(
+            inspect_ipa(&large),
+            Err(UploadError::ExpansionLimit)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
