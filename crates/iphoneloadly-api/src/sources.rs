@@ -513,7 +513,7 @@ pub async fn download(
             if app.bundle_id.as_deref() != Some(&metadata.bundle_id) {
                 return Err(());
             }
-            if app.sha256 == metadata.sha256 {
+            if app.sha256 == metadata.sha256 && std::path::Path::new(&app.storage_path).is_file() {
                 let _ = std::fs::remove_file(&temporary);
                 store::record_source_check(
                     &db,

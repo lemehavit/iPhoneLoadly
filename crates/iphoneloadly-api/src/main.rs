@@ -630,6 +630,13 @@ fn device_id_for_udid(udid: &str) -> Uuid {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_ipa_file_has_its_own_message() {
+        let message = super::job_message("failed", Some("ipa_file_missing"));
+        assert!(message.contains("missing on the server"));
+        assert_ne!(message, super::job_message("failed", Some("ipa_signing_failed")));
+    }
+
     use super::{
         AfcProbeResponse, AppState, DeviceSummary, DeviceTransport, InstalledAppSummary,
         ReadOnlyProbeFailureResponse, ReadOnlyProbeSuccessResponse, Router,
@@ -2467,6 +2474,18 @@ async fn run_install_job(
     device_id: Uuid,
     ipa_path: PathBuf,
 ) {
+    if !ipa_path.is_file() {
+        // Fail with a clear reason instead of a signing error further down.
+        tracing::warn!(
+            job_id = %id,
+            app_id = %app_id,
+            path = %ipa_path.display(),
+            "IPA file is missing on the server"
+        );
+        set_job_failure(&state.database, id, "ipa_file_missing");
+        set_job_status(&state.database, id, "failed", None);
+        return;
+    }
     set_job_status(&state.database, id, "connecting", Some(0));
     set_job_status(&state.database, id, "signing", Some(1));
     let progress_database = state.database.clone();
@@ -2608,6 +2627,9 @@ fn job_message(phase: &str, failure_code: Option<&str>) -> &'static str {
                 "The iPhone could not be registered for this signing session."
             }
             "ipa_signing_failed" => "The IPA could not be signed.",
+            "ipa_file_missing" => {
+                "The IPA file is missing on the server. Download it again from its source or upload it again."
+            }
             "signed_metadata_failed" => "The signed IPA metadata could not be validated.",
             "device_install_failed" => {
                 "Signing completed, but transfer/installation on the iPhone failed. Keep the phone unlocked, reachable, and check free storage."
@@ -2779,7 +2801,16 @@ async fn delete_ipa(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl
         .and_then(|database| store::mark_app_deleted(&database, id).map_err(|_| ()));
     match deletion {
         Ok(store::AppDeletion::Ready { storage_path }) => {
-            if tokio::fs::remove_file(&storage_path).await.is_ok() {
+            // A file that is already gone must not block removing the app.
+            let removed = match tokio::fs::remove_file(&storage_path).await {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(app_id = %id, "IPA file was already missing when the app was removed");
+                    true
+                }
+                Err(_) => false,
+            };
+            if removed {
                 (StatusCode::NO_CONTENT, ()).into_response()
             } else {
                 if let Ok(database) = state.database.lock() {
