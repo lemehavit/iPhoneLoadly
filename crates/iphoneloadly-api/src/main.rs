@@ -1783,7 +1783,7 @@ fn rsd_installed_apps(
             let field = |keys: [&str; 2]| {
                 info.and_then(|info| {
                     keys.iter()
-                        .find_map(|key| info.get(*key).and_then(|v| v.as_string()))
+                        .find_map(|key| info.get(key).and_then(|v| v.as_string()))
                 })
                 .map(str::to_owned)
             };
@@ -3124,10 +3124,10 @@ async fn run_isolated_anisette_provisioning_diagnostic() {
     let events = Arc::new(Mutex::new(Vec::<AnisetteProvisioningStage>::new()));
     let event_store = events.clone();
     let sink: AnisetteProvisioningDiagnosticSink = Arc::new(move |event| {
-        if let Ok(mut events) = event_store.lock() {
-            if events.len() < 64 {
-                events.push(event);
-            }
+        if let Ok(mut events) = event_store.lock()
+            && events.len() < 64
+        {
+            events.push(event);
         }
     });
 
@@ -3157,10 +3157,9 @@ async fn run_isolated_anisette_provisioning_diagnostic() {
         "SUCCESS"
     };
 
-    let result = match tokio::time::timeout(Duration::from_secs(45), diagnostic).await {
-        Ok(result) => result,
-        Err(_) => "TIMEOUT",
-    };
+    let result = tokio::time::timeout(Duration::from_secs(45), diagnostic)
+        .await
+        .unwrap_or("TIMEOUT");
     println!("ANISETTE_DIAGNOSTIC_RESULT={result}");
     let events = events
         .lock()

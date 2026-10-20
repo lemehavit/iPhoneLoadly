@@ -640,10 +640,9 @@ impl SigningFailureDiagnostic {
         for context in report.as_ref().iter_reports() {
             if let Some(stage) =
                 context.downcast_current_context::<isideload::sideload::sideloader::SigningStage>()
+                && diagnostic.stage == "unknown"
             {
-                if diagnostic.stage == "unknown" {
-                    diagnostic.stage = stage.as_str();
-                }
+                diagnostic.stage = stage.as_str();
             }
             if let Some(SideloadError::DeveloperError(code, _)) =
                 context.downcast_current_context::<SideloadError>()
@@ -1852,7 +1851,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept test request");
             let mut request = [0_u8; 1024];
-            stream.read(&mut request).await.expect("read test request");
+            let read = stream.read(&mut request).await.expect("read test request");
+            assert!(read > 0, "test request was empty");
             stream
                 .write_all(
                     b"HTTP/1.1 503 Service Unavailable\r\n\

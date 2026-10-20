@@ -333,6 +333,9 @@ pub(crate) struct RsdInstallReport {
     pub(crate) certificate_pressure: bool,
     pub(crate) signing_diagnostic: Option<crate::signing::SigningFailureDiagnostic>,
 }
+// The CoreDevice appservice path is kept for the upcoming app management work
+// but has no caller while installs use Installation Proxy over RSD.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoreDeviceServiceOperation {
     ServiceLookup,
@@ -380,6 +383,7 @@ impl CoreDeviceServiceFailure {
         }
     }
 
+    #[allow(dead_code)]
     const fn timeout(operation: CoreDeviceServiceOperation, appservice_present: bool) -> Self {
         Self {
             operation,
@@ -389,6 +393,7 @@ impl CoreDeviceServiceFailure {
         }
     }
 
+    #[allow(dead_code)]
     fn from_error(
         operation: CoreDeviceServiceOperation,
         appservice_present: bool,
@@ -3063,6 +3068,7 @@ fn report_parsed_rsd_service_summary(summary: ParsedRsdServiceSummary) {
     );
 }
 
+#[allow(dead_code)]
 fn core_device_appservice_port(handshake: &RsdHandshake) -> Result<u16, CoreDeviceServiceFailure> {
     handshake
         .services
@@ -3071,6 +3077,7 @@ fn core_device_appservice_port(handshake: &RsdHandshake) -> Result<u16, CoreDevi
         .ok_or_else(CoreDeviceServiceFailure::missing_service)
 }
 
+#[allow(dead_code)]
 async fn run_core_device_service_operation<T>(
     operation: CoreDeviceServiceOperation,
     appservice_present: bool,
@@ -3857,6 +3864,7 @@ fn io_error_kind(error: &std::io::Error) -> &'static str {
 
 // UnexpectedResponse and PairingRejected can carry device text or payload-derived data.
 // Keep diagnostics to safe variant categories and the library-defined RemotePairing subcode.
+#[allow(dead_code)]
 fn core_device_error_kind(error: &idevice::IdeviceError) -> &'static str {
     match error {
         idevice::IdeviceError::Socket(error) => io_error_kind(error),
