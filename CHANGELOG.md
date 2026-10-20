@@ -3,6 +3,27 @@
 All notable changes to iPhoneLoadly are documented here. The project follows
 Semantic Versioning while remaining experimental alpha software.
 
+## [0.3.0-alpha.4] - 2026-10-20
+
+### Added
+
+- Wireless installs over RSD for an iPhone paired with remote pairing. With
+  `IPHONELOADLY_RSD_INSTALL=on` the paired iPhone appears in the device list,
+  and install and refresh jobs to it go over RSD, upgrading an app that is
+  already installed. A job only succeeds after the install is verified on the
+  device and records the team-suffixed bundle identifier.
+- The installed-apps list for the RSD iPhone is read over RSD.
+- Install responses can carry a bounded `signingDiagnostic` (stage, error
+  class, HTTP status, Apple code, local I/O kind) without raw error text.
+
+### Fixed
+
+- Apple sign-in after GrandSlam error -80045: anisette client info and URL bag
+  handling backported from upstream; GrandSlam keeps pinned Apple trust while
+  Developer Services uses public PKI.
+- App ID and app group names are stripped of characters Apple rejects (result
+  code 35), so apps such as `hello_world` can be signed.
+
 ## [0.3.0-alpha.3] - 2026-08-31
 
 ### Changed
