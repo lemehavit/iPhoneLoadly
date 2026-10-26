@@ -1306,8 +1306,14 @@ impl WirelessPairingService {
         signing: Arc<crate::signing::AppleSigningProvider>,
         ipa_path: PathBuf,
     ) -> RsdInstallReport {
-        self.install_remote_pairing_app(signing, ipa_path, ExistingAppPolicy::Refuse)
-            .await
+        self.install_remote_pairing_app(
+            signing,
+            ipa_path,
+            ExistingAppPolicy::Refuse,
+            crate::signing::DeviceRegistrationPolicy::RequireExisting,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn install_remote_pairing_app(
@@ -1315,8 +1321,15 @@ impl WirelessPairingService {
         signing: Arc<crate::signing::AppleSigningProvider>,
         ipa_path: PathBuf,
         existing_app: ExistingAppPolicy,
+        registration_policy: crate::signing::DeviceRegistrationPolicy,
+        progress: Option<Arc<dyn Fn(u8) + Send + Sync>>,
     ) -> RsdInstallReport {
-        let deadline = tokio::time::Instant::now() + RSD_INSTALL_TIMEOUT;
+        let overall_timeout = rsd_install_timeout(existing_app);
+        tracing::info!(
+            overall_timeout_secs = overall_timeout.as_secs(),
+            "RSD upload job budget"
+        );
+        let deadline = tokio::time::Instant::now() + overall_timeout;
         let work_deadline = install_work_deadline(deadline, tokio::time::Instant::now());
         let mut current_stage = ReadOnlyProbeStage::Discovery;
         let mut identity_session = match tokio::time::timeout_at(
@@ -1381,9 +1394,15 @@ impl WirelessPairingService {
         }
 
         let signing_identity = identity.clone();
+        let signing_progress = progress.clone();
         let mut signing_task = tokio::spawn(async move {
             signing
-                .preflight_and_sign_for_existing_device(&signing_identity, ipa_path)
+                .preflight_and_sign_for_device(
+                    &signing_identity,
+                    ipa_path,
+                    registration_policy,
+                    signing_progress,
+                )
                 .await
         });
         let (preflight, artifact) =
@@ -1522,6 +1541,7 @@ impl WirelessPairingService {
             deadline,
             &mut artifact_cleanup,
             existing_app,
+            progress.as_deref(),
         )
         .await;
         let final_session_cleanup = close_install_session(session).await;
@@ -1833,6 +1853,17 @@ impl WirelessPairingService {
 }
 
 const RSD_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// A production app can contain thousands of small files, each requiring AFC
+// round trips. Keep the isolated first-install diagnostic's original budget.
+const RSD_NORMAL_INSTALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const RSD_AFC_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn rsd_install_timeout(existing_app: ExistingAppPolicy) -> Duration {
+    match existing_app {
+        ExistingAppPolicy::Refuse => RSD_INSTALL_TIMEOUT,
+        ExistingAppPolicy::Upgrade => RSD_NORMAL_INSTALL_TIMEOUT,
+    }
+}
 const RSD_IDENTITY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RSD_APP_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const RSD_INSTALL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2142,6 +2173,7 @@ impl TaskStagingPath {
 struct TaskAfcClient {
     inner: AfcClient,
     packet_number: u64,
+    timed_out: bool,
 }
 
 impl TaskAfcClient {
@@ -2149,6 +2181,7 @@ impl TaskAfcClient {
         Self {
             inner,
             packet_number: 0,
+            timed_out: false,
         }
     }
 
@@ -2158,6 +2191,22 @@ impl TaskAfcClient {
         header_payload: Vec<u8>,
         payload: Vec<u8>,
     ) -> Result<AfcPacket, IdeviceError> {
+        self.request_with_timeout(operation, header_payload, payload, RSD_AFC_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &mut self,
+        operation: AfcOpcode,
+        header_payload: Vec<u8>,
+        payload: Vec<u8>,
+        maximum_wait: Duration,
+    ) -> Result<AfcPacket, IdeviceError> {
+        // A cancelled read may leave a late response on this stream. Never use
+        // it for another command; staging cleanup opens a separate AFC client.
+        if self.timed_out {
+            return Err(IdeviceError::Timeout);
+        }
         let header_payload_len = AfcPacketHeader::LEN + header_payload.len() as u64;
         let packet = AfcPacket {
             header: AfcPacketHeader {
@@ -2171,8 +2220,42 @@ impl TaskAfcClient {
             payload,
         };
         self.packet_number = self.packet_number.wrapping_add(1);
-        self.inner.send(packet).await?;
-        self.inner.read().await
+        let packet_number = packet.header.packet_num;
+        let payload_bytes = packet.payload.len();
+        let started = tokio::time::Instant::now();
+        let request_deadline = started + maximum_wait;
+        let inner = &mut self.inner;
+        let request = async {
+            inner.send(packet).await?;
+            inner.read().await
+        };
+        tokio::pin!(request);
+        let mut pending_logged = false;
+        loop {
+            tokio::select! {
+                result = &mut request => {
+                    if pending_logged {
+                        tracing::info!(?operation, packet_number, payload_bytes,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            success = result.is_ok(), "RSD AFC request completed");
+                    }
+                    return result;
+                }
+                _ = tokio::time::sleep_until(request_deadline) => {
+                    self.timed_out = true;
+                    tracing::warn!(?operation, packet_number, payload_bytes,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "RSD AFC request timed out");
+                    return Err(IdeviceError::Timeout);
+                }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    pending_logged = true;
+                    tracing::info!(?operation, packet_number, payload_bytes,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "RSD AFC request pending");
+                }
+            }
+        }
     }
 
     async fn path_request(
@@ -2403,7 +2486,19 @@ impl RemoteRsdSession<AdapterHandle> {
             Some(&lockdown_identity),
             Some(&device_name),
         )
-        .map(|identity| identity.with_device_class(device_class.as_deref()))
+        .map(|identity| {
+            let properties = &self.handshake().properties;
+            let product_type = properties
+                .get("ProductType")
+                .and_then(plist::Value::as_string);
+            let os_version = properties
+                .get("OSVersion")
+                .or_else(|| properties.get("ProductVersion"))
+                .and_then(plist::Value::as_string);
+            identity
+                .with_device_class(device_class.as_deref())
+                .with_device_metadata(product_type, os_version)
+        })
     }
 
     async fn task_afc_client(
@@ -2673,12 +2768,34 @@ fn open_verified_upload_file(
     Ok(file)
 }
 
+// Reserve 85..100 for the installation command and its verification.
+fn upload_progress_percent(bytes_sent: u64, total_bytes: u64) -> u8 {
+    if total_bytes == 0 {
+        return 40;
+    }
+    40 + ((u128::from(bytes_sent.min(total_bytes)) * 45) / u128::from(total_bytes)) as u8
+}
+
 async fn stage_signed_bundle(
     client: &mut TaskAfcClient,
     staging: &TaskStagingPath,
     plan: &SignedBundleUploadPlan,
     root_created: &mut bool,
+    progress: Option<&(dyn Fn(u8) + Send + Sync)>,
 ) -> Result<(), &'static str> {
+    let started = tokio::time::Instant::now();
+    let mut last_log = started;
+    let mut bytes_sent = 0_u64;
+    let mut entries_done = 0_usize;
+    let mut last_percent = 40;
+    if let Some(callback) = progress {
+        callback(40);
+    }
+    tracing::info!(
+        entries = plan.entries.len(),
+        total_bytes = plan.byte_count,
+        "RSD upload started"
+    );
     if !client
         .is_directory("PublicStaging")
         .await
@@ -2756,6 +2873,25 @@ async fn stage_signed_bundle(
                             .write(descriptor, buffer[..count].to_vec())
                             .await
                             .map_err(|_| "staging_file_write")?;
+                        bytes_sent += count as u64;
+                        let percent = upload_progress_percent(bytes_sent, plan.byte_count);
+                        if percent > last_percent {
+                            if let Some(callback) = progress {
+                                callback(percent);
+                            }
+                            last_percent = percent;
+                        }
+                        if last_log.elapsed() >= Duration::from_secs(10) {
+                            tracing::info!(
+                                bytes_sent,
+                                total_bytes = plan.byte_count,
+                                entries_done,
+                                total_entries = plan.entries.len(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "RSD upload progress"
+                            );
+                            last_log = tokio::time::Instant::now();
+                        }
                     }
                     let final_metadata = file.metadata().await.map_err(|_| "source_changed")?;
                     if written != size
@@ -2773,7 +2909,28 @@ async fn stage_signed_bundle(
                 close_result.map_err(|_| "staging_file_close")?;
             }
         }
+        entries_done += 1;
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            tracing::info!(
+                bytes_sent,
+                total_bytes = plan.byte_count,
+                entries_done,
+                total_entries = plan.entries.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "RSD upload progress"
+            );
+            last_log = tokio::time::Instant::now();
+        }
     }
+    if let Some(callback) = progress {
+        callback(85);
+    }
+    tracing::info!(
+        bytes_sent,
+        entries_done,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "RSD upload completed"
+    );
     Ok(())
 }
 
@@ -2836,6 +2993,7 @@ async fn execute_rsd_first_install(
     deadline: tokio::time::Instant,
     artifact_cleanup: &mut Option<crate::signing::SignedAppArtifact>,
     existing_app: ExistingAppPolicy,
+    progress: Option<&(dyn Fn(u8) + Send + Sync)>,
 ) -> RsdInstallReport {
     let work_deadline = install_work_deadline(deadline, tokio::time::Instant::now());
 
@@ -2876,6 +3034,8 @@ async fn execute_rsd_first_install(
     let artifact = artifact_cleanup
         .take()
         .expect("signed artifact remains owned until cleanup");
+    let planning_started = tokio::time::Instant::now();
+    tracing::info!("RSD upload plan started");
     let planning_task = tokio::task::spawn_blocking(move || {
         let artifact_path = artifact.app_bundle_path().to_path_buf();
         let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2915,6 +3075,12 @@ async fn execute_rsd_first_install(
             );
         }
     };
+    tracing::info!(
+        entries = plan.entries.len(),
+        total_bytes = plan.byte_count,
+        elapsed_ms = planning_started.elapsed().as_millis() as u64,
+        "RSD upload plan ready"
+    );
     let staging = TaskStagingPath::new(Uuid::new_v4());
     let mut afc = match session.task_afc_client(work_deadline).await {
         Ok(client) => client,
@@ -2930,7 +3096,7 @@ async fn execute_rsd_first_install(
     let mut root_created = false;
     let staging_result = tokio::time::timeout_at(
         work_deadline,
-        stage_signed_bundle(&mut afc, &staging, &plan, &mut root_created),
+        stage_signed_bundle(&mut afc, &staging, &plan, &mut root_created, progress),
     )
     .await;
     drop(afc);
@@ -2968,10 +3134,17 @@ async fn execute_rsd_first_install(
                     return report;
                 }
             };
+            if let Some(callback) = progress {
+                callback(90);
+            }
+            tracing::info!("RSD upload installation command started");
             let install_result =
                 send_one_install_command(&mut client, &staging.app, install_deadline).await;
             drop(client);
 
+            if let Some(callback) = progress {
+                callback(95);
+            }
             let verification_deadline =
                 install_verification_deadline(deadline, tokio::time::Instant::now());
             let outcome = verified_install_outcome(install_result, async {
@@ -4648,6 +4821,18 @@ mod tests {
     }
 
     #[test]
+    fn transfer_progress_is_bounded_monotonic_and_reserves_verification() {
+        assert_eq!(upload_progress_percent(0, 0), 40);
+        assert_eq!(upload_progress_percent(0, 100), 40);
+        assert_eq!(upload_progress_percent(50, 100), 62);
+        assert_eq!(upload_progress_percent(100, 100), 85);
+        assert_eq!(upload_progress_percent(u64::MAX, u64::MAX), 85);
+        assert_eq!(upload_progress_percent(u64::MAX, 1), 85);
+        let values: Vec<_> = (0..=100).map(|v| upload_progress_percent(v, 100)).collect();
+        assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
     fn task_staging_path_is_fixed_unique_and_cleanup_scoped() {
         let first =
             TaskStagingPath::new(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
@@ -4962,6 +5147,162 @@ mod tests {
             .expect("client closes after one query")
             .expect("read post-query EOF");
         assert_eq!(read, 0, "probe sent more than one request");
+    }
+
+    #[test]
+    fn transfer_timeout_budget_preserves_diagnostic_and_bounds_normal_installs() {
+        assert_eq!(
+            rsd_install_timeout(ExistingAppPolicy::Refuse),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            rsd_install_timeout(ExistingAppPolicy::Upgrade),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(RSD_AFC_REQUEST_TIMEOUT, Duration::from_secs(90));
+        for policy in [ExistingAppPolicy::Refuse, ExistingAppPolicy::Upgrade] {
+            let start = tokio::time::Instant::now();
+            let end = start + rsd_install_timeout(policy);
+            assert_eq!(
+                end - install_work_deadline(end, start),
+                install_cleanup_reserve()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_timeout_stops_an_unanswered_request_without_resubmitting() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let client = async move {
+            let afc = <AfcClient as RsdService>::from_stream(Box::new(client_stream))
+                .await
+                .unwrap();
+            let mut client = TaskAfcClient::new(afc);
+            let result = client
+                .request_with_timeout(
+                    AfcOpcode::GetFileInfo,
+                    b"fixture".to_vec(),
+                    Vec::new(),
+                    Duration::from_millis(100),
+                )
+                .await;
+            assert!(matches!(result, Err(IdeviceError::Timeout)));
+            // A late reply must not be consumed as the response to a new request.
+            assert!(matches!(
+                client.close(123).await,
+                Err(IdeviceError::Timeout)
+            ));
+            assert_eq!(client.packet_number, 1);
+        };
+        let server = async move {
+            serve_rsd_checkin(&mut server_stream).await;
+            let mut header = [0_u8; 40];
+            server_stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(u64::from_le_bytes(header[8..16].try_into().unwrap()), 47);
+            let mut path = [0_u8; 7];
+            server_stream.read_exact(&mut path).await.unwrap();
+            assert_eq!(&path, b"fixture");
+            // No response: the client must reach its deadline and close, not retry.
+            assert_stream_closed_after_one_query(&mut server_stream).await;
+        };
+        timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transfer_timeout_still_accepts_a_response_before_deadline() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let client = async move {
+            let afc = <AfcClient as RsdService>::from_stream(Box::new(client_stream))
+                .await
+                .unwrap();
+            let mut client = TaskAfcClient::new(afc);
+            let result = client
+                .request_with_timeout(
+                    AfcOpcode::GetFileInfo,
+                    b"fixture".to_vec(),
+                    Vec::new(),
+                    Duration::from_secs(2),
+                )
+                .await;
+            assert!(result.is_ok());
+            assert_eq!(client.packet_number, 1);
+        };
+        let server = async move {
+            serve_rsd_checkin(&mut server_stream).await;
+            let mut request = [0_u8; 47];
+            server_stream.read_exact(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let reply = AfcPacket {
+                header: AfcPacketHeader {
+                    magic: MAGIC,
+                    entire_len: 40,
+                    header_payload_len: 40,
+                    packet_num: 0,
+                    operation: AfcOpcode::Data,
+                },
+                header_payload: Vec::new(),
+                payload: Vec::new(),
+            };
+            server_stream.write_all(&reply.serialize()).await.unwrap();
+            assert_stream_closed_after_one_query(&mut server_stream).await;
+        };
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transfer_afc_waits_for_one_response_without_resubmitting() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let client = async move {
+            let afc = <AfcClient as RsdService>::from_stream(Box::new(client_stream))
+                .await
+                .unwrap();
+            let mut client = TaskAfcClient::new(afc);
+            assert!(client.path_exists("fixture").await.unwrap());
+            assert_eq!(client.packet_number, 1);
+        };
+        let server = async move {
+            serve_rsd_checkin(&mut server_stream).await;
+            let mut header = [0_u8; 40];
+            server_stream.read_exact(&mut header).await.unwrap();
+            let length = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            assert_eq!(length, 47);
+            let mut path = [0_u8; 7];
+            server_stream.read_exact(&mut path).await.unwrap();
+            assert_eq!(&path, b"fixture");
+            // Exercise the periodic diagnostic branch while retaining the same request.
+            let mut extra = [0_u8; 1];
+            assert!(
+                timeout(Duration::from_secs(11), server_stream.read(&mut extra))
+                    .await
+                    .is_err()
+            );
+            let reply = AfcPacket {
+                header: AfcPacketHeader {
+                    magic: MAGIC,
+                    entire_len: 40,
+                    header_payload_len: 40,
+                    packet_num: 0,
+                    operation: AfcOpcode::Data,
+                },
+                header_payload: Vec::new(),
+                payload: Vec::new(),
+            };
+            server_stream.write_all(&reply.serialize()).await.unwrap();
+            assert_stream_closed_after_one_query(&mut server_stream).await;
+        };
+        timeout(Duration::from_secs(15), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
     }
 
     async fn run_afc_fixture(

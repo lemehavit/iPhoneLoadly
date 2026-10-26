@@ -715,6 +715,8 @@ pub struct SigningDeviceIdentity {
     name: String,
     udid: String,
     apple_tv: bool,
+    product_type: Option<String>,
+    ios_version: Option<String>,
 }
 
 impl SigningDeviceIdentity {
@@ -727,6 +729,8 @@ impl SigningDeviceIdentity {
             name,
             udid,
             apple_tv: false,
+            product_type: None,
+            ios_version: None,
         })
     }
 
@@ -735,6 +739,33 @@ impl SigningDeviceIdentity {
     pub fn with_device_class(mut self, device_class: Option<&str>) -> Self {
         self.apple_tv = device_class.is_some_and(|class| class.eq_ignore_ascii_case("AppleTV"));
         self
+    }
+
+    /// Optional display metadata from the existing RSD handshake.
+    pub fn with_device_metadata(
+        mut self,
+        product_type: Option<&str>,
+        ios_version: Option<&str>,
+    ) -> Self {
+        fn bounded(value: Option<&str>) -> Option<String> {
+            value
+                .filter(|value| {
+                    !value.trim().is_empty()
+                        && value.len() <= 128
+                        && !value.chars().any(char::is_control)
+                })
+                .map(str::to_owned)
+        }
+        self.product_type = bounded(product_type);
+        self.ios_version = bounded(ios_version);
+        self
+    }
+
+    pub fn product_type(&self) -> Option<&str> {
+        self.product_type.as_deref()
+    }
+    pub fn ios_version(&self) -> Option<&str> {
+        self.ios_version.as_deref()
     }
 
     pub fn is_apple_tv(&self) -> bool {
@@ -764,6 +795,21 @@ pub enum DeviceRegistrationState {
 pub enum DeviceRegistrationPolicy {
     RequireExisting,
     Ensure,
+}
+
+fn registration_policy_after_preflight(
+    state: DeviceRegistrationState,
+    requested: DeviceRegistrationPolicy,
+) -> Option<DeviceRegistrationPolicy> {
+    match (state, requested) {
+        (DeviceRegistrationState::AlreadyPresent, _) => {
+            Some(DeviceRegistrationPolicy::RequireExisting)
+        }
+        (DeviceRegistrationState::NewRequired, DeviceRegistrationPolicy::Ensure) => {
+            Some(DeviceRegistrationPolicy::Ensure)
+        }
+        (DeviceRegistrationState::NewRequired, DeviceRegistrationPolicy::RequireExisting) => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1352,6 +1398,21 @@ impl AppleSigningProvider {
             .list_devices(&team, identity.developer_device_type())
             .await
             .map_err(|_| SigningError::DeveloperTeamFailed)?;
+        let matches = crate::registration_diagnostic::registration_matches(
+            &identity.udid,
+            devices.iter().map(|device| device.device_number.as_str()),
+        );
+        tracing::info!(
+            team_id = crate::registration_diagnostic::diagnostic_team_id(&team.team_id),
+            device_id = %crate::device_id_for_udid(&identity.udid),
+            platform = if identity.is_apple_tv() { "tvos" } else { "ios" },
+            listed_devices = matches.listed_devices,
+            exact_matches = matches.exact,
+            ascii_case_insensitive_matches = matches.ascii_case_insensitive,
+            trimmed_ascii_case_insensitive_matches = matches.trimmed_ascii_case_insensitive,
+            target_has_outer_whitespace = matches.target_has_outer_whitespace,
+            "Apple device registration preflight"
+        );
         let device_registration = if devices
             .iter()
             .any(|device| device.device_number == identity.udid)
@@ -1457,10 +1518,12 @@ impl AppleSigningProvider {
         Ok(artifact)
     }
 
-    pub async fn preflight_and_sign_for_existing_device(
+    pub async fn preflight_and_sign_for_device(
         &self,
         identity: &SigningDeviceIdentity,
         ipa_path: PathBuf,
+        registration_policy: DeviceRegistrationPolicy,
+        progress: Option<Arc<dyn Fn(u8) + Send + Sync>>,
     ) -> Result<(AppleAccountPreflight, Option<SignedAppArtifact>), ExistingDeviceSigningError>
     {
         if !ipa_path.is_file() {
@@ -1477,15 +1540,12 @@ impl AppleSigningProvider {
         let preflight = Self::account_preflight_with_sideloader(sideloader, identity)
             .await
             .map_err(ExistingDeviceSigningError::Preflight)?;
-        // An iPhone must already be registered on the team. An Apple TV is
-        // added through its own pairing flow in the dashboard, so its first
-        // install registers it, like atvloadly does.
-        let registration_policy = match preflight.device_registration {
-            DeviceRegistrationState::AlreadyPresent => DeviceRegistrationPolicy::RequireExisting,
-            DeviceRegistrationState::NewRequired if identity.is_apple_tv() => {
-                DeviceRegistrationPolicy::Ensure
-            }
-            DeviceRegistrationState::NewRequired => return Ok((preflight, None)),
+        // Normal installs may renew a missing Apple registration. Diagnostic
+        // installs explicitly require an existing registration on the team.
+        let Some(registration_policy) =
+            registration_policy_after_preflight(preflight.device_registration, registration_policy)
+        else {
+            return Ok((preflight, None));
         };
         let artifact = self
             .sign_for_device_with_sideloader(
@@ -1493,7 +1553,11 @@ impl AppleSigningProvider {
                 identity,
                 ipa_path,
                 registration_policy,
-                |_| {},
+                move |value| {
+                    if let Some(callback) = &progress {
+                        callback(value);
+                    }
+                },
             )
             .await
             .map_err(ExistingDeviceSigningError::Signing)?;
@@ -1583,6 +1647,44 @@ impl AppleSigningProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_policy_allows_normal_install_to_renew_missing_device() {
+        assert_eq!(
+            registration_policy_after_preflight(
+                DeviceRegistrationState::NewRequired,
+                DeviceRegistrationPolicy::Ensure,
+            ),
+            Some(DeviceRegistrationPolicy::Ensure),
+        );
+    }
+
+    #[test]
+    fn registration_policy_keeps_diagnostic_install_from_registering_device() {
+        assert_eq!(
+            registration_policy_after_preflight(
+                DeviceRegistrationState::NewRequired,
+                DeviceRegistrationPolicy::RequireExisting,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn registration_policy_reuses_existing_device_in_both_flows() {
+        for requested in [
+            DeviceRegistrationPolicy::Ensure,
+            DeviceRegistrationPolicy::RequireExisting,
+        ] {
+            assert_eq!(
+                registration_policy_after_preflight(
+                    DeviceRegistrationState::AlreadyPresent,
+                    requested
+                ),
+                Some(DeviceRegistrationPolicy::RequireExisting),
+            );
+        }
+    }
 
     fn temp_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("iphoneloadly-signing-{name}-{}", Uuid::now_v7()))
@@ -1801,6 +1903,20 @@ mod tests {
             .build()
             .await
             .expect("build Apple account through the pinned Apple root");
+    }
+
+    #[test]
+    fn transfer_identity_metadata_is_optional_bounded_and_preserves_identity() {
+        let identity = SigningDeviceIdentity::new("Phone".into(), "stable-udid".into())
+            .unwrap()
+            .with_device_metadata(Some("iPhone17,1"), Some("26.0"));
+        assert_eq!(identity.product_type(), Some("iPhone17,1"));
+        assert_eq!(identity.ios_version(), Some("26.0"));
+        assert_eq!(identity.udid(), "stable-udid");
+        let identity = identity.with_device_metadata(Some("bad\nvalue"), Some(&"x".repeat(129)));
+        assert_eq!(identity.product_type(), None);
+        assert_eq!(identity.ios_version(), None);
+        assert_eq!(identity.udid(), "stable-udid");
     }
 
     #[test]
