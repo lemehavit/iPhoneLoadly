@@ -5,6 +5,43 @@ Semantic Versioning while remaining experimental alpha software.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.6] - 2026-10-26
+
+### Fixed
+
+- Normal RSD installs and refreshes can register an iPhone that is missing from
+  the selected Apple team's device list, matching the existing installation
+  behavior. Already registered devices are reused. The isolated first-install
+  diagnostic still requires an existing registration.
+- RSD jobs now report signing and transfer progress instead of remaining at
+  "Signing IPA 1%" while uploading files.
+- The RSD device picker uses model and OS-version metadata from the existing
+  handshake when available, rather than always reporting `unknown`.
+- File-heavy RSD installs no longer share the diagnostic's 15-minute limit.
+  Normal installs and refreshes have a 60-minute total budget; the isolated
+  first-install diagnostic retains its 15-minute limit.
+- Each AFC request has a 90-second deadline. A connection that times out is
+  discarded for further commands, preventing a late response from being used
+  as the response to a subsequent command. Existing scoped cleanup and
+  installed-bundle verification remain in place.
+
+### Added
+
+- Bounded registration-match counts, upload planning and transfer counters,
+  and pending/timed-out AFC-operation diagnostics, without raw UDIDs, file
+  paths or payload contents.
+- Regression coverage for registration policy, transfer progress, optional
+  device metadata, delayed and unanswered AFC requests, and timeout budgets.
+
+### Upgrade notes
+
+- A large app with many small files can still take more than 15 minutes over
+  RSD. Keep the device reachable until Activity reports the final result.
+  A hardware installation with 12,308 entries and about 312 MB of signed app
+  data completed successfully in 29 minutes 51 seconds with this fix.
+- Restarting the service may require completing Apple two-factor sign-in in
+  the dashboard before the next install or refresh.
+
 ## [0.3.0-alpha.5] - 2026-10-20
 
 ### Added

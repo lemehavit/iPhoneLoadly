@@ -2,6 +2,7 @@ mod apple_tv;
 mod github;
 mod ipa;
 mod jobs;
+mod registration_diagnostic;
 mod signing;
 mod sources;
 mod store;
@@ -1801,8 +1802,8 @@ fn rsd_device_summary(identity: &signing::SigningDeviceIdentity) -> DeviceSummar
     DeviceSummary {
         id: device_id_for_udid(identity.udid()),
         display_name: identity.name().to_owned(),
-        product_type: "unknown".into(),
-        ios_version: "unknown".into(),
+        product_type: identity.product_type().unwrap_or("unknown").to_owned(),
+        ios_version: identity.ios_version().unwrap_or("unknown").to_owned(),
         connection_type: ConnectionType::Network,
         status: DeviceStatus::Online,
         install_eligible: true,
@@ -2502,6 +2503,15 @@ async fn run_install_job(
                 state.signing.clone(),
                 ipa_path,
                 wireless_pairing::ExistingAppPolicy::Upgrade,
+                signing::DeviceRegistrationPolicy::Ensure,
+                Some(Arc::new(move |progress| {
+                    let phase = if progress >= 40 {
+                        "transferring"
+                    } else {
+                        "signing"
+                    };
+                    set_job_status(&progress_database, id, phase, Some(progress));
+                })),
             )
             .await;
         tracing::info!(
